@@ -1,0 +1,46 @@
+{
+  "name": "turn-server",
+  "version": "0.1.0",
+  "description": "STUN/TURN server and client for Node.js",
+  "type": "module",
+  "main": "index.cjs",
+  "module": "index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "require": "./index.cjs"
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.cjs",
+    "index.d.ts",
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": ["stun", "turn", "webrtc", "ice", "nat", "rfc5389", "rfc5766"],
+  "author": {
+    "name": "colocohen"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/turn-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/turn-server/issues"
+  },
+  "homepage": "https://github.com/colocohen/turn-server#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ],
+  "dependencies": {}
+}
