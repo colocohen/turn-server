@@ -301,13 +301,16 @@ function Server(options) {
 
     var udp = dgram.createSocket({ type: family, reuseAddr: true });
 
+    // Cached local address — udp.address() is a syscall. Safe to cache
+    // after 'listening' fires, the address cannot change.
+    var udp_local_addr = null;
+
     udp.on('message', function(msg, rinfo) {
       if (context.destroyed) return;
+      if (!udp_local_addr) return;  // received before 'listening' (shouldn't happen)
 
       var src = { ip: rinfo.address, port: rinfo.port };
-      var dst_raw = udp.address();
-      var dst_addr = { ip: dst_raw.address, port: dst_raw.port };
-      var key = make_udp_key(rinfo.address, rinfo.port, dst_raw.address, dst_raw.port);
+      var key = make_udp_key(rinfo.address, rinfo.port, udp_local_addr.ip, udp_local_addr.port);
 
       var client = context.clients[key];
       if (!client) {
@@ -318,25 +321,43 @@ function Server(options) {
         // Hook: accept
         if (!check_hook('accept', { source: src, transport: 'udp' })) return;
 
+        // Capture rinfo values in closure — locked to this 5-tuple client.
+        var dst_port = rinfo.port;
+        var dst_ip   = rinfo.address;
+
         client = create_client_socket(src, function(buf) {
-          udp.send(Buffer.from(buf), 0, buf.length, rinfo.port, rinfo.address, function(err) {
+          // HOT PATH: zero-copy Buffer view. buf is Uint8Array from
+          // wire.encode_message — Buffer.from(u.buffer, offset, len) creates
+          // a view over the same memory rather than copying ~1200 bytes.
+          var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+          udp.send(out, 0, out.length, dst_port, dst_ip, function(err) {
             if (err) ev.emit('error', err);
           });
-        }, dst_addr);
+        }, udp_local_addr);
 
         context.clients[key] = client;
         client._idleTimer = setup_idle_timeout(key);
+        client._idleKey = key;
 
         client.on('close', function() {
           if (client._idleTimer) clearTimeout(client._idleTimer);
           delete context.clients[key];
         });
+      } else if (client._idleTimer) {
+        // Refresh idle timer without re-allocating the timer object.
+        // timer.refresh() is available since Node 10 — re-arms the existing
+        // handle, saving a syscall pair per packet.
+        if (typeof client._idleTimer.refresh === 'function') {
+          client._idleTimer.refresh();
+        } else {
+          clearTimeout(client._idleTimer);
+          client._idleTimer = setup_idle_timeout(client._idleKey);
+        }
       }
 
-      // Reset idle timer on each message
-      if (client._idleTimer) { clearTimeout(client._idleTimer); client._idleTimer = setup_idle_timeout(key); }
-
-      client.feed(new Uint8Array(msg));
+      // HOT PATH: msg is Buffer. wire's r_bytes and validate_integrity now
+      // handle Buffer input safely (see src/wire.js), so no wrapping needed.
+      client.feed(msg);
     });
 
     udp.on('error', function(err) {
@@ -345,6 +366,7 @@ function Server(options) {
 
     udp.on('listening', function() {
       var addr = udp.address();
+      udp_local_addr = { ip: addr.address, port: addr.port };
       ev.emit('listening', { transport: 'udp', address: addr.address, port: addr.port });
     });
 
@@ -374,9 +396,12 @@ function Server(options) {
       var tcp_buf = Buffer.alloc(0);
 
       var client = create_client_socket(src, function(buf) {
-        // TCP: add 2-byte length framing
-        var framed = buf;
-        if (!conn.destroyed) conn.write(Buffer.from(framed));
+        // HOT PATH: zero-copy Buffer view when buf is Uint8Array.
+        // TCP stream.write() accepts both Buffer and Uint8Array natively,
+        // but internally optimizes for Buffer.
+        if (conn.destroyed) return;
+        var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        conn.write(out);
       }, { ip: conn.localAddress, port: conn.localPort });
 
       // Store by connection reference
@@ -411,7 +436,9 @@ function Server(options) {
 
           var frame = tcp_buf.slice(0, msg_len);
           tcp_buf = tcp_buf.slice(msg_len);
-          client.feed(new Uint8Array(frame));
+          // HOT PATH: frame is a Buffer. wire handles both Buffer and
+          // Uint8Array safely (see r_bytes/validate_integrity in wire.js).
+          client.feed(frame);
         }
       });
 
@@ -478,8 +505,10 @@ function Server(options) {
       var tcp_buf = Buffer.alloc(0);
 
       var client = create_client_socket(src, function(buf) {
-        var framed = buf;
-        if (!conn.destroyed) conn.write(Buffer.from(framed));
+        // HOT PATH: zero-copy Buffer view over Uint8Array from wire.encode_message.
+        if (conn.destroyed) return;
+        var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        conn.write(out);
       }, { ip: conn.localAddress, port: conn.localPort });
 
       var key = 'tls:' + src.ip + ':' + src.port;
@@ -508,7 +537,8 @@ function Server(options) {
 
           var frame = tcp_buf.slice(0, msg_len);
           tcp_buf = tcp_buf.slice(msg_len);
-          client.feed(new Uint8Array(frame));
+          // HOT PATH: Buffer → wire handles it safely.
+          client.feed(frame);
         }
       });
 
@@ -561,7 +591,10 @@ function Server(options) {
     var client = create_client_socket(src, function(buf) {
       try {
         if (ws.readyState === 1) { // OPEN
-          ws.send(buf instanceof Uint8Array ? Buffer.from(buf) : buf);
+          // HOT PATH: zero-copy Buffer view. ws library accepts both
+          // Buffer and Uint8Array, but Buffer is the optimized path.
+          var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+          ws.send(out);
         }
       } catch(e) {}
     });
@@ -571,7 +604,9 @@ function Server(options) {
 
     ws.on('message', function(msg) {
       if (context.destroyed) return;
-      var data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : new Uint8Array(msg);
+      // HOT PATH: msg is usually a Buffer from ws; if it's ArrayBuffer
+      // (browser-style), wrap once — no way to avoid here.
+      var data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : msg;
       client.feed(data);
     });
 

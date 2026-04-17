@@ -466,7 +466,12 @@ function Session(options) {
       // Fingerprint check
       if (msg.fingerprint_offset !== null) {
         var fp_val = msg.getAttribute(wire.ATTR.FINGERPRINT);
-        var before = data.slice(0, msg.fingerprint_offset);
+        // compute_fingerprint temporarily mutates bytes [2,3]. If data is a
+        // Buffer, .slice() returns a view that shares memory with the original
+        // — detach by copying into a fresh Uint8Array to avoid leaking the
+        // mutation to other views (attrs, tid).
+        var fp_slice = data.slice(0, msg.fingerprint_offset);
+        var before = Buffer.isBuffer(fp_slice) ? new Uint8Array(fp_slice) : fp_slice;
         var expected_fp = wire.compute_fingerprint(before);
         if (fp_val !== expected_fp) return;
       }
@@ -1301,11 +1306,21 @@ function Session(options) {
       final_attrs = final_attrs.concat([{ type: wire.ATTR.SOFTWARE, value: context.software }]);
     }
 
+    // RFC 8489 §9.2.1: if we chose a password algorithm (e.g. SHA256 after
+    // the server advertised PASSWORD-ALGORITHMS), the MESSAGE-INTEGRITY
+    // variant MUST match. Otherwise the server sees mismatched algo/integrity
+    // and rejects with 400 Bad Request (bid-down protection).
+    var integrity_algo = 'sha1';
+    if (context.authMech === 'long-term' && context.passwordAlgorithm === 0x0002) {
+      integrity_algo = 'sha256';
+    }
+
     var result = wire.encode_message({
       method: method,
       cls: wire.CLASS.REQUEST,
       attributes: final_attrs,
       key: get_client_key(),
+      integrity: integrity_algo,
       fingerprint: context.useFingerprint !== false,
     });
 

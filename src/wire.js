@@ -165,7 +165,17 @@ function w_bytes(buf, off, b) { buf.set(b, off); return off + b.length; }
 function r_u8(buf, off)  { return [buf[off++] >>> 0, off]; }
 function r_u16(buf, off) { return [((buf[off] << 8) | buf[off + 1]) >>> 0, off + 2]; }
 function r_u32(buf, off) { return [((buf[off] << 24) | (buf[off+1] << 16) | (buf[off+2] << 8) | buf[off+3]) >>> 0, off + 4]; }
-function r_bytes(buf, off, n) { return [buf.slice(off, off + n), off + n]; }
+
+// Always returns a plain Uint8Array (a copy if buf is a Buffer, because
+// Buffer.slice returns a *view* that shares memory with the original —
+// which can cause subtle bugs if the original is later mutated, as
+// compute_integrity_hmac does with bytes [2,3] of the header).
+function r_bytes(buf, off, n) {
+  var slice = buf.slice(off, off + n);
+  // Buffer.slice is a view; detach by copying into a fresh Uint8Array.
+  // Uint8Array.slice is already a copy, so this is a no-op in that case.
+  return [Buffer.isBuffer(slice) ? new Uint8Array(slice) : slice, off + n];
+}
 
 
 /* ============================ Address helpers ============================== */
@@ -717,32 +727,31 @@ function compute_userhash(username, realm) {
 
 // HMAC-SHA1 integrity (RFC 5389)
 function compute_integrity(msg_buf, key) {
-  var b2 = msg_buf[2], b3 = msg_buf[3];
-  var new_len = (msg_buf.length - HEADER_SIZE) + 24;
-  msg_buf[2] = (new_len >>> 8) & 0xFF;
-  msg_buf[3] = new_len & 0xFF;
-  var hmac = new Uint8Array(crypto.createHmac('sha1', key).update(msg_buf).digest());
-  msg_buf[2] = b2; msg_buf[3] = b3;
-  return hmac;
+  // RFC 5389 §15.4 — SHA1-HMAC, always 20 bytes
+  return compute_integrity_hmac('sha1', 20, msg_buf, key, 20);
 }
 
-// HMAC-SHA256 integrity (RFC 8489)
+// HMAC-SHA256 integrity (RFC 8489 §14.6)
 function compute_integrity_sha256(msg_buf, key, truncate_len) {
-  var b2 = msg_buf[2], b3 = msg_buf[3];
-  var hmac_len = truncate_len || 32;
-  var new_len = (msg_buf.length - HEADER_SIZE) + 4 + hmac_len;
-  msg_buf[2] = (new_len >>> 8) & 0xFF;
-  msg_buf[3] = new_len & 0xFF;
-  var full_hmac = new Uint8Array(crypto.createHmac('sha256', key).update(msg_buf).digest());
-  msg_buf[2] = b2; msg_buf[3] = b3;
-  return hmac_len < 32 ? full_hmac.slice(0, hmac_len) : full_hmac;
+  return compute_integrity_hmac('sha256', 32, msg_buf, key, truncate_len || 32);
 }
 
-// Generic HMAC integrity for any algorithm (coturn supports SHA384/SHA512)
+// Generic HMAC integrity. Supports SHA1 (RFC 5389), SHA256 (RFC 8489),
+// and the extended SHA384/SHA512 variants (coturn supports them for
+// defense-in-depth).
+//
+// IMPORTANT: this function temporarily rewrites bytes 2-3 of msg_buf
+// (the STUN length field) to include the forthcoming integrity attribute,
+// computes the HMAC, then restores the original length. This matches
+// RFC 5389 §15.4 which requires the length field to include the
+// MESSAGE-INTEGRITY attribute when computing the HMAC.
 function compute_integrity_hmac(algo, digest_len, msg_buf, key, truncate_len) {
   var b2 = msg_buf[2], b3 = msg_buf[3];
   var hmac_len = truncate_len || digest_len;
-  var new_len = (msg_buf.length - HEADER_SIZE) + 4 + hmac_len;
+  // SHA1 integrity attribute = 4-byte header + 20 data bytes = 24 total.
+  // All other variants have the same 4-byte header + truncated HMAC.
+  var attr_total_bytes = (algo === 'sha1') ? 24 : (4 + hmac_len);
+  var new_len = (msg_buf.length - HEADER_SIZE) + attr_total_bytes;
   msg_buf[2] = (new_len >>> 8) & 0xFF;
   msg_buf[3] = new_len & 0xFF;
   var full_hmac = new Uint8Array(crypto.createHmac(algo, key).update(msg_buf).digest());
@@ -758,25 +767,21 @@ function compute_integrity_sha512(msg_buf, key) {
   return compute_integrity_hmac('sha512', 64, msg_buf, key, 64);
 }
 
-function validate_integrity_sha256(raw_buf, integrity_offset, key) {
-  var attr_len_off = integrity_offset + 2;
-  var hmac_len = (raw_buf[attr_len_off] << 8) | raw_buf[attr_len_off + 1];
-  var before = raw_buf.slice(0, integrity_offset);
-  var expected = compute_integrity_sha256(before, key, hmac_len);
-  var actual = raw_buf.slice(integrity_offset + 4, integrity_offset + 4 + hmac_len);
-  if (expected.length !== actual.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
-}
-
-// Generic validation: detects SHA variant by attribute value length
-// 20=SHA1, 32=SHA256, 48=SHA384, 64=SHA512
+// Timing-safe comparison to prevent timing attacks. Generic — detects SHA
+// variant by attribute value length (20=SHA1, 32=SHA256, 48=SHA384, 64=SHA512).
+// Use validate_integrity() for SHA1-only (fast path) or this for any variant.
 function validate_integrity_by_length(raw_buf, integrity_offset, key) {
   var attr_len_off = integrity_offset + 2;
   var hmac_len = (raw_buf[attr_len_off] << 8) | raw_buf[attr_len_off + 1];
-  var before = raw_buf.slice(0, integrity_offset);
+  // Detach: compute_integrity_hmac temporarily mutates bytes [2,3] of its
+  // input to rewrite the STUN length. If raw_buf is a Buffer, .slice() returns
+  // a *view* and those mutations would leak to other views of the same memory
+  // (attributes, tid). Force a copy here.
+  var before_raw = raw_buf.slice(0, integrity_offset);
+  var before = Buffer.isBuffer(before_raw) ? new Uint8Array(before_raw) : before_raw;
   var expected;
-  if (hmac_len === 20) expected = compute_integrity(before, key);
-  else if (hmac_len <= 32) expected = compute_integrity_sha256(before, key, hmac_len);
+  if (hmac_len === 20)      expected = compute_integrity(before, key);
+  else if (hmac_len <= 32)  expected = compute_integrity_sha256(before, key, hmac_len);
   else if (hmac_len === 48) expected = compute_integrity_sha384(before, key);
   else if (hmac_len === 64) expected = compute_integrity_sha512(before, key);
   else return false;
@@ -785,9 +790,17 @@ function validate_integrity_by_length(raw_buf, integrity_offset, key) {
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
 }
 
-// Timing-safe comparison to prevent timing attacks
+// Alias: validate SHA-256 integrity explicitly.
+function validate_integrity_sha256(raw_buf, integrity_offset, key) {
+  return validate_integrity_by_length(raw_buf, integrity_offset, key);
+}
+
+// Fast path: validate SHA-1 integrity (RFC 5389, used by ICE connectivity checks).
+// Skips variant detection — caller guarantees SHA-1.
 function validate_integrity(raw_buf, integrity_offset, key) {
-  var before = raw_buf.slice(0, integrity_offset);
+  // Same detach as validate_integrity_by_length — see comment there.
+  var before_raw = raw_buf.slice(0, integrity_offset);
+  var before = Buffer.isBuffer(before_raw) ? new Uint8Array(before_raw) : before_raw;
   var expected = compute_integrity(before, key);
   var actual = raw_buf.slice(integrity_offset + 4, integrity_offset + 4 + 20);
   if (expected.length !== actual.length) return false;

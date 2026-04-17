@@ -10,6 +10,16 @@ import Session from './session.js';
 import * as wire from './wire.js';
 
 
+// Zero-copy Uint8Array → Buffer conversion. Node's dgram.send() and
+// stream.write() accept Uint8Array since Node 18, but internally some
+// paths are optimized for Buffer. Buffer.from(u.buffer, ...) creates a
+// Buffer *view* over the same memory — no copy.
+function toBuffer(u) {
+  if (Buffer.isBuffer(u)) return u;
+  return Buffer.from(u.buffer, u.byteOffset, u.byteLength);
+}
+
+
 function Socket(options) {
   if (!(this instanceof Socket)) return new Socket(options);
   options = options || {};
@@ -97,7 +107,10 @@ function Socket(options) {
     if (context.transportType === 'udp') {
       context.transport.on('message', function(msg) {
         if (context.destroyed) return;
-        session.message(new Uint8Array(msg));
+        // HOT PATH: msg is a Buffer. With r_bytes/validate_integrity fixed
+        // to detach when needed, passing Buffer directly is safe and saves
+        // a ~1200-byte copy per incoming packet.
+        session.message(msg);
       });
     } else {
       // TCP / TLS — 2-byte length prefix framing
@@ -133,7 +146,8 @@ function Socket(options) {
           if (_tcpLen < 2 + frameLen) break;
           consumeBytes(2); // skip length header
           var frame = consumeBytes(frameLen);
-          session.message(new Uint8Array(frame));
+          // HOT PATH: frame is a Buffer — pass directly, no wrapping.
+          session.message(frame);
         }
       }
     }
@@ -161,14 +175,16 @@ function Socket(options) {
     if (!context.transport || context.destroyed) return;
 
     if (context.transportType === 'udp') {
-      var msg = Buffer.from(buf);
+      // HOT PATH: buf is Uint8Array from wire.encode_message. toBuffer() gives
+      // a zero-copy Buffer view over the same memory.
+      var msg = toBuffer(buf);
       context.transport.send(msg, 0, msg.length, context.serverPort, context.serverHost, function(err) {
         if (err) ev.emit('error', err);
       });
     } else {
       // TCP/TLS: add 2-byte length framing
       var framed = wire.tcp_frame(buf);
-      context.transport.write(Buffer.from(framed));
+      context.transport.write(toBuffer(framed));
     }
   }
 
@@ -380,11 +396,12 @@ function Socket(options) {
       // Check if there's a channel binding for this peer
       var channel = session.getChannelByPeer(from.ip, from.port);
       if (channel !== null) {
-        // Send as ChannelData (more efficient)
-        session.sendChannelData(channel, new Uint8Array(data));
+        // Send as ChannelData (more efficient). `data` is Buffer from dgram —
+        // pass directly, wire.encode_channel_data works on both Buffer and Uint8Array.
+        session.sendChannelData(channel, data);
       } else {
         // Send as Data indication
-        session.sendData(from, new Uint8Array(data));
+        session.sendData(from, data);
       }
 
       // Info event: onRelayed (peer → client, inbound)
@@ -418,7 +435,9 @@ function Socket(options) {
   session.on('relay', function(peer, data) {
     if (!context.relaySocket || context.destroyed) return;
 
-    context.relaySocket.send(Buffer.from(data), 0, data.length, peer.port, peer.ip, function(err) {
+    // HOT PATH: zero-copy Buffer view (was Buffer.from(data) which copied).
+    var out = toBuffer(data);
+    context.relaySocket.send(out, 0, out.length, peer.port, peer.ip, function(err) {
       if (err) ev.emit('error', err);
     });
 
@@ -437,7 +456,10 @@ function Socket(options) {
   session.on('data', function(peer, data, channel) {
     if (!context.relaySocket || context.destroyed) return;
 
-    context.relaySocket.send(Buffer.from(data), 0, data.length, peer.port, peer.ip, function(err) {
+    // HOT PATH: zero-copy Buffer view. ChannelData is typically 30-50 pkt/sec
+    // per active channel in media calls — saves a 1200-byte copy per RTP.
+    var out = toBuffer(data);
+    context.relaySocket.send(out, 0, out.length, peer.port, peer.ip, function(err) {
       if (err) ev.emit('error', err);
     });
 
@@ -482,10 +504,10 @@ function Socket(options) {
     var conn = context.tcpPeerConnections[connectionId];
     if (!conn) { cb(new Error('No connection for ID')); return; }
 
-    // Data from peer → send to client
+    // Data from peer → send to client. `data` is already a Buffer.
     conn.on('data', function(data) {
       if (context.destroyed) return;
-      session.sendData(peer, new Uint8Array(data));
+      session.sendData(peer, data);
     });
 
     conn.on('close', function() {

@@ -1,10 +1,11 @@
-
 import dns from 'node:dns';
 
 import Session from './src/session.js';
 import Socket from './src/socket.js';
 import { Server, createServer } from './src/server.js';
 import * as wire from './src/wire.js';
+import { IceAgent } from './src/ice_agent.js';
+import * as candidate from './src/ice_candidate.js';
 
 
 /* ====================== TURN URI + DNS SRV ====================== */
@@ -198,6 +199,16 @@ function detectNAT(server, options, cb) {
 
 /* ====================== Exports ====================== */
 
-export { Session, Socket, Server, createServer, connect, getPublicIP, detectNAT, resolve, wire };
+export {
+  Session, Socket, Server, createServer,
+  connect, getPublicIP, detectNAT, resolve,
+  wire,
+  IceAgent, candidate,
+};
 
-export default { Session, Socket, Server, createServer, connect, getPublicIP, detectNAT, resolve, wire };
+export default {
+  Session, Socket, Server, createServer,
+  connect, getPublicIP, detectNAT, resolve,
+  wire,
+  IceAgent, candidate,
+};

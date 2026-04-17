@@ -23,15 +23,16 @@
 2. [Why turn-server?](#-why-turn-server)
 3. [Quick Start](#-quick-start)
 4. [Features](#-features)
-5. [Hooks API](#-hooks-api)
-6. [Client API](#-client-api)
-7. [Comparison](#-comparison)
-8. [Performance](#-performance)
-9. [Interoperability Testing](#-interoperability-testing)
-10. [Project Structure](#-project-structure)
-11. [Roadmap](#-roadmap)
-12. [Sponsors](#-sponsors)
-13. [License](#-license)
+5. [ICE Agent](#-ice-agent)
+6. [Hooks API](#-hooks-api)
+7. [Client API](#-client-api)
+8. [Comparison](#-comparison)
+9. [Performance](#-performance)
+10. [Interoperability Testing](#-interoperability-testing)
+11. [Project Structure](#-project-structure)
+12. [Roadmap](#-roadmap)
+13. [Sponsors](#-sponsors)
+14. [License](#-license)
 
 
 ## ⚡ What is STUN / TURN?
@@ -212,6 +213,156 @@ const client = connect('turn:turn.example.com:3478?transport=udp', {
 - 300 Try Alternate redirect handling
 - Transaction ID validation on responses
 
+### ICE Agent (RFC 8445 / 7675 / 8839)
+- **Full and Lite modes** - Full initiates checks (clients, SFU gateways); Lite only responds (server-side ICE per RFC 8445 §2.4)
+- **Vanilla and Trickle gathering** - emit candidates incrementally or batch until complete
+- **Candidate types** - host, server-reflexive (srflx), peer-reflexive (prflx), relay (TURN) - IPv4 and IPv6
+- **Multi-homed gathering** - srflx fan-out per host base (RFC 8445 §5.1.1.1) across all interfaces
+- **Multiple ICE servers** - mixing STUN + TURN, multiple TURN servers, multiple URIs per server - all gathered in parallel with graceful degradation on failures
+- **Regular nomination** - controlling agent uses USE-CANDIDATE (RFC 8445 §8.1.1.1)
+- **Peer-reflexive construction** - symmetric NAT handling per RFC 8445 §7.2.5.3 (new valid pair with prflx local, not re-marking original)
+- **Role conflict resolution** - RFC 8445 §7.3.1.1 tie-breaker with 487 error responses and role-flip
+- **Consent freshness** (RFC 7675) - 15s interval with ±20% jitter, disconnected at 30s, failed at 45s
+- **ICE restart** (RFC 8445 §9) - seamless media continuity via previous-pair fallback; `agent.send()` keeps working during restart window
+- **iceTransportPolicy** - `'all'` or `'relay'` (TURN-only, for privacy/firewall scenarios)
+- **MESSAGE-INTEGRITY validation** on 401/438/487 error responses (prevents role-flip spoofing)
+- **Link-local filtering** - skips 169.254.x.x (RFC 3927) and IPv6 fe80:: / 100::
+- **mDNS support** - `.local` candidate addresses (RFC 8839)
+
+
+## 🧰 ICE Agent
+
+A complete **RFC 8445** ICE agent, usable standalone or as the ICE layer for a full WebRTC stack. Exposed as `IceAgent`, with a reactive event-driven API that mirrors the patterns of `RTCPeerConnection.iceTransports[0]`.
+
+### Minimal usage
+
+```js
+import { IceAgent } from 'turn-server';
+
+const agent = new IceAgent({
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'turn:turn.example.com:3478', username: 'alice', credential: 'secret' },
+  ],
+  mode: 'full',        // 'full' | 'lite'
+  trickle: true,
+  controlling: true,   // offerer = true, answerer = false
+});
+
+// Local credentials (auto-generated, or supply in constructor)
+const { ufrag, pwd } = agent.localParameters;
+
+// Candidate discovery
+agent.on('candidate', (c) => {
+  if (c === null) { /* end-of-candidates */ return; }
+  signaling.sendCandidate(c);
+});
+
+// State transitions: new → checking → connected → disconnected → failed
+agent.on('statechange',  (next, prev) => console.log('ICE:', prev, '→', next));
+agent.on('selectedpair', (pair) => console.log('Using', pair.local.ip, '→', pair.remote.ip));
+agent.on('packet',       (buf, rinfo, type) => { /* DTLS / RTP / RTCP */ });
+
+// Peer exchange
+agent.setRemoteParameters({ ufrag: peerUfrag, pwd: peerPwd });
+for (const c of peerCandidates) agent.addRemoteCandidate(c);
+agent.addRemoteCandidate(null);   // end-of-candidates
+
+agent.gather();                   // start gathering host + srflx + relay
+// after 'selectedpair':
+agent.send(Buffer.from('hello'));
+```
+
+### Configuration
+
+| Option | Default | Description |
+|---|---|---|
+| `iceServers` | `[]` | Array of `{ urls, username?, credential? }` (WebRTC API format) |
+| `mode` | `'full'` | `'full'` (sends + receives checks) or `'lite'` (only receives; for SFUs) |
+| `trickle` | `true` | Emit candidates as found (`true`) or batch until complete (`false`) |
+| `controlling` | `true` | `true` = offerer (sends USE-CANDIDATE), `false` = answerer |
+| `iceTransportPolicy` | `'all'` | `'all'` (host + srflx + relay) or `'relay'` (only TURN) |
+| `includeLoopback` | `false` | Include `127.0.0.1` / `::1` in host candidates (testing only) |
+| `ipv6` | `true` | Gather IPv6 candidates |
+| `ufrag` / `pwd` | auto | Local credentials (auto-generated if omitted; 24-bit ufrag, 128-bit pwd) |
+
+`iceServers[].urls` can be a string or an array. Each URL can carry `?transport=udp|tcp`. For `turns://` URLs, additional TLS options `servername`, `rejectUnauthorized`, `ca` are honored.
+
+### Events
+
+| Event | Payload | When |
+|---|---|---|
+| `candidate` | `(cand)` | Each local candidate found; `null` signals end-of-candidates |
+| `statechange` | `(next, prev)` | `new` / `checking` / `connected` / `disconnected` / `failed` / `closed` |
+| `gatheringstatechange` | `(next, prev)` | `new` / `gathering` / `complete` |
+| `selectedpair` | `(pair, prev?)` | A valid pair was nominated and selected |
+| `paircheck` | `(pair, success)` | A connectivity check completed |
+| `packet` | `(buf, rinfo, type)` | Non-STUN payload (DTLS/RTP/RTCP/channel-data) |
+| `candidateerror` | `(error)` | Gathering a srflx/relay candidate failed (e.g., STUN timeout, TURN auth) |
+| `rolechange` | `('controlling' \| 'controlled')` | Role flipped (RFC 8445 §7.3.1.1) |
+| `restart` | `({ ufrag, pwd })` | `agent.restart()` was called |
+
+### Multiple ICE servers
+
+Pass as many as you want. Host/srflx/relay candidates are gathered from **every** server **in parallel**:
+
+```js
+new IceAgent({
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'turn:turn1.example.com:3478',     username: 'u1', credential: 'p1' },
+    { urls: 'turn:turn2.example.com:3478',     username: 'u2', credential: 'p2' },
+    { urls: 'turns:turn-tls.example.com:5349', username: 'u3', credential: 'p3' },
+  ],
+});
+```
+
+If some servers fail (timeout, auth error), `candidateerror` is emitted per failure and the agent proceeds with whatever candidates did come back. ICE then picks the best pair by priority (host > srflx > relay, RFC 8445 §5.1.2).
+
+### ICE restart (RFC 8445 §9)
+
+Unlike the "hard reset" approach used by pion/werift/aioice (which clears `selectedPair` immediately and interrupts media for 1-3 seconds), this agent implements **seamless restart** per RFC 8445 §9:
+
+```js
+const { ufrag, pwd } = agent.restart();
+// - Clears check state + remote creds
+// - Moves the OLD selectedPair to an internal _previousPair
+// - agent.send() keeps flowing via _previousPair during the restart window
+
+// Signal the new local creds to the peer via your SDP layer
+signaling.sendRestartOffer(ufrag, pwd);
+const answer = await signaling.receiveRestartAnswer();
+
+agent.setRemoteParameters({ ufrag: answer.ufrag, pwd: answer.pwd });
+for (const c of answer.candidates) agent.addRemoteCandidate(c);
+agent.gather();
+
+// When a new pair wins nomination, selection switches automatically.
+// _previousPair is dropped; agent.send() seamlessly switches to the new pair.
+```
+
+The result is **zero packet loss during restart** when the old path is still functional (e.g., user-initiated restart). For restarts triggered by a dead path (~85% of real-world restarts), the behavior matches the hard-reset approach.
+
+### Using IceAgent with your own TURN client socket
+
+If you already have a `Socket` (from `connect()` or a custom transport), pass it as `externalSocket`:
+
+```js
+import { connect, IceAgent } from 'turn-server';
+
+connect('turn:my-turn.example.com:3478', { username: 'u', password: 'p' }, (err, sock) => {
+  const agent = new IceAgent({
+    externalSocket: sock,     // IceAgent will not bind its own sockets
+    iceServers: [],           // no extra gathering
+    mode: 'full',
+    controlling: true,
+  });
+  agent.gather();
+});
+```
+
+
 
 ## 🪝 Hooks API
 
@@ -337,6 +488,9 @@ resolve('turn:example.com', (err, parsed) => {
 | **NAT detection (RFC 5780)** | ✅ | ❌ | ❌ | ✅ |
 | **OAuth (RFC 7635)** | ✅ | ❌ | ❌ | ✅ |
 | **ICE attrs (RFC 8445)** | ✅ | ❌ | ❌ | ✅ |
+| **ICE agent (RFC 8445)** | ✅ full + lite | ❌ | ❌ | ✅ |
+| **Consent freshness (RFC 7675)** | ✅ | ❌ | ❌ | ✅ |
+| **ICE restart (RFC 8445 §9)** | ✅ seamless | ❌ | ❌ | ✅ |
 | **RFC 5769 test vectors** | ✅ 22/22 | ❌ | ✅ | ✅ |
 | **Attributes** | 62 | ~8 | ~15 | 62+ |
 | | | | | |
@@ -435,12 +589,14 @@ new RTCPeerConnection({
 
 ```
 turn-server/
-├── index.js               - Public API: connect, getPublicIP, detectNAT, resolve
+├── index.js               - Public API: connect, getPublicIP, detectNAT, resolve, IceAgent
 └── src/
     ├── wire.js              - Binary protocol: 62 attributes, encode/decode, integrity, CRC32
     ├── session.js           - State machine: auth, allocations, permissions, channels, hooks
     ├── socket.js            - Transport: UDP/TCP/TLS client, relay socket, ChannelData routing
-    └── server.js            - Multi-endpoint listener, 5-tuple routing, convenience limits
+    ├── server.js            - Multi-endpoint listener, 5-tuple routing, convenience limits
+    ├── ice_agent.js         - ICE agent (RFC 8445): gathering, checks, nomination, consent, restart
+    └── ice_candidate.js     - Candidate primitives: priority, foundation, SDP parse/format (RFC 8839)
 ```
 
 | File | Lines | Role |
@@ -449,8 +605,10 @@ turn-server/
 | `session.js` | 1,586 | Protocol logic - state machine, auth, hooks |
 | `socket.js` | 658 | Network I/O - UDP, TCP, TLS, relay sockets |
 | `server.js` | 731 | Server orchestration - listeners, routing, limits |
+| `ice_agent.js` | 2,349 | ICE agent - gathering, pairing, checks, nomination, consent, restart |
+| `ice_candidate.js` | 459 | Candidate primitives - priority, foundation, SDP parse/format |
 | `index.js` | 203 | Client convenience - connect, DNS, NAT detection |
-| **Total** | **4,237** | **Zero dependencies** |
+| **Total** | **7,045** | **Zero dependencies** |
 
 
 ## 🛣 Roadmap
@@ -462,6 +620,9 @@ turn-server/
 - NAT detection (RFC 5780) - CHANGE-REQUEST, OTHER-ADDRESS
 - OAuth (RFC 7635) - token-based auth with event delegation
 - ICE attributes (RFC 8445) - PRIORITY, USE-CANDIDATE, ICE-CONTROLLED/CONTROLLING
+- **ICE agent (RFC 8445) - full + lite modes, trickle, gathering (host/srflx/relay), connectivity checks, regular nomination, peer-reflexive construction, role conflict resolution, ICE restart with seamless media continuity**
+- **Consent Freshness (RFC 7675) - 15s interval with ±20% jitter, auto-transitions to disconnected/failed**
+- **Candidate primitives (RFC 8839) - priority formula, foundation computation, SDP parse/format, mDNS**
 - Multiplexing (RFC 7983) - STUN/TURN/DTLS demultiplexing
 - RFC 5769 test vectors - 22/22 validated
 - All 62 IANA-registered STUN attributes including vendor extensions
@@ -481,7 +642,7 @@ turn-server/
 - Origin consistency checking
 - UDP idle timeout + graceful drain
 - Statistics and health checks
-- 297 tests passing
+- 450+ tests passing (297 core + 153 ICE)
 
 ### ⏳ Planned
 - DTLS transport (pending LemonTLS DTLS support)

@@ -1,7 +1,7 @@
 {
   "name": "turn-server",
-  "version": "0.1.0",
-  "description": "STUN/TURN server and client for Node.js",
+  "version": "0.2.0",
+  "description": "STUN/TURN server + full ICE agent for Node.js",
   "type": "module",
   "main": "index.cjs",
   "module": "index.js",
@@ -23,7 +23,7 @@
     "LICENSE",
     "README.md"
   ],
-  "keywords": ["stun", "turn", "webrtc", "ice", "nat", "rfc5389", "rfc5766"],
+  "keywords": ["stun", "turn", "webrtc", "ice", "nat", "rfc5389", "rfc5766", "rfc8445", "rfc7675"],
   "author": {
     "name": "colocohen"
   },
