@@ -152,6 +152,33 @@ function IceAgent(options) {
   if (!(this instanceof IceAgent)) return new IceAgent(options);
   options = options || {};
 
+  // ── External socket validation ──
+  // When running on a shared UDP port (server-side ICE Lite scenario),
+  // the caller provides a pre-bound dgram.Socket via options.socket
+  // (IPv4) and/or options.socket6 (IPv6). Sockets MUST be bound before
+  // being passed — we validate this immediately so errors surface early.
+  if (options.socket) {
+    try { options.socket.address(); }
+    catch (e) { throw new Error('options.socket must be bound before new IceAgent()'); }
+  }
+  if (options.socket6) {
+    try { options.socket6.address(); }
+    catch (e) { throw new Error('options.socket6 must be bound before new IceAgent()'); }
+  }
+
+  const hasExternal = !!(options.socket || options.socket6);
+
+  // Default mode: 'lite' when using shared socket (server scenario),
+  // 'full' otherwise (client scenario). Explicit options.mode wins.
+  const resolvedMode = options.mode === 'lite' ? 'lite' :
+                       options.mode === 'full' ? 'full' :
+                       (hasExternal ? 'lite' : 'full');
+
+  // ICE Lite MUST be controlled (RFC 8445 §6.1.1). In 'full' mode, default
+  // to controlling (offerer role). Explicit options.controlling wins.
+  const resolvedControlling = options.controlling !== undefined ? !!options.controlling :
+                              (resolvedMode === 'lite' ? false : true);
+
   const ev = new EventEmitter();
   const self = this;
 
@@ -161,9 +188,9 @@ function IceAgent(options) {
   let context = {
 
     // ── Identity & config ──
-    mode:                 options.mode === 'lite' ? 'lite' : 'full',
+    mode:                 resolvedMode,
     trickle:              options.trickle !== false,            // default true
-    controlling:          options.controlling !== false,         // default true (offerer)
+    controlling:          resolvedControlling,
     iceServers:           options.iceServers || [],
     iceTransportPolicy:   options.iceTransportPolicy || 'all',   // 'all' | 'relay'
     includeLoopback:      !!options.includeLoopback,
@@ -200,7 +227,14 @@ function IceAgent(options) {
     // ── Sockets ──
     sockets:              {},    // key 'family:ip:port' → dgram.Socket
     primarySocket:        null,  // preferred socket for sending (set by selection)
-    externalSocket:       null,  // externally-provided socket (useSocket)
+    externalSocket:       options.socket  || null,  // externally-provided IPv4 socket
+    externalSocket6:      options.socket6 || null,  // externally-provided IPv6 socket
+
+    // ── Announced addresses — override host candidate IPs/ports.
+    // Useful when the bind address ≠ public address (NAT, cloud, 0.0.0.0 bind).
+    // Each entry is either a string (IP) or { ip, port }. When omitted, falls
+    // back to reading socket.address() as before.
+    announcedAddresses:   options.announcedAddresses || null,
 
     // ── TURN clients (for relay candidates) ──
     turnClients:          {},    // key 'host:port' → turn Socket
@@ -288,6 +322,13 @@ function IceAgent(options) {
         // Role change → recompute pair priorities + re-sort
         recomputePairPriorities();
         ev.emit('rolechange', context.controlling ? 'controlling' : 'controlled');
+      }
+    }
+
+    if ('announcedAddresses' in opts) {
+      if (opts.announcedAddresses !== context.announcedAddresses) {
+        context.announcedAddresses = opts.announcedAddresses;
+        has_changed = true;
       }
     }
 
@@ -470,6 +511,11 @@ function IceAgent(options) {
 
     if ('externalSocket' in opts) {
       context.externalSocket = opts.externalSocket;
+      has_changed = true;
+    }
+
+    if ('externalSocket6' in opts) {
+      context.externalSocket6 = opts.externalSocket6;
       has_changed = true;
     }
 
@@ -684,6 +730,24 @@ function IceAgent(options) {
       transactionId:   null,
       lastSent:        0,
       encodedCheck:    null,
+
+      // ── Stats counters (W3C RTCIceCandidatePairStats) ───────────────────
+      // Populated by sendBindingCheck/sendConsentCheck/onCheckResponse and
+      // by handleBindingRequest. Zero-valued until first activity.
+      roundTripTime:      0,        // seconds, last measured (response - request)
+      totalRoundTripTime: 0,        // seconds, sum of all measurements
+      rttMeasurements:    0,        // count of successful response arrivals
+      requestsSent:       0,        // connectivity checks we sent
+      responsesReceived:  0,        // responses to our checks
+      requestsReceived:   0,        // peer's connectivity checks we got
+      responsesSent:      0,        // our responses to peer's checks
+      consentRequestsSent: 0,       // consent keepalives we sent
+      bytesSent:          0,        // STUN bytes sent on this pair
+      bytesReceived:      0,        // STUN bytes received on this pair
+      packetsSent:        0,        // STUN packets sent on this pair
+      packetsReceived:    0,        // STUN packets received on this pair
+      lastPacketSentTimestamp:     0,
+      lastPacketReceivedTimestamp: 0,
     };
   }
 
@@ -824,10 +888,51 @@ function IceAgent(options) {
   /* ── Host candidate gathering ── */
 
   function gatherHostCandidates(done) {
-    // If external socket is provided, use it directly as the only host.
-    if (context.externalSocket) {
-      const addr = context.externalSocket.address();
-      addHostFromBoundSocket(context.externalSocket, addr);
+    // If external socket(s) provided, use them as the only host candidates.
+    // Supports IPv4 and/or IPv6 (dual-stack = both provided). This is the
+    // shared-UDP-port server scenario — skip interface enumeration entirely.
+    //
+    // When context.announcedAddresses is set, the IPs/ports in those entries
+    // override what socket.address() would report. This is essential for
+    // cloud/NAT deployments where the bind IP (often 0.0.0.0) differs from
+    // the public address the peer needs to reach. Each entry can be either a
+    // string ('1.2.3.4') or an object ({ ip, port }). Family is inferred from
+    // IP shape; port falls back to the socket's bound port when unspecified.
+    if (context.externalSocket || context.externalSocket6) {
+      const announced = context.announcedAddresses;
+
+      if (announced && announced.length > 0) {
+        for (let i = 0; i < announced.length; i++) {
+          const a = announced[i];
+          const ip = typeof a === 'string' ? a : a.ip;
+          if (!ip) continue;
+          const family = ip.indexOf(':') >= 0 ? 'IPv6' : 'IPv4';
+          const sock = family === 'IPv6' ? context.externalSocket6 : context.externalSocket;
+          if (!sock) continue;  // no socket for this family — skip
+          let sockAddr;
+          try { sockAddr = sock.address(); } catch (_) { continue; }
+          const port = (typeof a === 'object' && a.port) ? a.port : sockAddr.port;
+          addHostFromBoundSocket(sock, { address: ip, port: port, family: family });
+        }
+      } else {
+        // No announced addresses — use the bind addresses (legacy behavior).
+        if (context.externalSocket) {
+          const addr = context.externalSocket.address();
+          addHostFromBoundSocket(context.externalSocket, {
+            address: addr.address,
+            port:    addr.port,
+            family:  addr.family || 'IPv4',
+          });
+        }
+        if (context.externalSocket6) {
+          const addr = context.externalSocket6.address();
+          addHostFromBoundSocket(context.externalSocket6, {
+            address: addr.address,
+            port:    addr.port,
+            family:  addr.family || 'IPv6',
+          });
+        }
+      }
       done();
       return;
     }
@@ -1381,6 +1486,14 @@ function IceAgent(options) {
     pair.retransmits   = 0;
     pair.encodedCheck  = encoded.buf;   // saved for retransmits
 
+    // Stats: count this binding request (before send — we want to count the
+    // attempt even if transmission fails). Retransmits are counted on their
+    // own path (scheduleRetransmit).
+    pair.requestsSent++;
+    pair.bytesSent        += encoded.buf.length;
+    pair.packetsSent++;
+    pair.lastPacketSentTimestamp = pair.lastSent;
+
     context.pendingTransactions[txHex] = {
       kind:     'check',
       pair:     pair,
@@ -1440,6 +1553,21 @@ function IceAgent(options) {
       set_context({ pair_failed: pair });
       return;
     }
+
+    // Stats: record RTT, byte/packet counters for this response.
+    // RFC 7064 / RFC 8445 — RTT is (response arrival) - (request send).
+    const nowMs = Date.now();
+    if (pair.lastSent) {
+      const rttMs = nowMs - pair.lastSent;
+      pair.roundTripTime      = rttMs / 1000;           // seconds (spec format)
+      pair.totalRoundTripTime += rttMs / 1000;
+      pair.rttMeasurements++;
+    }
+    pair.responsesReceived++;
+    pair.packetsReceived++;
+    // Best-effort — msg.raw length, else approximate by the MI-truncated header.
+    pair.bytesReceived += (msg && msg.raw && msg.raw.length) ? msg.raw.length : 20;
+    pair.lastPacketReceivedTimestamp = nowMs;
 
     // Validate XOR-MAPPED-ADDRESS presence (RFC 8489)
     const mapped = msg.getAttribute(wire.ATTR.XOR_MAPPED_ADDRESS)
@@ -1624,6 +1752,7 @@ function IceAgent(options) {
     });
 
     const txHex = txIdHex(encoded.transactionId);
+    const consentSentAt = Date.now();
     const timer = setTimeout(function() {
       const p = context.pendingTransactions[txHex];
       if (!p) return;
@@ -1632,14 +1761,30 @@ function IceAgent(options) {
     }, 10_000);
     if (timer.unref) timer.unref();
 
+    // Stats — count the consent attempt on the selected pair.
+    pair.consentRequestsSent++;
+    pair.requestsSent++;
+    pair.bytesSent += encoded.buf.length;
+    pair.packetsSent++;
+    pair.lastPacketSentTimestamp = consentSentAt;
+
     context.pendingTransactions[txHex] = {
       kind: 'consent',
       pair: pair,
       timer: timer,
-      callback: function(_msg, _rinfo, err) {
+      callback: function(msg, _rinfo, err) {
         delete context.pendingTransactions[txHex];
         if (timer) clearTimeout(timer);
         if (err) return;   // no response → leave lastSuccessAt stale
+        // Stats: RTT from consent response + byte/packet counters.
+        const rttMs = Date.now() - consentSentAt;
+        pair.roundTripTime       = rttMs / 1000;
+        pair.totalRoundTripTime += rttMs / 1000;
+        pair.rttMeasurements++;
+        pair.responsesReceived++;
+        pair.packetsReceived++;
+        pair.bytesReceived += (msg && msg.raw && msg.raw.length) ? msg.raw.length : 20;
+        pair.lastPacketReceivedTimestamp = Date.now();
         // Successful response → feed back through set_context so cascades re-run.
         set_context({ consentLastSuccessAt: Date.now() });
       },
@@ -1713,8 +1858,26 @@ function IceAgent(options) {
       if (local) pair = tryMakePair(local, remoteCand);
     }
 
+    // Stats: count this binding request on the pair (if we have one).
+    if (pair) {
+      pair.requestsReceived++;
+      pair.packetsReceived++;
+      pair.bytesReceived += buf.length;
+      pair.lastPacketReceivedTimestamp = Date.now();
+    }
+
     // Always respond — even before processing, the peer needs a Success
     sendBindingSuccess(msg, rinfo, sock, turnSocket);
+
+    // Stats: we just sent a response.
+    if (pair) {
+      pair.responsesSent++;
+      pair.packetsSent++;
+      // Response size: STUN header (20) + XOR-MAPPED-ADDRESS (~12) + MI (~24) + FP (8)
+      // Precise size is computed by sendBindingSuccess; approximate here.
+      pair.bytesSent += 64;
+      pair.lastPacketSentTimestamp = Date.now();
+    }
 
     if (!pair) return;
 
@@ -2062,16 +2225,60 @@ function IceAgent(options) {
     }
     context.turnClients = {};
 
-    // Close UDP sockets (but not external)
+    // Close UDP sockets (but not external ones — they're owned by the caller)
     const skeys = Object.keys(context.sockets);
     for (let i = 0; i < skeys.length; i++) {
       const s = context.sockets[skeys[i]];
-      if (s !== context.externalSocket) {
+      if (s !== context.externalSocket && s !== context.externalSocket6) {
         try { s.close(); } catch (e) {}
       }
     }
     context.sockets = {};
     context.primarySocket = null;
+  }
+
+
+  /* ========================= External packet API ========================= */
+
+  // Feed an incoming UDP packet from an externally-managed socket.
+  // Called by the demuxer (e.g. WebRTCRouter) after the packet has been
+  // identified as ICE/STUN traffic for this agent. rinfo must be in Node's
+  // dgram format: { address, port, family, size }.
+  function handleIncomingPacket(msg, rinfo) {
+    if (context.closed) return;
+
+    // Select the right socket based on the packet's source family, so that
+    // STUN responses go back via the same family they arrived on.
+    const isV6 = rinfo.family === 'IPv6';
+    const sock = isV6 ? context.externalSocket6 : context.externalSocket;
+    if (!sock) return;  // this family not configured
+
+    onSocketMessage(msg, rinfo, sock);
+  }
+
+  // Check whether the given 5-tuple matches this agent's active pair.
+  // Used by WebRTCRouter for fast-path routing of subsequent packets:
+  // when a packet's rinfo matches a validated pair, we can route without
+  // parsing STUN USERNAME.
+  function hasValidatedPair(rinfo) {
+    if (context.closed) return false;
+    const ip = rinfo.address;
+    const port = rinfo.port;
+
+    // Fast path — current selected pair
+    const sp = context.selectedPair;
+    if (sp && sp.remote.ip === ip && sp.remote.port === port) return true;
+
+    // Previous pair during ICE restart (media still flows here)
+    const pp = context._previousPair;
+    if (pp && pp.remote.ip === ip && pp.remote.port === port) return true;
+
+    // Any other validated pair (rare, but correct)
+    for (let i = 0; i < context.validList.length; i++) {
+      const p = context.validList[i];
+      if (p.remote.ip === ip && p.remote.port === port) return true;
+    }
+    return false;
   }
 
 
@@ -2143,16 +2350,39 @@ function IceAgent(options) {
       startGathering();
     },
 
-    /** Provide an external socket to share instead of binding our own. */
+    /** Provide an external socket to share instead of binding our own.
+     *  Infers IPv4 vs IPv6 from the socket's address and stores it in
+     *  the appropriate context field. Prefer passing `socket`/`socket6`
+     *  directly in the constructor — this method exists for backward
+     *  compatibility and dynamic attachment after construction. */
     useSocket: function(sock) {
-      set_context({ externalSocket: sock });
-      if (sock) {
-        try {
-          const addr = sock.address();
-          addHostFromBoundSocket(sock, { address: addr.address, port: addr.port, family: addr.family });
-        } catch (e) {}
-      }
+      if (!sock) return;
+      try {
+        const addr = sock.address();
+        const family = addr.family ||
+          (addr.address && addr.address.indexOf(':') >= 0 ? 'IPv6' : 'IPv4');
+        if (family === 'IPv6') {
+          set_context({ externalSocket6: sock });
+        } else {
+          set_context({ externalSocket: sock });
+        }
+        addHostFromBoundSocket(sock, {
+          address: addr.address,
+          port:    addr.port,
+          family:  family,
+        });
+      } catch (e) {}
     },
+
+    /** Feed an incoming UDP packet when running in external-socket mode.
+     *  rinfo must be in Node's dgram format: { address, port, family, size }.
+     *  See RFC 9443 for the demuxing scheme on shared UDP ports. */
+    handlePacket: handleIncomingPacket,
+
+    /** Returns true if the given 5-tuple matches this agent's selected
+     *  pair, previous pair (during ICE restart), or any validated pair.
+     *  Used by demuxers for fast-path routing. */
+    hasValidatedPair: hasValidatedPair,
 
     /** Send application data through the selected pair. During an ICE
      *  restart, falls back to the previously-selected pair so that media

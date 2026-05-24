@@ -80,7 +80,36 @@ function Server(options) {
     listeners: [],
     clients: {},
     destroyed: false,
+
+    // ── External socket mode (shared UDP port) ──
+    // When set, Server does not create its own UDP socket. Instead, the user
+    // feeds packets via server.handlePacket(msg, rinfo) and queries state
+    // via server.hasClient(rinfo). See RFC 9443 for multiplexing scheme.
+    externalSocket:     options.socket  || null,    // IPv4 dgram.Socket (pre-bound)
+    externalSocket6:    options.socket6 || null,    // IPv6 dgram.Socket (pre-bound)
+    externalLocalAddr:  null,                        // cached from socket.address()
+    externalLocalAddr6: null,                        // cached from socket6.address()
   };
+
+  // Cache local addresses from external sockets. Sockets MUST be bound
+  // before being passed to createServer — this is validated here so errors
+  // surface immediately rather than on first packet.
+  if (context.externalSocket) {
+    try {
+      var _a4 = context.externalSocket.address();
+      context.externalLocalAddr = { ip: _a4.address, port: _a4.port };
+    } catch (e) {
+      throw new Error('options.socket must be bound before createServer()');
+    }
+  }
+  if (context.externalSocket6) {
+    try {
+      var _a6 = context.externalSocket6.address();
+      context.externalLocalAddr6 = { ip: _a6.address, port: _a6.port };
+    } catch (e) {
+      throw new Error('options.socket6 must be bound before createServer()');
+    }
+  }
 
 
   /* ====================== 5-tuple key ====================== */
@@ -292,6 +321,64 @@ function Server(options) {
   }
 
 
+  /* ====================== UDP packet processing ====================== */
+
+  // Shared between standalone start_udp() and external handlePacket().
+  // send_fn signature: send_fn(buf, dst_port, dst_ip)
+  function process_udp_packet(msg, rinfo, send_fn, local_addr) {
+    if (context.destroyed) return;
+    if (!local_addr) return;
+
+    var src = { ip: rinfo.address, port: rinfo.port };
+    var key = make_udp_key(rinfo.address, rinfo.port, local_addr.ip, local_addr.port);
+
+    var client = context.clients[key];
+    if (!client) {
+      // Reject new connections when draining
+      if (context.draining) return;
+      // Built-in maxConnections check
+      if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) return;
+      // Hook: accept
+      if (!check_hook('accept', { source: src, transport: 'udp' })) return;
+
+      // Capture rinfo values in closure — locked to this 5-tuple client.
+      var dst_port = rinfo.port;
+      var dst_ip   = rinfo.address;
+
+      client = create_client_socket(src, function(buf) {
+        // HOT PATH: zero-copy Buffer view. buf is Uint8Array from
+        // wire.encode_message — Buffer.from(u.buffer, offset, len) creates
+        // a view over the same memory rather than copying ~1200 bytes.
+        var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        send_fn(out, dst_port, dst_ip);
+      }, local_addr);
+
+      context.clients[key] = client;
+      client._idleTimer = setup_idle_timeout(key);
+      client._idleKey = key;
+
+      client.on('close', function() {
+        if (client._idleTimer) clearTimeout(client._idleTimer);
+        delete context.clients[key];
+      });
+    } else if (client._idleTimer) {
+      // Refresh idle timer without re-allocating the timer object.
+      // timer.refresh() is available since Node 10 — re-arms the existing
+      // handle, saving a syscall pair per packet.
+      if (typeof client._idleTimer.refresh === 'function') {
+        client._idleTimer.refresh();
+      } else {
+        clearTimeout(client._idleTimer);
+        client._idleTimer = setup_idle_timeout(client._idleKey);
+      }
+    }
+
+    // HOT PATH: msg is Buffer. wire's r_bytes and validate_integrity now
+    // handle Buffer input safely (see src/wire.js), so no wrapping needed.
+    client.feed(msg);
+  }
+
+
   /* ====================== UDP listener ====================== */
 
   function start_udp(config) {
@@ -305,59 +392,15 @@ function Server(options) {
     // after 'listening' fires, the address cannot change.
     var udp_local_addr = null;
 
+    // send function closed over the bound socket
+    var send_fn = function(out, dst_port, dst_ip) {
+      udp.send(out, 0, out.length, dst_port, dst_ip, function(err) {
+        if (err) ev.emit('error', err);
+      });
+    };
+
     udp.on('message', function(msg, rinfo) {
-      if (context.destroyed) return;
-      if (!udp_local_addr) return;  // received before 'listening' (shouldn't happen)
-
-      var src = { ip: rinfo.address, port: rinfo.port };
-      var key = make_udp_key(rinfo.address, rinfo.port, udp_local_addr.ip, udp_local_addr.port);
-
-      var client = context.clients[key];
-      if (!client) {
-        // Reject new connections when draining
-        if (context.draining) return;
-        // Built-in maxConnections check
-        if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) return;
-        // Hook: accept
-        if (!check_hook('accept', { source: src, transport: 'udp' })) return;
-
-        // Capture rinfo values in closure — locked to this 5-tuple client.
-        var dst_port = rinfo.port;
-        var dst_ip   = rinfo.address;
-
-        client = create_client_socket(src, function(buf) {
-          // HOT PATH: zero-copy Buffer view. buf is Uint8Array from
-          // wire.encode_message — Buffer.from(u.buffer, offset, len) creates
-          // a view over the same memory rather than copying ~1200 bytes.
-          var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
-          udp.send(out, 0, out.length, dst_port, dst_ip, function(err) {
-            if (err) ev.emit('error', err);
-          });
-        }, udp_local_addr);
-
-        context.clients[key] = client;
-        client._idleTimer = setup_idle_timeout(key);
-        client._idleKey = key;
-
-        client.on('close', function() {
-          if (client._idleTimer) clearTimeout(client._idleTimer);
-          delete context.clients[key];
-        });
-      } else if (client._idleTimer) {
-        // Refresh idle timer without re-allocating the timer object.
-        // timer.refresh() is available since Node 10 — re-arms the existing
-        // handle, saving a syscall pair per packet.
-        if (typeof client._idleTimer.refresh === 'function') {
-          client._idleTimer.refresh();
-        } else {
-          clearTimeout(client._idleTimer);
-          client._idleTimer = setup_idle_timeout(client._idleKey);
-        }
-      }
-
-      // HOT PATH: msg is Buffer. wire's r_bytes and validate_integrity now
-      // handle Buffer input safely (see src/wire.js), so no wrapping needed.
-      client.feed(msg);
+      process_udp_packet(msg, rinfo, send_fn, udp_local_addr);
     });
 
     udp.on('error', function(err) {
@@ -737,6 +780,45 @@ function Server(options) {
   }
 
 
+  /* ====================== External socket API ====================== */
+
+  // Feed an incoming UDP packet from an externally-managed socket.
+  // rinfo must be in Node's dgram format: { address, port, family, size }.
+  // Called by the demuxer when a packet is identified as TURN traffic.
+  function handlePacket(msg, rinfo) {
+    if (context.destroyed) return;
+
+    // Select the right socket + local address based on packet's family
+    var isV6 = rinfo.family === 'IPv6';
+    var sock      = isV6 ? context.externalSocket6    : context.externalSocket;
+    var localAddr = isV6 ? context.externalLocalAddr6 : context.externalLocalAddr;
+
+    if (!sock || !localAddr) return;  // external mode not configured for this family
+
+    var send_fn = function(out, dst_port, dst_ip) {
+      sock.send(out, 0, out.length, dst_port, dst_ip, function(err) {
+        if (err) ev.emit('error', err);
+      });
+    };
+
+    process_udp_packet(msg, rinfo, send_fn, localAddr);
+  }
+
+  // Query whether the given 5-tuple matches an active TURN client.
+  // Used by the demuxer to disambiguate byte 0 in range 64-79 between
+  // TURN ChannelData and QUIC short header (RFC 9443).
+  function hasClient(rinfo) {
+    if (context.destroyed) return false;
+
+    var isV6 = rinfo.family === 'IPv6';
+    var localAddr = isV6 ? context.externalLocalAddr6 : context.externalLocalAddr;
+    if (!localAddr) return false;
+
+    var key = make_udp_key(rinfo.address, rinfo.port, localAddr.ip, localAddr.port);
+    return !!context.clients[key];
+  }
+
+
   /* ====================== API ====================== */
 
   var api = {
@@ -774,6 +856,16 @@ function Server(options) {
 
     /** Check if server is draining */
     isDraining: function() { return context.draining; },
+
+    /** Feed an incoming UDP packet from a shared/external socket.
+     *  rinfo must be in Node's dgram format: { address, port, family, size }.
+     *  See RFC 9443 for the demuxing scheme on shared UDP ports. */
+    handlePacket: handlePacket,
+
+    /** Returns true if the given 5-tuple is an active TURN client.
+     *  Used by demuxers to disambiguate TURN ChannelData (byte 0: 64-79)
+     *  from QUIC short header packets (also 64-127). */
+    hasClient: hasClient,
   };
 
   for (var k in api) {
