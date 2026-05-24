@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="https://github.com/colocohen/turn-server/raw/main/turn-server.svg" width="450" alt="turn-server"/>
+</p>
+
 <h1 align="center">turn-server</h1>
 <p align="center">
-  <em>Production-grade STUN/TURN server and client for Node.js - zero dependencies</em>
+  <em>Production-grade STUN/TURN server and client for Node.js</em>
 </p>
 
 <p align="center">
