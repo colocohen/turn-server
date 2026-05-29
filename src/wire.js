@@ -921,10 +921,12 @@ function encode_channel_data(channel_number, data) {
   return out;
 }
 
-// Hot path — subarray (view, zero-copy). Data is fire-and-forget in relay.
+// Hot path — subarray (view, zero-copy). Direct byte reads avoid the
+// 2-element array allocation that r_u16()'s [val, off] return would incur on
+// the busiest path in the relay (millions of ChannelData/sec).
 function decode_channel_data(buf) {
-  var channel; [channel] = r_u16(buf, 0);
-  var len;     [len] = r_u16(buf, 2);
+  var channel = ((buf[0] << 8) | buf[1]) >>> 0;
+  var len     = ((buf[2] << 8) | buf[3]) >>> 0;
   return { channel: channel, data: buf.subarray(4, 4 + len) };
 }
 
@@ -937,6 +939,34 @@ function tcp_frame(data) {
   w_u16(out, 0, data.length);
   w_bytes(out, 2, data);
   return out;
+}
+
+// Zero-copy Uint8Array → Buffer view (no copy when already a Buffer). Shared by
+// every transport's send path so the conversion lives in exactly one place.
+function to_buffer(u) {
+  if (Buffer.isBuffer(u)) return u;
+  return Buffer.from(u.buffer, u.byteOffset, u.byteLength);
+}
+
+// STUN-over-stream framing (RFC 8489 §6.2.2): on TCP/TLS, STUN messages and
+// ChannelData are self-delimiting by their own headers (no length prefix).
+// Given `avail` bytes starting at `off`, returns the next frame's full length:
+//   > 0  → STUN (20 + body) or ChannelData (4 + data, padded to 4 bytes)
+//     0  → need more bytes to classify or to complete the frame (caller waits)
+//   -1  → unrecognized leading byte (caller skips 1 byte to resync)
+// Centralizes the classification that the client and server stream parsers share.
+function stun_stream_frame_length(buf, off, avail) {
+  if (avail < 4) return 0;
+  var first = buf[off];
+  if ((first & 0xC0) === 0x00) {
+    return 20 + (((buf[off + 2] << 8) | buf[off + 3]) >>> 0);
+  }
+  if (first >= 0x40 && first <= 0x4F) {
+    var n = 4 + (((buf[off + 2] << 8) | buf[off + 3]) >>> 0);
+    if (n % 4 !== 0) n += 4 - (n % 4);
+    return n;
+  }
+  return -1;
 }
 
 
@@ -1097,9 +1127,10 @@ function decode_message(buf) {
 // IPv6: stun:[::1]:port, turn:[2001:db8::1]:port?transport=tcp
 function parseUri(uri) {
   // Try IPv6 bracket notation first: scheme:[ipv6]:port?params
-  var m = uri.match(/^(stuns?|turns?):\[([^\]]+)\](?::(\d+))?(?:\?(.*))?$/);
-  // Fall back to IPv4/hostname: scheme:host:port?params
-  if (!m) m = uri.match(/^(stuns?|turns?):([^?:]+)(?::(\d+))?(?:\?(.*))?$/);
+  // Accepts both colon form (stun:host) and authority form (ws://host).
+  var m = uri.match(/^(stuns?|turns?|wss?):(?:\/\/)?\[([^\]]+)\](?::(\d+))?(?:[/?](.*))?$/);
+  // Fall back to IPv4/hostname: scheme:host:port?params  (or scheme://host...)
+  if (!m) m = uri.match(/^(stuns?|turns?|wss?):(?:\/\/)?([^/?:]+)(?::(\d+))?(?:[/?](.*))?$/);
   if (!m) return null;
 
   var scheme = m[1];
@@ -1114,9 +1145,21 @@ function parseUri(uri) {
     });
   }
 
-  var secure = scheme === 'stuns' || scheme === 'turns';
-  var isTurn = scheme === 'turn' || scheme === 'turns';
-  var transport = params.transport || (secure ? 'tls' : 'udp');
+  var isWs = scheme === 'ws' || scheme === 'wss';
+  var secure = scheme === 'stuns' || scheme === 'turns' || scheme === 'wss';
+  var isTurn = scheme === 'turn' || scheme === 'turns' || isWs;
+
+  var transport;
+  if (isWs) {
+    transport = scheme;                                      // 'ws' | 'wss'
+  } else if (params.transport === 'dtls') {
+    transport = 'dtls';                                      // explicit
+  } else if (secure && params.transport === 'udp') {
+    // RFC 7350 §3.2: 'turns'/'stuns' + transport=udp == STUN/TURN over DTLS
+    transport = 'dtls';
+  } else {
+    transport = params.transport || (secure ? 'tls' : 'udp');
+  }
 
   if (!port) {
     port = secure ? 5349 : 3478;
@@ -1129,6 +1172,7 @@ function parseUri(uri) {
     transport: transport,
     secure: secure,
     isTurn: isTurn,
+    isWs: isWs,
     params: params,
   };
 }
@@ -1150,7 +1194,7 @@ export {
   compute_integrity_hmac, validate_integrity_by_length,
   add_integrity, add_fingerprint, compute_fingerprint,
   encode_channel_data, decode_channel_data, is_stun, is_channel_data,
-  tcp_frame, parseUri,
+  tcp_frame, to_buffer, stun_stream_frame_length, parseUri,
   // RFC 7983 multiplexing (WebRTC stack)
   is_dtls, is_rtp, is_rtcp, demux,
   generateTransactionId, validateStunMessage,

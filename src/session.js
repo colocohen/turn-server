@@ -491,8 +491,9 @@ function Session(options) {
     var peer = get_peer_by_channel(parsed.channel);
     if (!peer) return;
 
-    // Hook: beforeRelay — client → peer via ChannelData
-    if (context.isServer) {
+    // Hook: beforeRelay — client → peer via ChannelData. listenerCount guard
+    // first so the info object isn't allocated per packet on the relay hot path.
+    if (context.isServer && ev.listenerCount('beforeRelay') > 0) {
       if (!check_hook('beforeRelay', {
         username: context.allocation ? context.allocation.username : null,
         source: context.source,
@@ -985,6 +986,8 @@ function Session(options) {
     var peer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
 
     if (channel_number === null || peer === null) { send_error(msg, 400, null, key); return; }
+    // RFC 8656 §12 narrowed the usable channel range to 0x4000–0x4FFF (RFC 5766
+    // allowed up to 0x7FFF); 0x5000–0xFFFF is reserved for RFC 7983 demux.
     if (channel_number < 0x4000 || channel_number > 0x4FFF) { send_error(msg, 400, null, key); return; }
 
     // Hook: beforeChannelBind
@@ -1011,8 +1014,8 @@ function Session(options) {
     if (peer === null || data === null) return;
     if (!has_permission(peer.ip)) return;
 
-    // Hook: beforeRelay — client → peer direction
-    if (!check_hook('beforeRelay', {
+    // Hook: beforeRelay — client → peer direction. listenerCount guard first.
+    if (ev.listenerCount('beforeRelay') > 0 && !check_hook('beforeRelay', {
       username: context.allocation.username,
       source: context.source,
       peer: peer,
@@ -1235,12 +1238,14 @@ function Session(options) {
   function start_retransmission(buf) {
     stop_retransmission();
     if (_rtoBase !== null) {
-      // UDP mode: exponential backoff retransmission
+      // UDP/DTLS mode: exponential-backoff retransmission (RFC 8489 §6.2.1).
       _rtoLastBuf = buf;
       _rtoAttempt = 0;
       schedule_retransmit();
     } else {
-      // TCP mode: single timeout (Ti)
+      // TCP/TLS/WS mode: reliable transport — a single transaction timeout Ti
+      // (RFC 8489 §6.2.2), no retransmission.
+      _rtoLastBuf = buf;
       _rtoTimer = setTimeout(function() {
         _rtoTimer = null;
         _pendingRequest = null;
@@ -1248,9 +1253,6 @@ function Session(options) {
         ev.emit('timeout');
       }, _tcpTimeout);
     }
-    _rtoLastBuf = buf;
-    _rtoAttempt = 0;
-    schedule_retransmit();
   }
 
   function schedule_retransmit() {

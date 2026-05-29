@@ -801,6 +801,18 @@ function IceAgent(options) {
             servername:         srv.servername,
             rejectUnauthorized: srv.rejectUnauthorized,
             ca:                 srv.ca,
+            // Pass-through DTLS (lemon-tls) + WebSocket transport options.
+            // All optional: the Socket falls back to import('lemon-tls') and
+            // the global WebSocket respectively when these are absent.
+            connectDTLS:        srv.connectDTLS,
+            lemonTls:           srv.lemonTls,
+            alpnProtocols:      srv.alpnProtocols,
+            minVersion:         srv.minVersion,
+            maxVersion:         srv.maxVersion,
+            mtu:                srv.mtu,
+            WebSocket:          srv.WebSocket,
+            wsPath:             srv.wsPath,
+            wsUrl:              srv.wsUrl,
           });
         } else {
           stunServers.push({ uri: urlList[j], parsed: p });
@@ -1118,7 +1130,7 @@ function IceAgent(options) {
         // HOT PATH: encoded.buf is Uint8Array from wire.encode_message.
         // Create zero-copy Buffer view rather than copying ~20-100 bytes.
         const u = encoded.buf;
-        const out = Buffer.isBuffer(u) ? u : Buffer.from(u.buffer, u.byteOffset, u.byteLength);
+        const out = wire.to_buffer(u);
         sock.send(
           out,
           server.parsed.port || 3478,
@@ -1185,13 +1197,25 @@ function IceAgent(options) {
         const Socket = mod.default || mod.Socket;
         const parsed = server.parsed;
 
-        // Map ICE-URI transport → Socket.transportType.
-        //   turn:?transport=udp   → 'udp'
-        //   turn:?transport=tcp   → 'tcp'
-        //   turns:...             → 'tls'   (TLS over TCP)
-        // Note: turns:?transport=udp would mean DTLS, which the Socket client
-        // doesn't currently support — we fall back to 'tls' for safety.
-        const transportType = parsed.secure ? 'tls' : (parsed.transport || 'udp');
+        // Map ICE-URI transport → Socket.transportType. wire.parseUri already
+        // resolves the scheme/?transport combo, so we mostly honour it directly
+        // and only collapse "secure + stream" to TLS-over-TCP:
+        //   turn:?transport=udp    → 'udp'
+        //   turn:?transport=tcp    → 'tcp'
+        //   turns:?transport=tcp   → 'tls'   (TLS over TCP)
+        //   turns:?transport=udp   → 'dtls'  (DTLS, RFC 7350)
+        //   turns: (no transport)  → 'tls'
+        //   ws:// / wss://         → 'ws' / 'wss'
+        let transportType;
+        if (parsed.transport === 'ws' || parsed.transport === 'wss') {
+          transportType = parsed.transport;
+        } else if (parsed.transport === 'dtls') {
+          transportType = 'dtls';
+        } else if (parsed.secure) {
+          transportType = 'tls';
+        } else {
+          transportType = parsed.transport || 'udp';
+        }
 
         turnSocket = new Socket({
           isServer:      false,
@@ -1202,10 +1226,23 @@ function IceAgent(options) {
           password:      server.credential || null,
           authMech:      (server.username && server.credential) ? 'long-term' : 'none',
           rto:           500,
-          // TLS options — only used when transportType === 'tls'
+          // TLS / WSS options (used when transportType is 'tls' or 'wss')
           servername:         server.servername         || parsed.host,
           rejectUnauthorized: server.rejectUnauthorized,  // undefined → default (true)
           ca:                 server.ca || null,
+          // DTLS transport (lemon-tls) — injection optional; Socket falls back
+          // to import('lemon-tls') when these are absent.
+          connectDTLS:        server.connectDTLS || null,
+          lemonTls:           server.lemonTls    || null,
+          alpnProtocols:      server.alpnProtocols || null,
+          minVersion:         server.minVersion  || null,
+          maxVersion:         server.maxVersion  || null,
+          mtu:                server.mtu         || null,
+          // WebSocket transport — injection optional; Socket falls back to the
+          // global WebSocket (Node >= 22).
+          WebSocket:          server.WebSocket || null,
+          wsPath:             server.wsPath    || null,
+          wsUrl:              server.wsUrl     || null,
         });
         attachTurnSocket(turnSocket);
       } catch (e) {
@@ -2104,7 +2141,7 @@ function IceAgent(options) {
       if (!sock) return;
       // HOT PATH: zero-copy Buffer view over Uint8Array from wire.encode_message.
       // Was Buffer.from(buf) which copies; Buffer.from(u.buffer, offset, len) is a view.
-      const out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+      const out = wire.to_buffer(buf);
       sock.send(out, remote.port, remote.ip, function() {});
     } catch (e) {
       // Swallow — STUN is fire-and-forget; next retransmit will retry.
@@ -2134,7 +2171,7 @@ function IceAgent(options) {
       }
       if (sock && typeof sock.send === 'function') {
         // HOT PATH: zero-copy Buffer view.
-        const out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        const out = wire.to_buffer(buf);
         sock.send(out, rinfo.port, rinfo.address, function() {});
       }
     } catch (_) {}
@@ -2574,7 +2611,7 @@ function IceAgent(options) {
       // HOT PATH: RTP/RTCP media packets flow through here at 30-50 fps.
       // Buffer.from(u.buffer, offset, len) is a zero-copy view, unlike
       // Buffer.from(u) which would copy ~1200 bytes per packet.
-      const out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+      const out = wire.to_buffer(buf);
       sock.send(out, remote.port, remote.ip);
       return true;
     } catch (e) {

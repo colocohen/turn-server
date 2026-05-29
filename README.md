@@ -58,7 +58,7 @@ Every WebRTC application needs a STUN/TURN server. Google, Twilio, Cloudflare, a
 
 The existing options for STUN/TURN in Node.js are limited: **coturn** is a C daemon you run separately, **node-turn** is a minimal server with basic features, and the **stun** npm package only handles STUN (no TURN). None of them give you a complete, embeddable library with full protocol coverage.
 
-**turn-server** is a from-scratch implementation of the complete STUN/TURN protocol stack - both client and server - built as a library you can `require()` into any Node.js application. It covers every RFC, every attribute, every edge case, with zero dependencies.
+**turn-server** is a from-scratch implementation of the complete STUN/TURN protocol stack - both client and server - built as a library you can `require()` into any Node.js application. It covers every RFC, every attribute, every edge case.
 
 **What this means for you:**
 
@@ -74,6 +74,12 @@ The existing options for STUN/TURN in Node.js are limited: **coturn** is a C dae
 ```bash
 npm install turn-server
 ```
+
+> **Dependencies.** The core - STUN/TURN over UDP/TCP/TLS, server, client, and the ICE agent - is pure JavaScript. Two transports pull in pure-JS helpers, both **lazy-loaded** (only required when you actually use them):
+> - **DTLS** (RFC 7350) uses [`lemon-tls`](https://www.npmjs.com/package/lemon-tls) - installed by default.
+> - The optional WebSocket **server** auto-attach uses [`ws`](https://www.npmjs.com/package/ws) - an `optionalDependency`. The WebSocket **client** needs no dependency: it uses Node 22's built-in global `WebSocket`. You can also bring your own WebSocket server via `handleWebSocket()` (no `ws` needed).
+>
+> So UDP/TCP/TLS-only and BYO-WebSocket deployments carry no extra runtime cost.
 
 ### Server
 
@@ -129,8 +135,64 @@ process.on('SIGTERM', () => {
 
 server.listen([
   { port: 3478 },                                         // UDP + TCP
-  { port: 5349, transport: 'tls', cert: CERT, key: KEY }, // TLS
+  { port: 5349, transport: 'tls',  cert: CERT, key: KEY }, // TLS
+  { port: 5349, transport: 'dtls', cert: CERT, key: KEY }, // DTLS (RFC 7350) - UDP
+  { port: 8443, transport: 'ws' },                         // WebSocket (auto: needs `ws` installed)
 ]);
+```
+
+The WebSocket and DTLS endpoints are wired the same way as UDP/TCP/TLS - one
+engine, one set of hooks. For WebSocket you can also attach to an existing
+HTTP(S) server instead of letting the library open a port:
+
+```js
+import { WebSocketServer } from 'ws';
+
+// Option A: hand turn-server the constructor + your http(s) server
+server.listen([{ transport: 'ws', WebSocketServer, server: myHttpsServer }]);
+
+// Option B: full BYO - drive the upgrade yourself (Express/Fastify friendly)
+const wss = new WebSocketServer({ server: myHttpsServer, path: '/turn' });
+wss.on('connection', (ws, req) => server.handleWebSocket(ws, req));
+```
+
+> WebSocket rides on the HTTP/1.1 Upgrade mechanism. If your app is HTTP/2, run
+> the WS endpoint on an HTTP/1.1 listener (same host/cert is fine) - `ws` does
+> not support WebSocket-over-HTTP/2 (RFC 8441).
+
+#### Shared TLS material
+
+`tls` and `dtls` endpoints inherit a server-level default, so you can set the
+certificate once instead of per endpoint (the per-endpoint config still wins):
+
+```js
+const server = createServer({
+  auth: { /* ... */ }, relay: { /* ... */ },
+  tls: { cert: CERT, key: KEY, SNICallback },   // inherited by every tls + dtls endpoint
+});
+server.listen([
+  { port: 5349, transport: 'tls' },             // uses the shared cert/key
+  { port: 5349, transport: 'dtls' },            // same
+]);
+```
+
+#### DTLS / STUN on one shared UDP socket (RFC 7983)
+
+In external-socket mode you feed one UDP socket through `handlePacket()`. With a
+`dtls` config, that socket demuxes by first byte (RFC 7983): cleartext STUN/TURN
+and DTLS-to-server (RFC 7350) coexist on the same port - useful when bundling
+with QUIC/other protocols behind one port.
+
+```js
+const udp = dgram.createSocket('udp4');
+udp.bind(3478, () => {
+  const server = createServer({
+    socket: udp,                                 // external/shared socket mode
+    auth: { /* ... */ }, relay: { /* ... */ },
+    dtls: { cert: CERT, key: KEY, SNICallback }, // also accept DTLS on this socket
+  });
+  udp.on('message', (msg, rinfo) => server.handlePacket(msg, rinfo));
+});
 ```
 
 ### Client - get your public IP
@@ -167,6 +229,20 @@ const client = connect('turn:turn.example.com:3478?transport=udp', {
 });
 ```
 
+The transport is chosen by the URI (RFC 7064 / 7065 / 7350):
+
+```js
+connect('turn:host:3478?transport=udp',  opts, cb);  // UDP
+connect('turn:host:3478?transport=tcp',  opts, cb);  // TCP
+connect('turns:host:5349?transport=tcp', opts, cb);  // TLS over TCP
+connect('turns:host:5349?transport=udp', opts, cb);  // DTLS  (RFC 7350)
+connect('wss://host:8443/turn',          opts, cb);  // WebSocket over TLS
+```
+
+Every form returns the same `socket` with the same API (`allocate`,
+`createPermission`, `channelBind`, `send`, the `data` event) - the transport is
+transparent to the protocol layer.
+
 
 ## ✨ Features
 
@@ -182,7 +258,7 @@ const client = connect('turn:turn.example.com:3478?transport=udp', {
 - RFC 5769 test vectors - 22/22 passing
 
 ### Server
-- Multi-endpoint: UDP, TCP, TLS, WebSocket on any combination of ports
+- Multi-endpoint: UDP, TCP, TLS, WebSocket, DTLS on any combination of ports
 - 4 auth mechanisms: none, short-term, long-term, OAuth (RFC 7635)
 - REST API credentials (shared secret, time-limited)
 - PASSWORD-ALGORITHMS negotiation with bid-down attack prevention
@@ -481,7 +557,7 @@ resolve('turn:example.com', (err, parsed) => {
 | | **turn-server** | **node-turn** | **stun** (npm) | **coturn** |
 |---|:---:|:---:|:---:|:---:|
 | **Language** | Node.js | Node.js | Node.js | C |
-| **Dependencies** | **0** | 0 | 5+ | OpenSSL, DB |
+| **Dependencies** | **2** (pure JS) | 0 | 5+ | OpenSSL, DB |
 | **Embeddable** | ✅ library | ✅ | ✅ | ❌ daemon |
 | **ESM** | ✅ | ❌ CJS | ❌ CJS | N/A |
 | **Maintained** | ✅ | ❌ 5yr | ❌ 6yr | ✅ |
@@ -510,7 +586,7 @@ resolve('turn:example.com', (err, parsed) => {
 | **TCP + framing** | ✅ | ❌ | ❌ | ✅ |
 | **TLS (ALPN + SNI)** | ✅ | ❌ | ❌ | ✅ |
 | **WebSocket** | ✅ | ❌ | ❌ | ❌ |
-| **DTLS** | planned | ❌ | ❌ | ✅ |
+| **DTLS** (RFC 7350) | ✅ | ❌ | ❌ | ✅ |
 | | | | | |
 | **Client connect()** | ✅ | ❌ | ✅ | ✅ uclient |
 | **getPublicIP()** | ✅ | ❌ | ✅ | ❌ |
@@ -612,7 +688,7 @@ turn-server/
 | `ice_agent.js` | 2,349 | ICE agent - gathering, pairing, checks, nomination, consent, restart |
 | `ice_candidate.js` | 459 | Candidate primitives - priority, foundation, SDP parse/format |
 | `index.js` | 203 | Client convenience - connect, DNS, NAT detection |
-| **Total** | **7,045** | **Zero dependencies** |
+| **Total** | **~7,300** | **lemon-tls (DTLS) + ws (WebSocket server, optional)** |
 
 
 ## 🛣 Roadmap
@@ -635,7 +711,9 @@ turn-server/
 - SHA1, SHA256, SHA384, SHA512 message integrity
 - PASSWORD-ALGORITHMS negotiation + bid-down attack prevention
 - USERHASH computation (RFC 8489 §14.4)
-- Multi-endpoint server (UDP + TCP + TLS + WebSocket)
+- Multi-endpoint server (UDP + TCP + TLS + WebSocket + DTLS)
+- DTLS transport (RFC 7350) - STUN/TURN over DTLS via LemonTLS (client + server)
+- WebSocket client transport - via the global WebSocket (Node 22+) or an injected implementation
 - 14-hook API for full server control
 - Built-in convenience limits (connections, quotas, bandwidth, permissions, channels)
 - Client: connect(), getPublicIP(), detectNAT(), DNS SRV, URI parsing, auto-refresh
@@ -647,12 +725,6 @@ turn-server/
 - UDP idle timeout + graceful drain
 - Statistics and health checks
 - 450+ tests passing (297 core + 153 ICE)
-
-### ⏳ Planned
-- DTLS transport (pending LemonTLS DTLS support)
-- WebSocket client transport
-- TypeScript type definitions (`.d.ts`)
-- `npm publish`
 
 _Community contributions are welcome! Please ⭐ star the repo to follow progress._
 

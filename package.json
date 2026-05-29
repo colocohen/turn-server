@@ -1,29 +1,42 @@
 {
   "name": "turn-server",
-  "version": "0.2.0",
-  "description": "STUN/TURN server + full ICE agent for Node.js",
+  "version": "0.4.0",
+  "description": "STUN/TURN server + client + full ICE agent for Node.js - UDP, TCP, TLS, WebSocket and DTLS transports",
   "type": "module",
-  "main": "index.cjs",
+  "main": "index.js",
   "module": "index.js",
+  "types": "index.d.ts",
   "exports": {
     ".": {
-      "import": "./index.js",
-      "require": "./index.cjs"
+      "types": "./index.d.ts",
+      "import": "./index.js"
     }
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "types": "index.d.ts",
   "files": [
     "index.js",
-    "index.cjs",
     "index.d.ts",
     "src/",
     "LICENSE",
     "README.md"
   ],
-  "keywords": ["stun", "turn", "webrtc", "ice", "nat", "rfc5389", "rfc5766", "rfc8445", "rfc7675"],
+  "keywords": [
+    "stun",
+    "turn",
+    "webrtc",
+    "wrtc",
+    "ice",
+    "ice-agent",
+    "nat",
+    "websocket",
+    "rfc5389",
+    "rfc5766",
+    "rfc8445",
+    "rfc7675",
+    "rfc7350"
+  ],
   "author": {
     "name": "colocohen"
   },
@@ -42,5 +55,10 @@
       "url": "https://github.com/sponsors/colocohen"
     }
   ],
-  "dependencies": {}
+  "dependencies": {
+    "lemon-tls": "^0.4.0"
+  },
+  "optionalDependencies": {
+    "ws": "^8.18.0"
+  }
 }

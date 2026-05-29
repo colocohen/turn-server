@@ -19,6 +19,34 @@ function toBuffer(u) {
   return Buffer.from(u.buffer, u.byteOffset, u.byteLength);
 }
 
+// Normalize an inbound datagram payload to something session.message accepts
+// (Buffer or Uint8Array). lemon-tls emits Uint8Array on 'data'.
+function toMsg(d) {
+  if (Buffer.isBuffer(d) || d instanceof Uint8Array) return d;
+  if (d instanceof ArrayBuffer) return new Uint8Array(d);
+  if (d && d.buffer) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+  return d;
+}
+
+// Resolve lemon-tls's connectDTLS: prefer an injected implementation
+// (options.connectDTLS), otherwise lazy-import 'lemon-tls'. Kept optional so
+// turn-server has no hard dependency for non-DTLS users. cb(err, connectDTLS).
+function resolveConnectDTLS(options, cb) {
+  if (typeof options.connectDTLS === 'function') return cb(null, options.connectDTLS);
+  if (options.lemonTls && typeof options.lemonTls.connectDTLS === 'function') {
+    return cb(null, options.lemonTls.connectDTLS);
+  }
+  import('lemon-tls').then(function(m) {
+    var fn = m.connectDTLS || (m.default && m.default.connectDTLS);
+    if (typeof fn !== 'function') return cb(new Error("lemon-tls has no connectDTLS export"));
+    cb(null, fn);
+  }).catch(function() {
+    cb(new Error("DTLS transport requires lemon-tls. Install it (npm i lemon-tls) " +
+      "or pass options.connectDTLS / options.lemonTls."));
+  });
+}
+
+
 
 function Socket(options) {
   if (!(this instanceof Socket)) return new Socket(options);
@@ -54,9 +82,10 @@ function Socket(options) {
       checkOriginConsistency: options.checkOriginConsistency || false,
       allowLoopback: options.allowLoopback || false,
       allowMulticast: options.allowMulticast || false,
-      // RFC 8489 §7: skip FINGERPRINT over TLS/DTLS
+      // RFC 8489 §7: skip FINGERPRINT over TLS/DTLS (wss = WebSocket over TLS)
       useFingerprint: options.useFingerprint !== undefined ? options.useFingerprint
-        : (options.transportType !== 'tls' && options.transportType !== 'dtls'),
+        : (options.transportType !== 'tls' && options.transportType !== 'dtls'
+           && options.transportType !== 'wss'),
     }),
 
     // Server-side: function to send data back to client (provided by Server)
@@ -112,9 +141,45 @@ function Socket(options) {
         // a ~1200-byte copy per incoming packet.
         session.message(msg);
       });
+      context.transport.on('error', function(err) { ev.emit('error', err); });
+      context.transport.on('close', function() { ev.emit('close'); });
+
+    } else if (context.transportType === 'dtls') {
+      // DTLS preserves datagram boundaries — each 'data' event is exactly one
+      // decrypted STUN/ChannelData message. No framing of our own (like UDP).
+      // context.transport is a lemon-tls DTLSSocket.
+      context.transport.on('data', function(d) {
+        if (context.destroyed) return;
+        session.message(toMsg(d));
+      });
+      context.transport.on('error', function(err) { ev.emit('error', err); });
+      context.transport.on('close', function() { ev.emit('close'); });
+
+    } else if (context.transportType === 'ws' || context.transportType === 'wss') {
+      // WebSocket — the WS protocol already delimits messages, so each
+      // incoming message is exactly one STUN/ChannelData frame. No stream
+      // framing of our own. Works with the global WebSocket (Node >= 22),
+      // the browser WebSocket, or any injected `options.WebSocket`.
+      context.transport.binaryType = 'arraybuffer';
+      context.transport.onmessage = function(event) {
+        if (context.destroyed) return;
+        var d = event.data;
+        var frame = (d instanceof ArrayBuffer) ? new Uint8Array(d)
+                  : Buffer.isBuffer(d) ? d
+                  : (d && d.buffer) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength)
+                  : d;
+        session.message(frame);
+      };
+      context.transport.onerror = function(e) { ev.emit('error', e && e.error ? e.error : new Error('WebSocket error')); };
+      context.transport.onclose = function() { ev.emit('close'); };
+
     } else {
-      // TCP / TLS — 2-byte length prefix framing
-      // Use offset tracking instead of Buffer.concat to avoid copying on every chunk
+      // TCP / TLS — RFC 8489 §7.2: STUN over TCP is NOT length-prefixed.
+      // Messages are self-delimiting: STUN by its 20-byte header + length
+      // field, ChannelData by its 4-byte header + length (padded to 4).
+      // This matches what the server emits (server.js start_tcp/start_tls)
+      // and what coturn / browsers send. (The previous 2-byte tcp_frame()
+      // prefix was a mismatch that broke client<->server TCP entirely.)
       var _tcpChunks = [];
       var _tcpLen = 0;
 
@@ -132,28 +197,23 @@ function Socket(options) {
         return _tcpChunks[0] || Buffer.alloc(0);
       }
 
-      function consumeBytes(n) {
-        _tcpLen -= n;
-        var buf = compactBuffer();
-        _tcpChunks = [buf.slice(n)];
-        return buf.slice(0, n);
-      }
-
       function parseTcpFrames() {
-        while (_tcpLen >= 2) {
+        while (_tcpLen >= 4) {
           var buf = compactBuffer();
-          var frameLen = (buf[0] << 8) | buf[1];
-          if (_tcpLen < 2 + frameLen) break;
-          consumeBytes(2); // skip length header
-          var frame = consumeBytes(frameLen);
+          var msgLen = wire.stun_stream_frame_length(buf, 0, _tcpLen);
+          if (msgLen === -1) { _tcpChunks = [buf.slice(1)]; _tcpLen -= 1; continue; } // resync
+          if (msgLen === 0 || _tcpLen < msgLen) break;                                 // wait for more
+          var frame = buf.slice(0, msgLen);
+          _tcpChunks = [buf.slice(msgLen)];
+          _tcpLen -= msgLen;
           // HOT PATH: frame is a Buffer — pass directly, no wrapping.
           session.message(frame);
         }
       }
-    }
 
-    context.transport.on('error', function(err) { ev.emit('error', err); });
-    context.transport.on('close', function() { ev.emit('close'); });
+      context.transport.on('error', function(err) { ev.emit('error', err); });
+      context.transport.on('close', function() { ev.emit('close'); });
+    }
   }
 
 
@@ -181,10 +241,19 @@ function Socket(options) {
       context.transport.send(msg, 0, msg.length, context.serverPort, context.serverHost, function(err) {
         if (err) ev.emit('error', err);
       });
+    } else if (context.transportType === 'ws' || context.transportType === 'wss') {
+      // WebSocket frames the message for us — send one STUN/ChannelData frame
+      // as one binary WS message. No 2-byte prefix.
+      if (context.transport.readyState === 1 /* OPEN */) {
+        context.transport.send(toBuffer(buf));
+      }
+    } else if (context.transportType === 'dtls') {
+      // One DTLS datagram per STUN/ChannelData message (no framing, like UDP).
+      context.transport.send(toBuffer(buf));
     } else {
-      // TCP/TLS: add 2-byte length framing
-      var framed = wire.tcp_frame(buf);
-      context.transport.write(toBuffer(framed));
+      // TCP/TLS — RFC 8489 §7.2: send raw STUN, self-delimited by its own
+      // header length. NO 2-byte tcp_frame() prefix (that was the bug).
+      context.transport.write(toBuffer(buf));
     }
   }
 
@@ -381,8 +450,10 @@ function Socket(options) {
       // Check permission
       if (!session.hasPermission(from.ip)) return;
 
-      // Hook: beforeData — peer → client direction
-      if (!check_hook('beforeData', {
+      // Hook: beforeData — peer → client direction. Short-circuit on
+      // listenerCount FIRST so the info object isn't allocated per packet when
+      // no hook is registered (this is the relay hot path).
+      if (ev.listenerCount('beforeData') > 0 && !check_hook('beforeData', {
         peer: from,
         source: session.context.source,
         username: session.getAllocation() ? session.getAllocation().username : null,
@@ -404,8 +475,8 @@ function Socket(options) {
         session.sendData(from, data);
       }
 
-      // Info event: onRelayed (peer → client, inbound)
-      ev.emit('onRelayed', {
+      // Info event: onRelayed (peer → client, inbound). Guard allocation.
+      if (ev.listenerCount('onRelayed') > 0) ev.emit('onRelayed', {
         direction: 'inbound',
         peer: from,
         source: session.context.source,
@@ -442,7 +513,7 @@ function Socket(options) {
     });
 
     // Info event: onRelayed (client → peer, outbound, via Send indication)
-    ev.emit('onRelayed', {
+    if (ev.listenerCount('onRelayed') > 0) ev.emit('onRelayed', {
       direction: 'outbound',
       peer: peer,
       source: session.context.source,
@@ -464,7 +535,7 @@ function Socket(options) {
     });
 
     // Info event: onRelayed (client → peer, outbound, via ChannelData)
-    ev.emit('onRelayed', {
+    if (ev.listenerCount('onRelayed') > 0) ev.emit('onRelayed', {
       direction: 'outbound',
       peer: peer,
       source: session.context.source,
@@ -542,6 +613,11 @@ function Socket(options) {
   function connect(cb) {
     if (context.isServer) return;
 
+    // Forwards transport errors that occur before bindTransport() runs (i.e.
+    // during TCP connect / TLS handshake). Detached on successful connect so
+    // the persistent handler in bindTransport() is the only one afterward.
+    function _preErr(err) { ev.emit('error', err); }
+
     if (context.transportType === 'udp') {
       var family = context.serverHost && context.serverHost.indexOf(':') >= 0 ? 'udp6' : 'udp4';
       context.transport = dgram.createSocket(family);
@@ -556,10 +632,14 @@ function Socket(options) {
         host: context.serverHost,
         port: context.serverPort,
       }, function() {
+        if (typeof context.transport.off === 'function') context.transport.off('error', _preErr);
         bindTransport();
         if (cb) cb();
         ev.emit('connect');
       });
+      // Capture connect-phase errors (ECONNREFUSED, etc.) before bindTransport
+      // attaches the persistent handler. Detached above on successful connect.
+      context.transport.on('error', _preErr);
 
     } else if (context.transportType === 'tls') {
       context.transport = tls.connect({
@@ -570,9 +650,100 @@ function Socket(options) {
         ca: options.ca || undefined,
         SNICallback: options.SNICallback || undefined,
       }, function() {
+        if (typeof context.transport.off === 'function') context.transport.off('error', _preErr);
         bindTransport();
         if (cb) cb();
         ev.emit('connect');
+      });
+      // Capture handshake-phase errors (cert rejection, ECONNREFUSED) before
+      // bindTransport attaches the persistent handler. Detached on 'secureConnect'.
+      context.transport.on('error', _preErr);
+
+    } else if (context.transportType === 'ws' || context.transportType === 'wss') {
+      // WebSocket client. Zero-dep by default via the global WebSocket
+      // (Node >= 22 / browsers). For older Node or custom transports, inject
+      // an implementation through options.WebSocket.
+      var WS = options.WebSocket
+        || (typeof WebSocket !== 'undefined' ? WebSocket : null)
+        || (typeof globalThis !== 'undefined' ? globalThis.WebSocket : null);
+      if (!WS) {
+        ev.emit('error', new Error(
+          'WebSocket transport requires a global WebSocket (Node >= 22) ' +
+          'or options.WebSocket (e.g. the "ws" package).'));
+        return;
+      }
+
+      var scheme = (context.transportType === 'wss') ? 'wss' : 'ws';
+      var path = options.wsPath || '/';
+      var hostPart = (context.serverHost && context.serverHost.indexOf(':') >= 0)
+        ? '[' + context.serverHost + ']' : context.serverHost;
+      var url = options.wsUrl || (scheme + '://' + hostPart + ':' + context.serverPort + path);
+
+      var wsOpts;
+      if (context.transportType === 'wss') {
+        // 'ws' package honours these; the global/browser WebSocket ignores extra args.
+        wsOpts = {
+          rejectUnauthorized: options.rejectUnauthorized !== false,
+          ca: options.ca || undefined,
+          servername: options.servername || context.serverHost,
+        };
+      }
+
+      try {
+        context.transport = wsOpts ? new WS(url, wsOpts) : new WS(url);
+      } catch (e) {
+        ev.emit('error', e);
+        return;
+      }
+      context.transport.binaryType = 'arraybuffer';
+
+      var _opened = false;
+      context.transport.onopen = function() {
+        if (_opened) return; _opened = true;
+        bindTransport();
+        if (cb) cb();
+        ev.emit('connect');
+      };
+      // bindTransport sets onmessage/onerror/onclose; onopen above is enough here.
+
+    } else if (context.transportType === 'dtls') {
+      // DTLS client via lemon-tls connectDTLS (datagram transport over UDP).
+      // RFC 7350: STUN/TURN over DTLS. RFC 7350 also defines ALPN ids.
+      resolveConnectDTLS(options, function(err, connectDTLS) {
+        if (err) { ev.emit('error', err); return; }
+        var dsock;
+        try {
+          dsock = connectDTLS({
+            host: context.serverHost,
+            port: context.serverPort,
+            servername: options.servername || context.serverHost,
+            rejectUnauthorized: options.rejectUnauthorized !== false,
+            ca: options.ca || undefined,
+            alpnProtocols: options.alpnProtocols || ['stun.turn', 'stun.nat-discovery'],
+            minVersion: options.minVersion || 'DTLSv1.2',
+            maxVersion: options.maxVersion || 'DTLSv1.3',
+            mtu: options.mtu,
+          });
+        } catch (e) { ev.emit('error', e); return; }
+
+        context.transport = dsock;
+
+        function preErr(e) { ev.emit('error', e); }
+
+        var _connected = false;
+        function onConn() {
+          if (_connected) return; _connected = true;
+          if (typeof dsock.off === 'function') {
+            dsock.off('connect', onConn);
+            dsock.off('error', preErr);
+          }
+          bindTransport();          // wires 'data' / 'error' / 'close'
+          if (cb) cb();
+          ev.emit('connect');
+        }
+        dsock.on('connect', onConn);
+        // Surface pre-handshake errors (handshake timeout, cert rejection, …)
+        dsock.on('error', preErr);
       });
     }
   }
@@ -632,6 +803,10 @@ function Socket(options) {
 
     if (!context.isServer && context.transport) {
       if (context.transportType === 'udp') {
+        try { context.transport.close(); } catch (e) {}
+      } else if (context.transportType === 'ws' || context.transportType === 'wss') {
+        try { context.transport.close(); } catch (e) {}
+      } else if (context.transportType === 'dtls') {
         try { context.transport.close(); } catch (e) {}
       } else {
         try { context.transport.end(); } catch (e) {}

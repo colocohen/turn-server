@@ -9,6 +9,51 @@ import Socket from './socket.js';
 import * as wire from './wire.js';
 
 
+// Resolve lemon-tls's createDTLSServer: prefer an injected implementation,
+// otherwise lazy-import 'lemon-tls'. Optional so non-DTLS users need no dep.
+// cb(err, createDTLSServer).
+function resolveCreateDTLSServer(config, ctx, cb) {
+  var fn = config.createDTLSServer
+        || (config.lemonTls && config.lemonTls.createDTLSServer)
+        || ctx.createDTLSServer
+        || (ctx.lemonTls && ctx.lemonTls.createDTLSServer);
+  if (typeof fn === 'function') return cb(null, fn);
+  import('lemon-tls').then(function(m) {
+    var f = m.createDTLSServer || (m.default && m.default.createDTLSServer);
+    if (typeof f !== 'function') return cb(new Error("lemon-tls has no createDTLSServer export"));
+    cb(null, f);
+  }).catch(function() {
+    cb(new Error("dtls transport requires lemon-tls. Install it (npm i lemon-tls) " +
+      "or pass createDTLSServer / lemonTls in the listen config or server options."));
+  });
+}
+
+// Load a PEM cert/key that may be a path, a string, or a Buffer.
+function loadPem(v) {
+  if (v == null) return v;
+  if (Buffer.isBuffer(v)) return v;
+  if (typeof v === 'string' && v.indexOf('-----') < 0) return fs.readFileSync(v);
+  return v;
+}
+
+// Resolve lemon-tls's DTLSSession constructor (for shared-socket DTLS, where
+// turn-server drives the datagrams instead of letting lemon-tls own a socket).
+// cb(err, DTLSSession).
+function resolveDTLSSession(cfg, ctx, cb) {
+  var fn = (cfg && cfg.DTLSSession)
+        || (cfg && cfg.lemonTls && cfg.lemonTls.DTLSSession)
+        || (ctx.lemonTls && ctx.lemonTls.DTLSSession);
+  if (typeof fn === 'function') return cb(null, fn);
+  import('lemon-tls').then(function(m) {
+    var f = m.DTLSSession || (m.default && m.default.DTLSSession);
+    if (typeof f !== 'function') return cb(new Error("lemon-tls has no DTLSSession export"));
+    cb(null, f);
+  }).catch(function() {
+    cb(new Error("shared-socket DTLS requires lemon-tls. Install it (npm i lemon-tls) " +
+      "or pass DTLSSession / lemonTls in the dtls config."));
+  });
+}
+
 function Server(options) {
   if (!(this instanceof Server)) return new Server(options);
   options = options || {};
@@ -38,6 +83,25 @@ function Server(options) {
     sniCallback: options.sniCallback || options.SNICallback || null,
     realmCallback: options.realmCallback || null,
     relayCallback: options.relayCallback || null,
+
+    // Server-level TLS/DTLS material, inherited by every 'tls' and 'dtls'
+    // endpoint that doesn't override it. e.g. createServer({ tls: { cert, key,
+    // ca, SNICallback } }). Endpoint-level config in listen() still wins.
+    tlsDefaults: options.tls || null,
+
+    // Shared-socket DTLS (RFC 7350 over the external socket). When external
+    // socket mode is active AND this is set, handlePacket() demuxes DTLS
+    // records (RFC 7983 first-byte 20–63) into per-peer DTLSSessions instead
+    // of treating them as cleartext STUN. cert/key fall back to tlsDefaults.
+    dtlsShared:        options.dtls || null,
+    _DTLSSessionCtor:  null,   // resolved lemon-tls DTLSSession constructor
+    _dtlsCtorErr:      null,
+    dtlsConns:         {},      // 5-tuple key → { session, client, idle }
+
+    // DTLS implementation (lemon-tls). Optional injection so non-DTLS users
+    // need no dependency; falls back to import('lemon-tls') at listen time.
+    createDTLSServer: options.createDTLSServer || null,
+    lemonTls: options.lemonTls || null,
 
     // Allocation limits
     maxAllocateLifetime: options.maxAllocateLifetime || 3600,
@@ -109,6 +173,24 @@ function Server(options) {
     } catch (e) {
       throw new Error('options.socket6 must be bound before createServer()');
     }
+  }
+
+  // Merge endpoint config with server-level tls defaults (endpoint wins).
+  function tlsField(config, name) {
+    if (config && config[name] != null) return config[name];
+    if (context.tlsDefaults && context.tlsDefaults[name] != null) return context.tlsDefaults[name];
+    return undefined;
+  }
+
+  // Preload the DTLSSession constructor for shared-socket DTLS so handlePacket()
+  // (a hot, synchronous path) can use it without awaiting an import per packet.
+  // Until it resolves, inbound DTLS records are dropped — harmless, since DTLS
+  // retransmits its ClientHello.
+  if ((context.externalSocket || context.externalSocket6) && context.dtlsShared) {
+    resolveDTLSSession(context.dtlsShared, context, function(err, Ctor) {
+      if (err) context._dtlsCtorErr = err;
+      else context._DTLSSessionCtor = Ctor;
+    });
   }
 
 
@@ -349,7 +431,7 @@ function Server(options) {
         // HOT PATH: zero-copy Buffer view. buf is Uint8Array from
         // wire.encode_message — Buffer.from(u.buffer, offset, len) creates
         // a view over the same memory rather than copying ~1200 bytes.
-        var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        var out = wire.to_buffer(buf);
         send_fn(out, dst_port, dst_ip);
       }, local_addr);
 
@@ -443,7 +525,7 @@ function Server(options) {
         // TCP stream.write() accepts both Buffer and Uint8Array natively,
         // but internally optimizes for Buffer.
         if (conn.destroyed) return;
-        var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        var out = wire.to_buffer(buf);
         conn.write(out);
       }, { ip: conn.localAddress, port: conn.localPort });
 
@@ -454,28 +536,11 @@ function Server(options) {
       conn.on('data', function(chunk) {
         tcp_buf = Buffer.concat([tcp_buf, chunk]);
 
-        // RFC 8489 §6.2.2: STUN over TCP uses STUN's own header for framing
-        // No 2-byte length prefix on dedicated TURN port
+        // RFC 8489 §6.2.2: STUN over TCP is self-delimiting (no length prefix).
         while (tcp_buf.length >= 4) {
-          var first = tcp_buf[0];
-          var msg_len;
-
-          if ((first & 0xC0) === 0x00) {
-            // STUN message: 20-byte header + body length from bytes 2-3
-            var body_len = (tcp_buf[2] << 8) | tcp_buf[3];
-            msg_len = 20 + body_len;
-          } else if (first >= 0x40 && first <= 0x4F) {
-            // ChannelData: 4-byte header + data length from bytes 2-3 (padded to 4)
-            var data_len = (tcp_buf[2] << 8) | tcp_buf[3];
-            msg_len = 4 + data_len;
-            if (msg_len % 4 !== 0) msg_len += 4 - (msg_len % 4); // pad to 4-byte boundary
-          } else {
-            // Unknown — skip 1 byte
-            tcp_buf = tcp_buf.slice(1);
-            continue;
-          }
-
-          if (tcp_buf.length < msg_len) break; // wait for more data
+          var msg_len = wire.stun_stream_frame_length(tcp_buf, 0, tcp_buf.length);
+          if (msg_len === -1) { tcp_buf = tcp_buf.slice(1); continue; }   // resync
+          if (msg_len === 0 || tcp_buf.length < msg_len) break;          // wait for more data
 
           var frame = tcp_buf.slice(0, msg_len);
           tcp_buf = tcp_buf.slice(msg_len);
@@ -512,8 +577,10 @@ function Server(options) {
     var port = config.port || 5349;
     var address = config.address || '0.0.0.0';
 
-    // SNI: per-listener callback takes priority, then server-level option
-    var sniCallback = config.sniCallback || config.SNICallback || context.sniCallback || null;
+    // SNI: per-listener callback takes priority, then server-level tls default,
+    // then the top-level sniCallback option.
+    var sniCallback = tlsField(config, 'SNICallback') || tlsField(config, 'sniCallback')
+                   || config.sniCallback || context.sniCallback || null;
 
     var tls_options = {
       SNICallback: sniCallback,
@@ -521,18 +588,12 @@ function Server(options) {
       ALPNProtocols: config.ALPNProtocols || ['stun.turn', 'stun.nat-discovery'],
     };
 
-    // Load cert/key
-    if (config.cert && config.key) {
-      tls_options.cert = typeof config.cert === 'string' && config.cert.indexOf('-----') < 0
-        ? fs.readFileSync(config.cert) : config.cert;
-      tls_options.key = typeof config.key === 'string' && config.key.indexOf('-----') < 0
-        ? fs.readFileSync(config.key) : config.key;
-    }
-
-    if (config.ca) {
-      tls_options.ca = typeof config.ca === 'string' && config.ca.indexOf('-----') < 0
-        ? fs.readFileSync(config.ca) : config.ca;
-    }
+    // Load cert/key/ca (endpoint config, falling back to server-level tls defaults)
+    var _cert = loadPem(tlsField(config, 'cert'));
+    var _key  = loadPem(tlsField(config, 'key'));
+    var _ca   = loadPem(tlsField(config, 'ca'));
+    if (_cert && _key) { tls_options.cert = _cert; tls_options.key = _key; }
+    if (_ca) tls_options.ca = _ca;
 
     var tls_server = tls.createServer(tls_options, function(conn) {
       if (context.destroyed) { conn.destroy(); return; }
@@ -550,7 +611,7 @@ function Server(options) {
       var client = create_client_socket(src, function(buf) {
         // HOT PATH: zero-copy Buffer view over Uint8Array from wire.encode_message.
         if (conn.destroyed) return;
-        var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        var out = wire.to_buffer(buf);
         conn.write(out);
       }, { ip: conn.localAddress, port: conn.localPort });
 
@@ -561,22 +622,9 @@ function Server(options) {
         tcp_buf = Buffer.concat([tcp_buf, chunk]);
 
         while (tcp_buf.length >= 4) {
-          var first = tcp_buf[0];
-          var msg_len;
-
-          if ((first & 0xC0) === 0x00) {
-            var body_len = (tcp_buf[2] << 8) | tcp_buf[3];
-            msg_len = 20 + body_len;
-          } else if (first >= 0x40 && first <= 0x4F) {
-            var data_len = (tcp_buf[2] << 8) | tcp_buf[3];
-            msg_len = 4 + data_len;
-            if (msg_len % 4 !== 0) msg_len += 4 - (msg_len % 4);
-          } else {
-            tcp_buf = tcp_buf.slice(1);
-            continue;
-          }
-
-          if (tcp_buf.length < msg_len) break;
+          var msg_len = wire.stun_stream_frame_length(tcp_buf, 0, tcp_buf.length);
+          if (msg_len === -1) { tcp_buf = tcp_buf.slice(1); continue; }
+          if (msg_len === 0 || tcp_buf.length < msg_len) break;
 
           var frame = tcp_buf.slice(0, msg_len);
           tcp_buf = tcp_buf.slice(msg_len);
@@ -613,6 +661,8 @@ function Server(options) {
   // Usage: wsServer.on('connection', function(ws, req) { server.handleWebSocket(ws, req); });
   function handleWebSocket(ws, req) {
     if (context.destroyed) { try { ws.close(); } catch(e) {} return; }
+    // Reject new connections while draining (graceful shutdown).
+    if (context.draining) { try { ws.close(); } catch(e) {} return; }
 
     var src = { ip: '0.0.0.0', port: 0 };
 
@@ -636,7 +686,7 @@ function Server(options) {
         if (ws.readyState === 1) { // OPEN
           // HOT PATH: zero-copy Buffer view. ws library accepts both
           // Buffer and Uint8Array, but Buffer is the optimized path.
-          var out = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+          var out = wire.to_buffer(buf);
           ws.send(out);
         }
       } catch(e) {}
@@ -662,6 +712,173 @@ function Server(options) {
   }
 
 
+  /* ====================== WebSocket listener (optional auto-attach) ====================== */
+
+  // start_ws bridges a WebSocket server into the TURN engine. turn-server does
+  // not require a WS library for the common cases; resolution order is:
+  //
+  //   (a) a running WS server instance via `wsServer`
+  //       (anything that emits 'connection' with (ws, req)), or
+  //   (b) a WS server *constructor* via `WebSocketServer`
+  //       (e.g. the `ws` package's `WebSocketServer`), instantiated on
+  //       { port, host, path } (or { server } to attach to an http(s).Server), or
+  //   (c) a lazy import('ws') fallback (install `ws`), or
+  //   (d) a clear, actionable error.
+  //
+  // For Express/Fastify/HTTP apps, prefer calling server.handleWebSocket(ws, req)
+  // yourself from your own upgrade handler — see the README.
+  function start_ws(config) {
+    if (config.wsServer) { wireWsServer(config, config.wsServer); return; }
+
+    if (config.WebSocketServer) {
+      var inst = instantiateWsServer(config, config.WebSocketServer);
+      if (inst) wireWsServer(config, inst);
+      return;
+    }
+
+    // Lazy import('ws') — only loaded when actually starting a ws listener.
+    import('ws').then(function(m) {
+      var Ctor = m.WebSocketServer || (m.default && m.default.Server) || m.Server;
+      if (typeof Ctor !== 'function') {
+        ev.emit('error', new Error("ws transport: installed 'ws' has no WebSocketServer export"));
+        return;
+      }
+      var inst = instantiateWsServer(config, Ctor);
+      if (inst) wireWsServer(config, inst);
+    }).catch(function() {
+      ev.emit('error', new Error(
+        "ws transport requires the 'ws' package. Install it (npm i ws), pass a " +
+        "'wsServer' instance or 'WebSocketServer' constructor in the listen config, " +
+        "or call server.handleWebSocket(ws, req) from your own WebSocket server."));
+    });
+  }
+
+  function instantiateWsServer(config, Ctor) {
+    var ctorOpts = { port: config.port || 3478, host: config.address || '0.0.0.0' };
+    if (config.path) ctorOpts.path = config.path;
+    if (config.server) { delete ctorOpts.port; delete ctorOpts.host; ctorOpts.server = config.server; }
+    try {
+      return new Ctor(ctorOpts);
+    } catch (e) {
+      ev.emit('error', e);
+      return null;
+    }
+  }
+
+  function wireWsServer(config, wsServer) {
+    wsServer.on('connection', function(ws, req) {
+      handleWebSocket(ws, req);
+    });
+
+    wsServer.on('error', function(err) { ev.emit('error', err); });
+
+    if (typeof wsServer.on === 'function') {
+      wsServer.on('listening', function() {
+        ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0', port: config.port || null });
+      });
+    }
+    // Some WS servers attached to an existing http.Server never emit 'listening'
+    // themselves — surface a listening event immediately in that case.
+    if (config.wsServer || config.server) {
+      ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0', port: config.port || null });
+    }
+
+    // Tracked so stop()/drain() can close it (ws.WebSocketServer and http.Server
+    // both expose .close(cb)).
+    context.listeners.push({ type: 'ws', socket: wsServer });
+  }
+
+
+  /* ====================== DTLS listener (RFC 7350) ====================== */
+
+  // STUN/TURN over DTLS. lemon-tls's createDTLSServer owns its own UDP socket
+  // and per-peer demux, handing us a connected DTLSSocket per client — so this
+  // bridges almost exactly like handleWebSocket: one DTLSSocket <-> one TURN
+  // client Socket. DTLS preserves datagram boundaries, so there is no framing
+  // (each 'data' is one STUN/ChannelData message), and the relay path to peers
+  // stays plain UDP as usual.
+  function start_dtls(config) {
+    var port = config.port || 5349;
+    var address = config.address || '0.0.0.0';
+
+    resolveCreateDTLSServer(config, context, function(err, createDTLSServer) {
+      if (err) { ev.emit('error', err); return; }
+
+      var cert = loadPem(tlsField(config, 'cert'));
+      var key  = loadPem(tlsField(config, 'key'));
+      if (!cert || !key) {
+        ev.emit('error', new Error('dtls transport requires cert and key (in the listen config or createServer({ tls }))'));
+        return;
+      }
+
+      var dtlsServer;
+      try {
+        dtlsServer = createDTLSServer({
+          cert: cert,
+          key: key,
+          ca: loadPem(tlsField(config, 'ca')),
+          requestCert: config.requestCert,
+          SNICallback: tlsField(config, 'SNICallback') || tlsField(config, 'sniCallback')
+                    || config.sniCallback || context.sniCallback || undefined,
+          alpnProtocols: config.alpnProtocols || ['stun.turn', 'stun.nat-discovery'],
+          minVersion: config.minVersion || 'DTLSv1.2',
+          maxVersion: config.maxVersion || 'DTLSv1.3',
+          mtu: config.mtu,
+          // DoS mitigation: require a HelloVerifyRequest cookie round-trip by
+          // default for an internet-facing relay (override with useCookies:false).
+          useCookies: config.useCookies !== false,
+        });
+      } catch (e) { ev.emit('error', e); return; }
+
+      var localAddr = { ip: address, port: port };
+
+      dtlsServer.on('connection', function(dsock) {
+        if (context.destroyed) { try { dsock.close(); } catch (e) {} return; }
+        if (context.draining)  { try { dsock.close(); } catch (e) {} return; }
+
+        var src = { ip: dsock.remoteAddress, port: dsock.remotePort };
+        if (!check_hook('accept', { source: src, transport: 'dtls' })) {
+          try { dsock.close(); } catch (e) {}
+          return;
+        }
+
+        var client = create_client_socket(src, function(buf) {
+          // One STUN/ChannelData message per DTLS datagram (no framing).
+          try {
+            var out = wire.to_buffer(buf);
+            dsock.send(out);
+          } catch (e) {}
+        }, localAddr);
+
+        var key2 = 'dtls:' + src.ip + ':' + src.port;
+        context.clients[key2] = client;
+
+        dsock.on('data', function(d) {
+          if (context.destroyed) return;
+          client.feed(d instanceof ArrayBuffer ? new Uint8Array(d) : d);
+        });
+
+        dsock.on('error', function(e) { ev.emit('error', e); });
+
+        dsock.on('close', function() {
+          client.close();
+          delete context.clients[key2];
+        });
+      });
+
+      dtlsServer.on('clientError', function(e) { ev.emit('error', e); });
+      dtlsServer.on('error', function(e) { ev.emit('error', e); });
+
+      dtlsServer.listen(port, address, function() {
+        ev.emit('listening', { transport: 'dtls', address: address, port: port });
+      });
+
+      // dtlsServer exposes .close(cb) — trackable for stop()/drain().
+      context.listeners.push({ type: 'dtls', socket: dtlsServer });
+    });
+  }
+
+
   /* ====================== start / stop ====================== */
 
   function start() {
@@ -675,8 +892,12 @@ function Server(options) {
         start_tcp(lc);
       } else if (transport === 'tls') {
         start_tls(lc);
+      } else if (transport === 'ws' || transport === 'wss') {
+        start_ws(lc);
       } else if (transport === 'dtls') {
-        ev.emit('error', new Error('DTLS transport not yet supported'));
+        start_dtls(lc);
+      } else {
+        ev.emit('error', new Error('Unknown transport: ' + transport));
       }
     }
   }
@@ -737,6 +958,15 @@ function Server(options) {
     }
     context.clients = {};
 
+    // Close any shared-socket DTLS sessions (and their idle timers).
+    var dkeys = Object.keys(context.dtlsConns);
+    for (var d = 0; d < dkeys.length; d++) {
+      var de = context.dtlsConns[dkeys[d]];
+      if (de && de.idle) { try { clearTimeout(de.idle); } catch (e) {} }
+      if (de && de.session) { try { de.session.close(); } catch (e) {} }
+    }
+    context.dtlsConns = {};
+
     var pending = context.listeners.length;
     if (pending === 0) {
       ev.emit('close');
@@ -795,6 +1025,14 @@ function Server(options) {
 
     if (!sock || !localAddr) return;  // external mode not configured for this family
 
+    // RFC 7983 demux: a DTLS record's first byte is 20–63. When shared-socket
+    // DTLS is enabled, route those into per-peer DTLSSessions (RFC 7350 over
+    // the shared port) instead of parsing them as cleartext STUN.
+    if (context.dtlsShared && msg && msg.length > 0 && msg[0] >= 20 && msg[0] <= 63) {
+      handleDtlsPacket(msg, rinfo, sock, localAddr);
+      return;
+    }
+
     var send_fn = function(out, dst_port, dst_ip) {
       sock.send(out, 0, out.length, dst_port, dst_ip, function(err) {
         if (err) ev.emit('error', err);
@@ -802,6 +1040,109 @@ function Server(options) {
     };
 
     process_udp_packet(msg, rinfo, send_fn, localAddr);
+  }
+
+
+  /* ── Shared-socket DTLS (RFC 7350 over the external UDP socket) ── */
+
+  function handleDtlsPacket(msg, rinfo, sock, localAddr) {
+    if (!context._DTLSSessionCtor) {
+      // Constructor not ready: surface a load error once, otherwise drop and
+      // let DTLS retransmit its ClientHello.
+      if (context._dtlsCtorErr && !context._dtlsCtorReported) {
+        context._dtlsCtorReported = true;
+        ev.emit('error', context._dtlsCtorErr);
+      }
+      return;
+    }
+
+    var key = make_udp_key(rinfo.address, rinfo.port, localAddr.ip, localAddr.port);
+    var entry = context.dtlsConns[key];
+
+    if (!entry) {
+      if (context.draining) return;
+      if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) return;
+      if (!check_hook('accept', { source: { ip: rinfo.address, port: rinfo.port }, transport: 'dtls' })) return;
+      entry = createDtlsConn(key, rinfo, sock, localAddr);
+      if (!entry) return;
+    }
+
+    if (entry.idle && typeof entry.idle.refresh === 'function') entry.idle.refresh();
+    entry.session.feedDatagram(msg);
+  }
+
+  function createDtlsConn(key, rinfo, sock, localAddr) {
+    var cfg = context.dtlsShared || {};
+    var cert = loadPem(cfg.cert != null ? cfg.cert : (context.tlsDefaults && context.tlsDefaults.cert));
+    var keyPem = loadPem(cfg.key != null ? cfg.key : (context.tlsDefaults && context.tlsDefaults.key));
+    if (!cert || !keyPem) {
+      ev.emit('error', new Error('shared-socket DTLS requires cert and key (in createServer({ dtls }) or createServer({ tls }))'));
+      return null;
+    }
+
+    var session;
+    try {
+      session = new context._DTLSSessionCtor({
+        isServer: true,
+        cert: cert,
+        key: keyPem,
+        ca: loadPem(cfg.ca != null ? cfg.ca : (context.tlsDefaults && context.tlsDefaults.ca)),
+        requestCert: cfg.requestCert,
+        SNICallback: cfg.SNICallback || (context.tlsDefaults && context.tlsDefaults.SNICallback) || context.sniCallback || undefined,
+        alpnProtocols: cfg.alpnProtocols || ['stun.turn', 'stun.nat-discovery'],
+        minVersion: cfg.minVersion || 'DTLSv1.2',
+        maxVersion: cfg.maxVersion || 'DTLSv1.3',
+        mtu: cfg.mtu,
+        useCookies: cfg.useCookies !== false,
+      });
+    } catch (e) { ev.emit('error', e); return null; }
+
+    var entry = { session: session, client: null, idle: null };
+    context.dtlsConns[key] = entry;
+
+    var dst_ip = rinfo.address, dst_port = rinfo.port;
+
+    function cleanup() {
+      if (entry.idle) { clearTimeout(entry.idle); entry.idle = null; }
+      if (entry.client) { try { entry.client.close(); } catch (e) {} }
+      delete context.clients[key];
+      delete context.dtlsConns[key];
+    }
+
+    // Idle reaper (reuses the UDP idleTimeout). Refreshed on each inbound record.
+    if (context.idleTimeout) {
+      entry.idle = setTimeout(function() { try { session.close(); } catch (e) {} cleanup(); }, context.idleTimeout);
+      if (entry.idle.unref) entry.idle.unref();
+    }
+
+    // DTLS → wire: send encrypted records back over the shared socket.
+    session.on('packet', function(data) {
+      if (context.destroyed) return;
+      var out = wire.to_buffer(data);
+      sock.send(out, 0, out.length, dst_port, dst_ip, function(err) { if (err) ev.emit('error', err); });
+    });
+
+    // Handshake complete → build the TURN client Socket. Outbound TURN bytes
+    // are encrypted via session.send(); decrypted inbound arrives on 'data'.
+    session.on('connect', function() {
+      if (entry.client || context.destroyed) return;
+      var client = create_client_socket({ ip: dst_ip, port: dst_port }, function(buf) {
+        try { session.send(buf); } catch (e) {}
+      }, localAddr);
+      entry.client = client;
+      context.clients[key] = client;
+      client.on('close', function() { delete context.clients[key]; });
+    });
+
+    session.on('data', function(plain) {
+      if (!entry.client || context.destroyed) return;
+      entry.client.feed(plain instanceof ArrayBuffer ? new Uint8Array(plain) : plain);
+    });
+
+    session.on('error', function(e) { ev.emit('error', e); });
+    session.on('close', cleanup);
+
+    return entry;
   }
 
   // Query whether the given 5-tuple matches an active TURN client.
@@ -815,7 +1156,7 @@ function Server(options) {
     if (!localAddr) return false;
 
     var key = make_udp_key(rinfo.address, rinfo.port, localAddr.ip, localAddr.port);
-    return !!context.clients[key];
+    return !!context.clients[key] || !!context.dtlsConns[key];
   }
 
 

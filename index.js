@@ -48,6 +48,9 @@ function connect(uri, options, cb) {
     parsed = { host: parts[0], port: parseInt(parts[1]) || 3478, transport: 'udp', secure: false, isTurn: true };
   }
 
+  var isWs   = parsed.transport === 'ws' || parsed.transport === 'wss';
+  var isDtls = parsed.transport === 'dtls';
+
   var socket = new Socket({
     isServer: false,
     server: parsed.host,
@@ -57,17 +60,35 @@ function connect(uri, options, cb) {
     password: options.password || null,
     authMech: (options.username && options.password) ? 'long-term' : 'none',
     software: options.software || null,
-    rto: (parsed.transport === 'udp') ? (options.rto || 500) : null,
+    // STUN retransmission applies to unreliable datagram transports: UDP and
+    // DTLS (DTLS does NOT retransmit application data — only its handshake).
+    rto: (parsed.transport === 'udp' || isDtls) ? (options.rto || 500) : null,
     servername: options.servername || parsed.host,
     ca: options.ca || null,
     rejectUnauthorized: options.rejectUnauthorized,
+    // WebSocket transport options (ws/wss)
+    WebSocket: options.WebSocket || null,
+    wsPath: options.wsPath || null,
+    wsUrl: options.wsUrl || null,
+    // DTLS transport options (lemon-tls)
+    connectDTLS: options.connectDTLS || null,
+    lemonTls: options.lemonTls || null,
+    alpnProtocols: options.alpnProtocols || null,
+    minVersion: options.minVersion || null,
+    maxVersion: options.maxVersion || null,
+    mtu: options.mtu || null,
   });
 
   if (options.autoRefresh !== false) {
     socket.getSession().enableAutoRefresh();
   }
 
-  if (typeof uri === 'string' && !/^\d+\.\d+\.\d+\.\d+$/.test(parsed.host)) {
+  // Skip the SRV/DNS IP-rewrite for transports that must connect by hostname
+  // to preserve TLS/DTLS certificate (SNI) validation; their implementations
+  // do their own DNS. (resolve() also has no SRV record type for ws/dtls.)
+  var skipResolve = isWs || isDtls;
+
+  if (typeof uri === 'string' && !skipResolve && !/^\d+\.\d+\.\d+\.\d+$/.test(parsed.host)) {
     resolve(uri, function(err, resolved) {
       if (resolved) {
         socket.context.serverHost = resolved.host;
