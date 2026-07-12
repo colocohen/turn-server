@@ -141,6 +141,12 @@ function Server(options) {
     // Per-user allocation tracking (for userQuota)
     _userAllocations: {},
 
+    // RFC 5766 §14.9 — port reservations (EVEN-PORT R bit → RESERVATION-TOKEN).
+    // Server-scoped and shared with every client Socket, because the token is
+    // claimed by a NEW allocation arriving on a DIFFERENT 5-tuple.
+    // tokenHex → { socket, timer }
+    relayReservations: {},
+
     listeners: [],
     clients: {},
     destroyed: false,
@@ -154,6 +160,18 @@ function Server(options) {
     externalLocalAddr:  null,                        // cached from socket.address()
     externalLocalAddr6: null,                        // cached from socket6.address()
   };
+
+  // Fail fast on a broken auth config. Long-term (and REST-API) credentials
+  // are derived as MD5(username:realm:password) and the realm is mandatory in
+  // the 401 challenge — without it the challenge can't be built and every
+  // client hangs in an auth loop. Catch this at construction time with a
+  // clear message instead of failing silently per packet.
+  if (context.authMech === 'long-term' && !context.realm && !context.realmCallback) {
+    throw new Error(
+      "turn-server: auth.mechanism 'long-term' requires auth.realm (or a realmCallback). " +
+      "The realm is sent in the 401 challenge and is part of key derivation: " +
+      "key = MD5(username:realm:password).");
+  }
 
   // Cache local addresses from external sockets. Sockets MUST be bound
   // before being passed to createServer — this is validated here so errors
@@ -238,6 +256,7 @@ function Server(options) {
       externalIp: context.externalIp,
       portRange: context.portRange,
       relayCallback: context.relayCallback,
+      reservations: context.relayReservations,
       maxAllocateLifetime: context.maxAllocateLifetime,
       defaultAllocateLifetime: context.defaultAllocateLifetime,
       secureStun: context.secureStun,
@@ -289,12 +308,25 @@ function Server(options) {
     sock.on('allocate:expired', function(alloc) {
       context.stats.activeAllocations--;
       var u = alloc.username || '_anon';
-      if (context._userAllocations[u]) context._userAllocations[u]--;
+      if (context._userAllocations[u]) {
+        context._userAllocations[u]--;
+        // Delete at zero — with REST-style usernames ("timestamp:user") every
+        // session has a UNIQUE username, so keeping zero-count keys would
+        // grow this map forever (memory leak on a long-running server).
+        if (context._userAllocations[u] <= 0) delete context._userAllocations[u];
+      }
       ev.emit('allocate:expired', sock, alloc);
     });
 
     sock.on('error', function(err) {
       ev.emit('error', err);
+    });
+
+    // Stats: count real authentication failures (bad integrity, unknown user,
+    // wrong credentials — NOT the initial 401 challenge of the normal flow).
+    session.on('auth:failure', function(info) {
+      context.stats.authFailures++;
+      ev.emit('auth:failure', sock, info);
     });
 
     // Stats: relay tracking
@@ -468,7 +500,13 @@ function Server(options) {
     var address = config.address || '0.0.0.0';
     var family = address.indexOf(':') >= 0 ? 'udp6' : 'udp4';
 
-    var udp = dgram.createSocket({ type: family, reuseAddr: true });
+    // reuseAddr is OPT-IN. With reuseAddr:true, binding a port that this
+    // process (or another) already holds SUCCEEDS silently — producing two
+    // live listeners with separate client tables that split traffic
+    // unpredictably. That failure mode is far worse than a loud EADDRINUSE,
+    // so the default is false; pass { reuseAddr: true } per endpoint if you
+    // genuinely need SO_REUSEADDR semantics.
+    var udp = dgram.createSocket({ type: family, reuseAddr: config.reuseAddr === true });
 
     // Cached local address — udp.address() is a syscall. Safe to cache
     // after 'listening' fires, the address cannot change.
@@ -486,6 +524,9 @@ function Server(options) {
     });
 
     udp.on('error', function(err) {
+      // Annotate so consumers can react per-endpoint (e.g. re-listen only
+      // the port that failed with EADDRINUSE).
+      err.transport = 'udp'; err.port = port; err.address = address;
       ev.emit('error', err);
     });
 
@@ -509,6 +550,13 @@ function Server(options) {
 
     var tcp = net.createServer(function(conn) {
       if (context.destroyed) { conn.destroy(); return; }
+      // Reject new connections while draining (graceful shutdown)
+      if (context.draining) { conn.destroy(); return; }
+      // Built-in maxConnections check (same policy as the UDP path)
+      if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) {
+        conn.destroy();
+        return;
+      }
 
       var src = { ip: conn.remoteAddress, port: conn.remotePort };
 
@@ -558,7 +606,10 @@ function Server(options) {
       });
     });
 
-    tcp.on('error', function(err) { ev.emit('error', err); });
+    tcp.on('error', function(err) {
+      err.transport = 'tcp'; err.port = port; err.address = address;
+      ev.emit('error', err);
+    });
 
     tcp.on('listening', function() {
       var addr = tcp.address();
@@ -597,6 +648,13 @@ function Server(options) {
 
     var tls_server = tls.createServer(tls_options, function(conn) {
       if (context.destroyed) { conn.destroy(); return; }
+      // Reject new connections while draining (graceful shutdown)
+      if (context.draining) { conn.destroy(); return; }
+      // Built-in maxConnections check (same policy as the UDP path)
+      if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) {
+        conn.destroy();
+        return;
+      }
 
       var src = { ip: conn.remoteAddress, port: conn.remotePort };
 
@@ -641,7 +699,10 @@ function Server(options) {
       });
     });
 
-    tls_server.on('error', function(err) { ev.emit('error', err); });
+    tls_server.on('error', function(err) {
+      err.transport = 'tls'; err.port = port; err.address = address;
+      ev.emit('error', err);
+    });
 
     tls_server.on('listening', function() {
       var addr = tls_server.address();
@@ -663,6 +724,11 @@ function Server(options) {
     if (context.destroyed) { try { ws.close(); } catch(e) {} return; }
     // Reject new connections while draining (graceful shutdown).
     if (context.draining) { try { ws.close(); } catch(e) {} return; }
+    // Built-in maxConnections check (same policy as the UDP path)
+    if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) {
+      try { ws.close(); } catch(e) {}
+      return;
+    }
 
     var src = { ip: '0.0.0.0', port: 0 };
 
@@ -770,7 +836,10 @@ function Server(options) {
       handleWebSocket(ws, req);
     });
 
-    wsServer.on('error', function(err) { ev.emit('error', err); });
+    wsServer.on('error', function(err) {
+      err.transport = 'ws'; err.port = config.port || null;
+      ev.emit('error', err);
+    });
 
     if (typeof wsServer.on === 'function') {
       wsServer.on('listening', function() {
@@ -835,6 +904,11 @@ function Server(options) {
       dtlsServer.on('connection', function(dsock) {
         if (context.destroyed) { try { dsock.close(); } catch (e) {} return; }
         if (context.draining)  { try { dsock.close(); } catch (e) {} return; }
+        // Built-in maxConnections check (same policy as the UDP path)
+        if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) {
+          try { dsock.close(); } catch (e) {}
+          return;
+        }
 
         var src = { ip: dsock.remoteAddress, port: dsock.remotePort };
         if (!check_hook('accept', { source: src, transport: 'dtls' })) {
@@ -867,7 +941,10 @@ function Server(options) {
       });
 
       dtlsServer.on('clientError', function(e) { ev.emit('error', e); });
-      dtlsServer.on('error', function(e) { ev.emit('error', e); });
+      dtlsServer.on('error', function(e) {
+        e.transport = 'dtls'; e.port = port; e.address = address;
+        ev.emit('error', e);
+      });
 
       dtlsServer.listen(port, address, function() {
         ev.emit('listening', { transport: 'dtls', address: address, port: port });
@@ -881,9 +958,9 @@ function Server(options) {
 
   /* ====================== start / stop ====================== */
 
-  function start() {
-    for (var i = 0; i < listen_config.length; i++) {
-      var lc = listen_config[i];
+  function startConfigs(configs) {
+    for (var i = 0; i < configs.length; i++) {
+      var lc = configs[i];
       var transport = (lc.transport || 'udp').toLowerCase();
 
       if (transport === 'udp') {
@@ -902,28 +979,42 @@ function Server(options) {
     }
   }
 
+  function start() {
+    startConfigs(listen_config);
+  }
+
   // listen() — like Node's server.listen(). Accepts config and starts.
   // Usage:
   //   server.listen({ port: 3478 })
   //   server.listen({ port: 3478, transport: 'udp' })
   //   server.listen([{ port: 3478 }, { port: 5349, transport: 'tls', cert, key }])
+  //
+  // Each call starts ONLY the endpoints it adds. (Starting the accumulated
+  // listen_config on every call silently double-bound earlier UDP ports —
+  // reuseAddr allowed two listeners with separate client tables on the same
+  // port, splitting traffic unpredictably.)
   function listen(config, cb) {
     if (!config) config = [{ port: 3478, transport: 'udp' }];
     if (!Array.isArray(config)) config = [config];
+
+    var added = [];
 
     // Each item: if only port specified, start both UDP and TCP on it
     for (var i = 0; i < config.length; i++) {
       var lc = config[i];
       if (!lc.transport) {
         // Default: start UDP + TCP on same port
-        listen_config.push(Object.assign({}, lc, { transport: 'udp' }));
-        listen_config.push(Object.assign({}, lc, { transport: 'tcp' }));
+        var u = Object.assign({}, lc, { transport: 'udp' });
+        var t = Object.assign({}, lc, { transport: 'tcp' });
+        listen_config.push(u, t);
+        added.push(u, t);
       } else {
         listen_config.push(lc);
+        added.push(lc);
       }
     }
 
-    start();
+    startConfigs(added);
     if (cb) cb();
   }
 
@@ -966,6 +1057,15 @@ function Server(options) {
       if (de && de.session) { try { de.session.close(); } catch (e) {} }
     }
     context.dtlsConns = {};
+
+    // Release unclaimed port reservations (RFC 5766 §14.9).
+    var rvkeys = Object.keys(context.relayReservations);
+    for (var rv = 0; rv < rvkeys.length; rv++) {
+      var rentry = context.relayReservations[rvkeys[rv]];
+      if (rentry && rentry.timer) { try { clearTimeout(rentry.timer); } catch (e) {} }
+      if (rentry && rentry.socket) { try { rentry.socket.close(); } catch (e) {} }
+    }
+    context.relayReservations = {};
 
     var pending = context.listeners.length;
     if (pending === 0) {

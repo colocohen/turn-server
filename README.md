@@ -252,7 +252,7 @@ transparent to the protocol layer.
 - MESSAGE-INTEGRITY (SHA1), MESSAGE-INTEGRITY-SHA256, SHA384, SHA512
 - FINGERPRINT (CRC32 with XOR), timing-safe comparison
 - ChannelData encode/decode (zero-copy subarray)
-- TCP framing (2-byte length prefix)
+- STUN-over-stream framing (RFC 8489 §6.2.2) - self-delimiting, no length prefix (matches coturn and browsers)
 - STUN/TURN URI parsing (RFC 7064 / 7065)
 - SASLprep / NFKC normalization
 - RFC 5769 test vectors - 22/22 passing
@@ -267,17 +267,19 @@ transparent to the protocol layer.
 - SNICallback for multi-domain TLS (like `node:tls`)
 - realmCallback for per-client realm/auth configuration
 - relayCallback for per-allocation relay address selection
-- EVEN-PORT and RESERVATION-TOKEN support
+- EVEN-PORT and RESERVATION-TOKEN (RFC 5766 §14.6 / §14.9) - even-port allocation, port+1 reservation with the token returned in the Allocate response, cross-connection claim, 30-second reservation TTL
+- ICMP error forwarding (RFC 8656 §11.5) - relay send failures become Data indications carrying an ICMP attribute; the client surfaces them as an `icmp` event
 - TCP relay (RFC 6062) - CONNECT and CONNECTION_BIND
 - NAT behavior discovery (RFC 5780) - CHANGE-REQUEST with secondary address
 - Peer address blocking - loopback, multicast, unspecified blocked by default (CVE-2020-26262)
 - Origin consistency checking
 
 ### Server - Production Features
-- Built-in convenience limits: `maxConnections`, `userQuota`, `totalQuota`, `maxDataSize`, `maxPermissionsPerAllocation`, `maxChannelsPerAllocation`
+- Built-in convenience limits: `maxConnections` (enforced on **every** transport: UDP, TCP, TLS, WebSocket, DTLS), `userQuota`, `totalQuota`, `maxDataSize`, `maxPermissionsPerAllocation`, `maxChannelsPerAllocation`
 - UDP idle timeout - automatically removes dead 5-tuple entries (default 5 min)
-- Graceful shutdown - `drain(timeout, cb)` stops new connections, waits for existing
-- Statistics - `getStats()` returns 7 real-time counters
+- Graceful shutdown - `drain(timeout, cb)` stops new connections on all transports, waits for existing
+- Statistics - `getStats()` returns 7 real-time counters, including a live `authFailures` count
+- `auth:failure` event - `(socket, { username, code, reason })` on bad integrity / unknown user / wrong credentials (the initial 401 challenge of the normal long-term flow is *not* counted) - ideal for rate limiting or fail2ban-style banning
 - Health check - `isHealthy()`, `isDraining()`
 - TLS with ALPN (`stun.turn`, `stun.nat-discovery`) and SNI
 
@@ -424,6 +426,11 @@ agent.gather();
 
 The result is **zero packet loss during restart** when the old path is still functional (e.g., user-initiated restart). For restarts triggered by a dead path (~85% of real-world restarts), the behavior matches the hard-reset approach.
 
+`gather()` after a restart:
+- **Re-announces the kept candidates** through the `candidate` event, so the SDP layer sees the full set again (existing sockets are preserved - they carry the previous pair's media during the restart window).
+- **Binds sockets only for interfaces that appeared** since the previous gather - the network-change case, which is the most common reason to restart ICE.
+- **Reuses live TURN allocations** instead of allocating a second time on the same server.
+
 ### Using IceAgent with your own TURN client socket
 
 If you already have a `Socket` (from `connect()` or a custom transport), pass it as `externalSocket`:
@@ -450,7 +457,7 @@ Every decision point in the server is exposed as a hook. Hooks receive an info o
 
 ```js
 server.on('accept', (info, cb) => {
-  // info: { source: { ip, port }, transport: 'udp'|'tcp'|'tls' }
+  // info: { source: { ip, port }, transport: 'udp'|'tcp'|'tls'|'ws'|'dtls' }
   cb(isAllowed(info.source.ip));
 });
 
@@ -471,12 +478,40 @@ server.on('beforeRelay', (info, cb) => {
 });
 ```
 
+### The `authenticate` hook - sync or async, one contract
+
+`authenticate` resolves credentials for **both** long-term and short-term auth,
+with a single callback contract. Both styles are accepted:
+
+```js
+cb(passwordOrKey)        // password string, pre-computed HMAC key (Buffer), null = unknown user
+cb(err, passwordOrKey)   // Node style - err → treated as unknown user
+```
+
+The callback may be invoked **synchronously or asynchronously** - the server
+defers its response until the callback fires, so database lookups are safe.
+Only the first invocation counts. For long-term auth, a string is passed
+through `MD5(user:realm:pass)` key derivation; a Buffer is used verbatim as
+a pre-computed key. For short-term auth, a string is the raw password
+(e.g. ICE's `ice-pwd`) and a Buffer is used verbatim.
+
+Real failed attempts (bad integrity, unknown user, wrong credentials) emit
+`auth:failure` and increment `getStats().authFailures`:
+
+```js
+server.on('auth:failure', (socket, { username, code, reason }) => {
+  // reason: 'bad-integrity' | 'unknown-user' | 'wrong-credentials'
+  //       | 'algorithm-mismatch' | 'invalid-token' | 'missing-credentials'
+  banCandidates.record(socket.context.session?.context?.source, username);
+});
+```
+
 All 14 hooks:
 
 | Hook | When | Info |
 |------|------|------|
 | `accept` | New connection | source, transport |
-| `authenticate` | Long-term auth | username, realm → cb(hmacKey) |
+| `authenticate` | Long-term **and** short-term auth | username, realm → cb(passwordOrKey) or cb(err, passwordOrKey); sync **or** async |
 | `authenticate_oauth` | OAuth auth | token, realm → cb(err, key) |
 | `authorize` | After auth | username, method |
 | `quota` | Before allocate | username → cb(allowed) |
@@ -512,6 +547,36 @@ connect('turn:example.com:3478?transport=udp', {
   socket.sendChannel(0x4001, Buffer.from('hello'));
 
   socket.on('data', (peer, data, channel) => { /* ... */ });
+
+  // ICMP errors from the relay path (RFC 8656 §11.5) - the server tells you
+  // a Send to this peer bounced (port/host/net unreachable, packet too big)
+  socket.on('icmp', (peer, icmp) => {
+    console.log(`peer ${peer.ip}:${peer.port} unreachable`, icmp); // { type, code, data }
+  });
+});
+```
+
+#### allocate(options, cb)
+
+| Option | Description |
+|---|---|
+| `transport` | `17` (UDP relay, default) or `6` (TCP relay, RFC 6062) |
+| `lifetime` | Requested allocation lifetime in seconds |
+| `dontFragment` | Add DONT-FRAGMENT |
+| `evenPort` | `true` = even relay port **and** reserve port+1 (R bit); `{ reserve: false }` = even port only (RFC 5766 §14.6) |
+| `reservationToken` | 8-byte token from a previous EVEN-PORT allocation - claims the reserved port+1 (RFC 5766 §14.9) |
+| `requestedAddressFamily` | `0x01` IPv4 / `0x02` IPv6 (RFC 6156) |
+
+The reservation flow (e.g. RTP on an even port, RTCP on the next odd port):
+
+```js
+rtpSocket.allocate({ evenPort: true });
+rtpSocket.on('allocate:success', (msg) => {
+  const relay = msg.getAttribute(0x0016);  // XOR-RELAYED-ADDRESS - even port
+  const token = msg.getAttribute(0x0022);  // RESERVATION-TOKEN - 8 bytes
+
+  // Any connection may claim relay.port+1 within 30 seconds:
+  rtcpSocket.allocate({ reservationToken: token });
 });
 ```
 
@@ -681,14 +746,14 @@ turn-server/
 
 | File | Lines | Role |
 |------|-------|------|
-| `wire.js` | 1,059 | Binary protocol - every byte on the wire |
-| `session.js` | 1,586 | Protocol logic - state machine, auth, hooks |
-| `socket.js` | 658 | Network I/O - UDP, TCP, TLS, relay sockets |
-| `server.js` | 731 | Server orchestration - listeners, routing, limits |
-| `ice_agent.js` | 2,349 | ICE agent - gathering, pairing, checks, nomination, consent, restart |
+| `wire.js` | 1,203 | Binary protocol - every byte on the wire |
+| `session.js` | 1,705 | Protocol logic - state machine, auth, hooks |
+| `socket.js` | 959 | Network I/O - UDP, TCP, TLS, relay sockets |
+| `server.js` | 1,275 | Server orchestration - listeners, routing, limits |
+| `ice_agent.js` | 2,718 | ICE agent - gathering, pairing, checks, nomination, consent, restart |
 | `ice_candidate.js` | 459 | Candidate primitives - priority, foundation, SDP parse/format |
-| `index.js` | 203 | Client convenience - connect, DNS, NAT detection |
-| **Total** | **~7,300** | **lemon-tls (DTLS) + ws (WebSocket server, optional)** |
+| `index.js` | 234 | Client convenience - connect, DNS, NAT detection |
+| **Total** | **~8,550** | **lemon-tls (DTLS) + ws (WebSocket server, optional)** |
 
 
 ## 🛣 Roadmap
@@ -724,6 +789,12 @@ turn-server/
 - Origin consistency checking
 - UDP idle timeout + graceful drain
 - Statistics and health checks
+- **Async `authenticate` hook - one contract (`cb(passwordOrKey)` / `cb(err, passwordOrKey)`, sync or async) for long-term + short-term**
+- **`auth:failure` event + live `authFailures` counter (rate-limiting / fail2ban hooks)**
+- **`maxConnections` + graceful drain enforced on every transport (UDP, TCP, TLS, WS, DTLS)**
+- **EVEN-PORT / RESERVATION-TOKEN full flow (RFC 5766 §14.6/§14.9) - token in the Allocate response, cross-connection claim, 30s TTL**
+- **ICMP error forwarding (RFC 8656 §11.5) - Data indication with ICMP attribute + client `icmp` event**
+- **ICE restart re-announces candidates; re-gather binds only new interfaces and reuses TURN allocations**
 - 450+ tests passing (297 core + 153 ICE)
 
 _Community contributions are welcome! Please ⭐ star the repo to follow progress._

@@ -47,7 +47,8 @@ function Session(options) {
 
     // source address of the remote side (set by transport layer)
     source: options.source || null,   // { ip, port, family }
-    localAddress: options.localAddress || null, // { ip, port } — server listening address
+    // { ip, port } — server listening address / RFC 5780 primary address
+    localAddress: options.localAddress || null,
 
     // server-side relay config
     relayIp: options.relayIp || null,
@@ -57,7 +58,6 @@ function Session(options) {
     defaultAllocateLifetime: options.defaultAllocateLifetime || 600,
 
     // NAT detection (RFC 5780) — secondary IP/port for CHANGE-REQUEST
-    localAddress: options.localAddress || null,  // { ip, port } — primary listening address
     secondaryAddress: options.secondaryAddress || null,  // { ip, port } — alternate IP/port
 
     // Security — peer address blocking (coturn CVE-2020-26262)
@@ -130,8 +130,29 @@ function Session(options) {
     return (Date.now() - nonce_time) <= context.nonceExpiry;
   }
 
-  // Synchronous callback only. If the 'authenticate' listener calls cb()
-  // asynchronously the behavior is undefined. Use synchronous cache/map lookups.
+  // Normalize the 'authenticate' hook callback so BOTH styles work, called
+  // synchronously OR asynchronously (e.g. a database lookup):
+  //     cb(result)        — result: password string | HMAC key (Buffer/Uint8Array)
+  //                         | null (unknown user) | Error (treated as unknown)
+  //     cb(err, result)   — Node style
+  // Only the first invocation wins; later calls are ignored.
+  function make_auth_cb(onResult) {
+    var settled = false;
+    return function(a, b) {
+      if (settled) return;
+      settled = true;
+      var result;
+      if (arguments.length >= 2) {
+        result = a ? null : b;                       // cb(err, result)
+      } else {
+        result = (a instanceof Error) ? null : a;    // cb(result)
+      }
+      onResult(result == null ? null : result);
+    };
+  }
+
+  // The 'authenticate' listener may call cb synchronously or asynchronously.
+  // No response is sent until cb fires (async DB lookups are fully supported).
   function get_key_for_user(username, cb) {
     // 1. Static credentials — check first (exact username match)
     if (context.credentials && context.credentials[username] != null) {
@@ -151,17 +172,14 @@ function Session(options) {
       return cb(wire.compute_long_term_key(username, context.realm, password));
     }
 
-    // 3. Dynamic lookup via 'authenticate' event
+    // 3. Dynamic lookup via 'authenticate' event (sync or async — see make_auth_cb)
     if (ev.listenerCount('authenticate') > 0) {
-      var called = false;
-      ev.emit('authenticate', username, context.realm, function(result) {
-        called = true;
-        if (result == null || result instanceof Error) return cb(null);
+      ev.emit('authenticate', username, context.realm, make_auth_cb(function(result) {
+        if (result == null) return cb(null);
         // result can be a pre-computed HMAC key (Buffer) or a password (string)
         if (typeof result === 'string') return cb(wire.compute_long_term_key(username, context.realm, result));
         cb(result); // assume pre-computed key
-      });
-      if (!called) cb(null);
+      }));
       return;
     }
 
@@ -169,6 +187,17 @@ function Session(options) {
   }
 
   function send_challenge(msg) {
+    // Long-term auth cannot challenge without a realm (RFC 8489 §9.2.3 —
+    // REALM is mandatory in the 401). Surface a clear, actionable error
+    // instead of crashing deep inside attribute encoding.
+    if (!context.realm) {
+      ev.emit('error', new Error(
+        "long-term auth requires a realm — cannot send the 401 challenge. " +
+        "Set auth.realm (or provide it via realmCallback / set_context)."));
+      send_error(msg, 500, null, null);
+      return;
+    }
+
     if (context.nonce === null || is_nonce_stale()) generate_nonce();
 
     var attrs = [
@@ -625,13 +654,18 @@ function Session(options) {
     if (ev.listenerCount('authenticate_oauth') > 0) {
       ev.emit('authenticate_oauth', token, context.realm, function(err, key) {
         if (err || key === null) {
+          ev.emit('auth:failure', { username: null, code: 401, reason: 'invalid-token' });
           send_error(msg, 401, null, null);
           return;
         }
         // Validate integrity with the derived key
         if (msg.integrity_offset !== null) {
           var valid = wire.validate_integrity(raw, msg.integrity_offset, key);
-          if (!valid) { send_error(msg, 401, null, null); return; }
+          if (!valid) {
+            ev.emit('auth:failure', { username: null, code: 401, reason: 'bad-integrity' });
+            send_error(msg, 401, null, null);
+            return;
+          }
         }
         route_server_request(msg, key);
       });
@@ -646,48 +680,54 @@ function Session(options) {
     var username = msg.getAttribute(wire.ATTR.USERNAME);
 
     if (username === null || msg.integrity_offset === null) {
+      ev.emit('auth:failure', { username: username, code: 400, reason: 'missing-credentials' });
       send_error(msg, 400, null, null);
       return;
     }
 
-    // Get password for user
-    var password = null;
+    function finish(passwordOrKey) {
+      if (passwordOrKey == null) {
+        ev.emit('auth:failure', { username: username, code: 401, reason: 'unknown-user' });
+        send_error(msg, 401, null, null);
+        return;
+      }
+
+      // The hook may return either the raw password (string) or a
+      // pre-computed short-term key (Buffer/Uint8Array).
+      var key = (typeof passwordOrKey === 'string')
+        ? wire.compute_short_term_key(passwordOrKey)
+        : passwordOrKey;
+
+      var valid = wire.validate_integrity(raw, msg.integrity_offset, key);
+      if (!valid) {
+        ev.emit('auth:failure', { username: username, code: 401, reason: 'bad-integrity' });
+        send_error(msg, 401, null, null);
+        return;
+      }
+
+      // Wrong credentials check
+      if (context.allocation && context.allocation.username !== null) {
+        if (context.allocation.username !== username) {
+          ev.emit('auth:failure', { username: username, code: 441, reason: 'wrong-credentials' });
+          send_error(msg, 441, null, key);
+          return;
+        }
+      }
+
+      route_server_request(msg, key);
+    }
+
+    // Same unified 'authenticate' hook contract as long-term auth:
+    // cb(passwordOrKey) or cb(err, passwordOrKey), sync or async.
     if (ev.listenerCount('authenticate') > 0) {
-      var called = false;
-      ev.emit('authenticate', username, null, function(err, p) {
-        called = true;
-        if (!err && p != null) password = p;
-      });
-      if (!called) password = null;
+      ev.emit('authenticate', username, null, make_auth_cb(finish));
     } else {
       // Look up in credentials map first, then fall back to context.password.
       // ICE connectivity checks use USERNAME = "remoteUfrag:localUfrag" with a
       // single shared password (ice-pwd), so credentials map won't match — the
       // direct password is the expected path for ICE.
-      password = context.credentials[username] || context.password || null;
+      finish(context.credentials[username] || context.password || null);
     }
-
-    if (password === null) {
-      send_error(msg, 401, null, null);
-      return;
-    }
-
-    var key = wire.compute_short_term_key(password);
-    var valid = wire.validate_integrity(raw, msg.integrity_offset, key);
-    if (!valid) {
-      send_error(msg, 401, null, null);
-      return;
-    }
-
-    // Wrong credentials check
-    if (context.allocation && context.allocation.username !== null) {
-      if (context.allocation.username !== username) {
-        send_error(msg, 441, null, key);
-        return;
-      }
-    }
-
-    route_server_request(msg, key);
   }
 
   // RFC 5389 §11 — Long-term credential: USERNAME + REALM + NONCE + INTEGRITY
@@ -713,6 +753,9 @@ function Session(options) {
 
     get_key_for_user(username, function(key) {
       if (key === null) {
+        // Credentials were supplied but the user is unknown — a real failure
+        // (unlike the initial no-credentials 401, which is the normal flow).
+        ev.emit('auth:failure', { username: username, code: 401, reason: 'unknown-user' });
         send_challenge(msg);
         return;
       }
@@ -725,6 +768,7 @@ function Session(options) {
         valid = wire.validate_integrity(raw, msg.integrity_offset, key);
       }
       if (!valid) {
+        ev.emit('auth:failure', { username: username, code: 401, reason: 'bad-integrity' });
         send_challenge(msg);
         return;
       }
@@ -737,6 +781,7 @@ function Session(options) {
         // Client used SHA1 — check if we offered SHA256
         if (client_algo && client_algo.algorithm !== 0x0001) {
           // Mismatch: client claims one algo but used another
+          ev.emit('auth:failure', { username: username, code: 400, reason: 'algorithm-mismatch' });
           send_error(msg, 400, null, null);
           return;
         }
@@ -745,6 +790,7 @@ function Session(options) {
       // Wrong credentials check
       if (context.allocation && context.allocation.username !== null) {
         if (context.allocation.username !== username) {
+          ev.emit('auth:failure', { username: username, code: 441, reason: 'wrong-credentials' });
           send_error(msg, 441, null, key);
           return;
         }
@@ -893,7 +939,7 @@ function Session(options) {
     alloc._confirmed = false;
     alloc._responseSent = false;
 
-    alloc.confirm = function(addr) {
+    alloc.confirm = function(addr, extra) {
       if (alloc._responseSent) return; // guard against double-confirm
       alloc._responseSent = true;
       alloc._confirmed = true;
@@ -903,6 +949,11 @@ function Session(options) {
         { type: wire.ATTR.XOR_MAPPED_ADDRESS, value: context.source },
         { type: wire.ATTR.LIFETIME, value: alloc.lifetime },
       ];
+      // RFC 5766 §14.9 — EVEN-PORT with the R bit reserves port+1; the token
+      // identifying the reservation MUST be returned in the success response.
+      if (extra && extra.reservationToken) {
+        success_attrs.push({ type: wire.ATTR.RESERVATION_TOKEN, value: extra.reservationToken });
+      }
       send_success(msg, success_attrs, key);
     };
 
@@ -946,8 +997,11 @@ function Session(options) {
 
     refresh_allocation(lifetime);
 
+    // lifetime=0 deallocates (context.allocation is now null) — respond 0.
+    // Otherwise respond with the granted (possibly clamped) lifetime.
+    var granted = (lifetime === 0 || !context.allocation) ? 0 : context.allocation.lifetime;
     send_success(msg, [
-      { type: wire.ATTR.LIFETIME, value: lifetime === 0 ? 0 : context.allocation ? context.allocation.lifetime : 0 },
+      { type: wire.ATTR.LIFETIME, value: granted },
     ], key);
   }
 
@@ -1173,7 +1227,7 @@ function Session(options) {
           }
 
           _pendingRequest.retries++;
-          send_client_request(_pendingRequest.method, _pendingRequest.attributes);
+          send_client_request(_pendingRequest.method, _pendingRequest.attributes, null, true);
           return;
         }
       }
@@ -1184,7 +1238,7 @@ function Session(options) {
         if (stale_nonce) {
           context.nonce = stale_nonce;
           _pendingRequest.retries++;
-          send_client_request(_pendingRequest.method, _pendingRequest.attributes);
+          send_client_request(_pendingRequest.method, _pendingRequest.attributes, null, true);
           return;
         }
       }
@@ -1200,7 +1254,11 @@ function Session(options) {
     if (msg.method === wire.METHOD.DATA && msg.cls === wire.CLASS.INDICATION) {
       var peer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
       var data = msg.getAttribute(wire.ATTR.DATA);
-      if (peer && data) ev.emit('data', peer, data, null);
+      var icmp = msg.getAttribute(wire.ATTR.ICMP);
+      // RFC 8656 §11.5 — an ICMP-carrying Data indication has no DATA attr:
+      // the server is telling us a previous Send to this peer hit an ICMP error.
+      if (peer && icmp) ev.emit('icmp', peer, icmp);
+      else if (peer && data) ev.emit('data', peer, data, null);
     }
   }
 
@@ -1277,9 +1335,13 @@ function Session(options) {
     _rtoAttempt = 0;
   }
 
-  function send_client_request(method, attributes, cb) {
-    // Save for auto-retry on 401/438 (base attributes, before auth)
-    if (!_pendingRequest || _pendingRequest.method !== method) {
+  function send_client_request(method, attributes, cb, _isAuthRetry) {
+    // Save for auto-retry on 401/438 (base attributes, before auth).
+    // Always snapshot on a NEW request — matching only on method would keep
+    // stale attributes when the same method is sent twice with different
+    // arguments (e.g. createPermission for a different peer). The internal
+    // 401/438 retry path passes _isAuthRetry to preserve the retry counter.
+    if (!_isAuthRetry) {
       _pendingRequest = { method: method, attributes: attributes, retries: 0 };
     }
 
@@ -1451,7 +1513,9 @@ function Session(options) {
     }, delay);
   }
 
-  // Schedule permission refresh (every 4 min, expires at 5)
+  // Schedule permission refresh (every 4 min, expires at 5). Periodic:
+  // each fire re-arms itself, so permissions stay alive for the whole
+  // session lifetime (until close() or auto-refresh is never enabled).
   function schedule_permission_refresh(peers) {
     if (!_autoRefresh || context.isServer) return;
     var key = peers.map(function(p) { return p.ip || p; }).join(',');
@@ -1464,10 +1528,11 @@ function Session(options) {
         attrs.push({ type: wire.ATTR.XOR_PEER_ADDRESS, value: p });
       }
       send_client_request(wire.METHOD.CREATE_PERMISSION, attrs);
+      schedule_permission_refresh(peers); // re-arm — keep the permission alive
     }, 240000); // 4 minutes
   }
 
-  // Schedule channel rebind (every 9 min, expires at 10)
+  // Schedule channel rebind (every 9 min, expires at 10). Periodic — see above.
   function schedule_channel_refresh(channel, peer) {
     if (!_autoRefresh || context.isServer) return;
     if (_channelTimers[channel]) clearTimeout(_channelTimers[channel]);
@@ -1478,6 +1543,7 @@ function Session(options) {
         { type: wire.ATTR.CHANNEL_NUMBER, value: channel },
         { type: wire.ATTR.XOR_PEER_ADDRESS, value: p },
       ]);
+      schedule_channel_refresh(channel, peer); // re-arm — keep the binding alive
     }, 540000); // 9 minutes
   }
 
@@ -1544,6 +1610,14 @@ function Session(options) {
         { type: wire.ATTR.DATA, value: data },
       ]);
     },
+    /** RFC 8656 §11.5 — notify the client that relaying to a peer hit an
+     *  ICMP error: Data indication with XOR-PEER-ADDRESS + ICMP, no DATA. */
+    sendIcmpError: function(peer, icmp) {
+      send_indication(wire.METHOD.DATA, [
+        { type: wire.ATTR.XOR_PEER_ADDRESS, value: peer },
+        { type: wire.ATTR.ICMP, value: icmp },
+      ]);
+    },
     sendChannelData: function(channel_number, data) {
       ev.emit('message', wire.encode_channel_data(channel_number, data));
     },
@@ -1570,6 +1644,14 @@ function Session(options) {
       var a = [{ type: wire.ATTR.REQUESTED_TRANSPORT, value: options.transport || wire.TRANSPORT.UDP }];
       if (options.lifetime) a.push({ type: wire.ATTR.LIFETIME, value: options.lifetime });
       if (options.dontFragment) a.push({ type: wire.ATTR.DONT_FRAGMENT, value: true });
+      // RFC 5766 §14.6: evenPort: true → even port + reserve port+1 (R bit);
+      //                 evenPort: { reserve: false } → even port only.
+      if (options.evenPort) a.push({ type: wire.ATTR.EVEN_PORT, value: options.evenPort });
+      // RFC 5766 §14.9: claim a previously reserved port (8-byte token from
+      // a prior Allocate success that used evenPort with the R bit).
+      if (options.reservationToken) a.push({ type: wire.ATTR.RESERVATION_TOKEN, value: options.reservationToken });
+      // RFC 6156: request IPv4 (0x01) / IPv6 (0x02) relay explicitly.
+      if (options.requestedAddressFamily) a.push({ type: wire.ATTR.REQUESTED_ADDRESS_FAMILY, value: options.requestedAddressFamily });
       send_client_request(wire.METHOD.ALLOCATE, a, cb);
     },
     refresh: function(lifetime, cb) {

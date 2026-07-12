@@ -104,8 +104,14 @@ function Socket(options) {
     relaySocket: null,
     relayAddress: null, // { ip, port } after bind
 
-    // Server-side: reservation tokens
-    reservations: {},
+    // Server-side: reservation tokens (RFC 5766 §14.9).
+    // A reserved port must be claimable from a NEW allocation — i.e. from a
+    // DIFFERENT 5-tuple — so the map is shared across all client Sockets:
+    // Server passes one shared object via options.reservations. A standalone
+    // Socket (no Server) falls back to a private map and owns its cleanup.
+    // Entry shape: tokenHex → { socket, timer } (timer = 30s expiry, §14.9).
+    reservations: options.reservations || {},
+    ownsReservations: !options.reservations,
 
     // Server-side: TCP relay connections (RFC 6062)
     tcpPeerConnections: {},  // connectionId → net.Socket
@@ -266,7 +272,7 @@ function Socket(options) {
     // Mark as handled — prevents session's sync fallback from firing
     alloc._confirmed = true;
 
-    allocateRelayPort(alloc, function(err, relaySocket, address) {
+    allocateRelayPort(alloc, function(err, relaySocket, address, reservationToken) {
       if (err) {
         if (alloc.reject) alloc.reject(err);
         else ev.emit('error', err);
@@ -276,9 +282,11 @@ function Socket(options) {
       context.relaySocket = relaySocket;
       context.relayAddress = address;
 
-      // Confirm the allocation with the real relay address — this sends the response to the client
+      // Confirm the allocation with the real relay address — this sends the
+      // response to the client (including RESERVATION-TOKEN when port+1 was
+      // reserved via EVEN-PORT's R bit).
       if (alloc.confirm) {
-        alloc.confirm(address);
+        alloc.confirm(address, reservationToken ? { reservationToken: reservationToken } : null);
       }
 
       ev.emit('allocate', alloc);
@@ -350,9 +358,10 @@ function Socket(options) {
 
     var family = (alloc.requestedFamily === wire.FAMILY.IPV6) ? 'udp6' : 'udp4';
 
-    // EVEN-PORT: find an even port (and optionally reserve next)
-    var need_even = alloc.evenPort === true;
-    var need_reserve = alloc.evenPort === true; // R bit
+    // EVEN-PORT (RFC 5766 §14.6): presence requests an even port; the R bit
+    // additionally reserves port+1 (claimed later via RESERVATION-TOKEN).
+    var need_even = alloc.evenPort != null;
+    var need_reserve = !!(alloc.evenPort && (alloc.evenPort === true || alloc.evenPort.reserve));
 
     var attempts = 0;
     var max_attempts = 100;
@@ -374,12 +383,19 @@ function Socket(options) {
 
       var sock = dgram.createSocket(family);
 
-      sock.on('error', function() {
+      // Bind-retry handler: fires when the port is busy. It MUST be detached
+      // once the bind succeeds — otherwise a later runtime error on the relay
+      // socket (e.g. ICMP-driven errors on some platforms) would re-enter
+      // tryBind() and silently swap the relay socket to a NEW port, while the
+      // client was already told the OLD relay address in the Allocate response.
+      function onBindError() {
         try { sock.close(); } catch (e) {}
         tryBind(); // port busy, try another
-      });
+      }
+      sock.once('error', onBindError);
 
       sock.bind({ address: relay_ip, port: port, exclusive: true }, function() {
+        sock.removeListener('error', onBindError);
         var addr = sock.address();
 
         // DONT-FRAGMENT
@@ -392,18 +408,36 @@ function Socket(options) {
         // EVEN-PORT with R bit: reserve the next port (N+1)
         if (need_reserve) {
           var reserveSock = dgram.createSocket(family);
-          reserveSock.on('error', function() {
+          function onReserveBindError() {
             // Can't reserve N+1, try a different even port
             try { sock.close(); } catch (e) {}
             try { reserveSock.close(); } catch (e) {}
             tryBind();
-          });
+          }
+          reserveSock.once('error', onReserveBindError);
           reserveSock.bind({ address: relay_ip, port: port + 1, exclusive: true }, function() {
-            // Store reservation token → reserved socket
-            var token = new Uint8Array(crypto.randomBytes(8));
-            context.reservations[Buffer.from(token).toString('hex')] = reserveSock;
+            reserveSock.removeListener('error', onReserveBindError);
+            // The reserved socket sits idle until claimed via RESERVATION-TOKEN;
+            // keep a handler attached so a stray error can't crash the process.
+            reserveSock.on('error', function(err) { ev.emit('error', err); });
 
-            cb(null, sock, { ip: external_ip, port: addr.port });
+            // Store reservation token → reserved socket. RFC 5766 §14.9:
+            // the server MUST hold the reservation for at least 30 seconds;
+            // after that, release the port.
+            var token = new Uint8Array(crypto.randomBytes(8));
+            var tokenHex = Buffer.from(token).toString('hex');
+            var ttl = setTimeout(function() {
+              var entry = context.reservations[tokenHex];
+              if (!entry) return;
+              delete context.reservations[tokenHex];
+              try { entry.socket.close(); } catch (e) {}
+            }, 30000);
+            if (ttl.unref) ttl.unref();
+            context.reservations[tokenHex] = { socket: reserveSock, timer: ttl };
+
+            // Hand the token up so the Allocate success can carry
+            // RESERVATION-TOKEN (see session alloc.confirm).
+            cb(null, sock, { ip: external_ip, port: addr.port }, token);
           });
           return;
         }
@@ -415,9 +449,11 @@ function Socket(options) {
     // RESERVATION-TOKEN: use previously reserved socket
     if (alloc.reservationToken) {
       var token_hex = Buffer.from(alloc.reservationToken).toString('hex');
-      var reserved = context.reservations[token_hex];
-      if (reserved) {
+      var entry = context.reservations[token_hex];
+      if (entry) {
         delete context.reservations[token_hex];
+        if (entry.timer) clearTimeout(entry.timer);
+        var reserved = entry.socket;
         bindRelaySocket(reserved);
         var raddr = reserved.address();
         cb(null, reserved, { ip: external_ip, port: raddr.port });
@@ -439,6 +475,35 @@ function Socket(options) {
     var allowed = true;
     ev.emit(name, info, function(result) { allowed = !!result; });
     return allowed;
+  }
+
+  // Map a Node.js UDP send errno to an ICMP { type, code } (RFC 8656 §11.5).
+  // Family-aware: ICMPv4 Destination Unreachable is type 3; ICMPv6 (RFC 4443)
+  // is type 1 with different codes, Packet Too Big is type 2.
+  // Returns null for errors that don't correspond to an ICMP condition.
+  function errnoToIcmp(err, peerIp) {
+    if (!err || !err.code) return null;
+    var v6 = peerIp && peerIp.indexOf(':') >= 0;
+    switch (err.code) {
+      case 'ECONNREFUSED': return v6 ? { type: 1, code: 4, data: 0 } : { type: 3, code: 3, data: 0 }; // port unreachable
+      case 'EHOSTUNREACH': return v6 ? { type: 1, code: 3, data: 0 } : { type: 3, code: 1, data: 0 }; // host unreachable
+      case 'ENETUNREACH':  return v6 ? { type: 1, code: 0, data: 0 } : { type: 3, code: 0, data: 0 }; // net unreachable
+      case 'EMSGSIZE':     return v6 ? { type: 2, code: 0, data: 0 } : { type: 3, code: 4, data: 0 }; // frag needed / too big
+      default: return null;
+    }
+  }
+
+  // Relay send failed for a known peer → RFC 8656 §11.5: tell the client via
+  // a Data indication carrying XOR-PEER-ADDRESS + ICMP (no DATA attribute).
+  // Non-ICMP-like errors still surface on the 'error' event as before.
+  function reportRelaySendError(peer, err) {
+    var icmp = errnoToIcmp(err, peer && peer.ip);
+    if (icmp) {
+      try { session.sendIcmpError(peer, icmp); } catch (e) {}
+      ev.emit('icmpError', { type: icmp.type, code: icmp.code, peer: peer, error: err });
+    } else {
+      ev.emit('error', err);
+    }
   }
 
   function bindRelaySocket(sock) {
@@ -486,19 +551,13 @@ function Socket(options) {
       });
     });
 
-    // RFC 8656 §18.13 — report ICMP errors to client via Data indication with ICMP attribute
+    // Socket-level errors have no peer attached (Node doesn't tell us which
+    // datagram triggered them), so we can't build an RFC 8656 §11.5 indication
+    // here — the per-send callbacks above handle that. Surface for observability.
     sock.on('error', function(err) {
       if (context.destroyed) return;
-      // Node.js UDP sockets emit errors on ICMP unreachable etc.
-      // Map common errno to ICMP type/code
-      var icmp_type = 3; // Destination Unreachable
-      var icmp_code = 3; // Port Unreachable (default)
-      if (err.code === 'ECONNREFUSED') icmp_code = 3;
-      else if (err.code === 'EHOSTUNREACH') icmp_code = 1;
-      else if (err.code === 'ENETUNREACH') icmp_code = 0;
-
-      // Send notification to client via event (session can build indication)
-      ev.emit('icmpError', { type: icmp_type, code: icmp_code, error: err });
+      var icmp = errnoToIcmp(err) || { type: 3, code: 3 };
+      ev.emit('icmpError', { type: icmp.type, code: icmp.code, peer: null, error: err });
     });
   }
 
@@ -509,7 +568,7 @@ function Socket(options) {
     // HOT PATH: zero-copy Buffer view (was Buffer.from(data) which copied).
     var out = toBuffer(data);
     context.relaySocket.send(out, 0, out.length, peer.port, peer.ip, function(err) {
-      if (err) ev.emit('error', err);
+      if (err) reportRelaySendError(peer, err);
     });
 
     // Info event: onRelayed (client → peer, outbound, via Send indication)
@@ -531,7 +590,7 @@ function Socket(options) {
     // per active channel in media calls — saves a 1200-byte copy per RTP.
     var out = toBuffer(data);
     context.relaySocket.send(out, 0, out.length, peer.port, peer.ip, function(err) {
-      if (err) ev.emit('error', err);
+      if (err) reportRelaySendError(peer, err);
     });
 
     // Info event: onRelayed (client → peer, outbound, via ChannelData)
@@ -773,6 +832,14 @@ function Socket(options) {
     }
   });
 
+  // Client-side: forward ICMP error notifications from the server
+  // (RFC 8656 §11.5 — Data indication with XOR-PEER-ADDRESS + ICMP).
+  session.on('icmp', function(peer, icmp) {
+    if (!context.isServer) {
+      ev.emit('icmp', peer, icmp);
+    }
+  });
+
 
   /* ====================== close / destroy ====================== */
 
@@ -787,12 +854,19 @@ function Socket(options) {
       context.relaySocket = null;
     }
 
-    // Close reservation sockets
-    var rkeys = Object.keys(context.reservations);
-    for (var i = 0; i < rkeys.length; i++) {
-      try { context.reservations[rkeys[i]].close(); } catch (e) {}
+    // Close reservation sockets — but ONLY when this Socket owns the map.
+    // Under a Server the map is shared across all clients (a token issued
+    // here must be claimable from a different 5-tuple); the Server sweeps
+    // it in stop(), and each entry has its own 30s TTL anyway.
+    if (context.ownsReservations) {
+      var rkeys = Object.keys(context.reservations);
+      for (var i = 0; i < rkeys.length; i++) {
+        var rentry = context.reservations[rkeys[i]];
+        if (rentry && rentry.timer) clearTimeout(rentry.timer);
+        try { (rentry && rentry.socket ? rentry.socket : rentry).close(); } catch (e) {}
+        delete context.reservations[rkeys[i]];
+      }
     }
-    context.reservations = {};
 
     // Close TCP relay peer connections
     var ckeys = Object.keys(context.tcpPeerConnections);

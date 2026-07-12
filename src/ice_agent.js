@@ -265,6 +265,7 @@ function IceAgent(options) {
     _gathering_srflx:     0,
     _gathering_relay:     0,
     _endOfCandidatesEmitted: false,
+    _reEmitOnGather:      false,   // set by restart(): re-announce kept candidates
     _gather_timers:       new Set(),
   };
 
@@ -335,10 +336,13 @@ function IceAgent(options) {
 
     /* Credentials */
 
+    let _localCredsChanged = false;
+
     if ('localUfrag' in opts) {
       if (opts.localUfrag !== context.localUfrag && opts.localUfrag) {
         context.localUfrag = opts.localUfrag;
         has_changed = true;
+        _localCredsChanged = true;
       }
     }
 
@@ -346,7 +350,16 @@ function IceAgent(options) {
       if (opts.localPwd !== context.localPwd && opts.localPwd) {
         context.localPwd = opts.localPwd;
         has_changed = true;
+        _localCredsChanged = true;
       }
+    }
+
+    // Local credentials changed (e.g. setLocalParameters overriding the ones
+    // restart() generated). Routers indexing agents by ufrag MUST hear about
+    // this — the 'restart' event alone carries the agent's own generated
+    // creds, which the SDP layer may immediately replace with its own.
+    if (_localCredsChanged) {
+      ev.emit('localparameters', { ufrag: context.localUfrag, pwd: context.localPwd });
     }
 
     if ('remoteUfrag' in opts) {
@@ -781,6 +794,23 @@ function IceAgent(options) {
 
     set_context({ gatheringState: 'gathering' });
 
+    // Re-gather after ICE restart (RFC 8445 §9): existing candidates are
+    // KEPT (their sockets carry the previous pair's media during the restart
+    // window), but the SDP layer needs them announced again for the new
+    // session. add_local_candidate's dedup would swallow them, so re-emit
+    // here in trickle mode. Non-trickle mode already re-emits the full batch
+    // at 'complete' (cascade 2.1) because restart() resets
+    // _endOfCandidatesEmitted.
+    if (context._reEmitOnGather) {
+      context._reEmitOnGather = false;
+      if (context.trickle) {
+        const existing = context.localCandidates.slice().sort(function(a, b) {
+          return b.priority - a.priority;
+        });
+        for (let i = 0; i < existing.length; i++) ev.emit('candidate', existing[i]);
+      }
+    }
+
     // Classify iceServers
     const stunServers = [];
     const turnServers = [];
@@ -951,6 +981,19 @@ function IceAgent(options) {
 
     const ifaces = os.networkInterfaces();
     const names = Object.keys(ifaces);
+
+    // Re-gather (e.g. after ICE restart, or a repeated gather() call): skip
+    // addresses we already hold a socket for. Re-binding would create a
+    // duplicate host candidate on a new ephemeral port and leak the old
+    // socket. Interfaces that appeared since the last gather (network
+    // change — the main reason to restart ICE) still get fresh sockets.
+    const alreadyBound = {};
+    const boundKeys = Object.keys(context.sockets);
+    for (let b = 0; b < boundKeys.length; b++) {
+      const s = context.sockets[boundKeys[b]];
+      try { alreadyBound[s.address().address] = true; } catch (_) {}
+    }
+
     const addrs = [];
     for (let i = 0; i < names.length; i++) {
       const list = ifaces[names[i]];
@@ -958,6 +1001,7 @@ function IceAgent(options) {
         const a = list[j];
         // Skip internal unless explicitly requested
         if (a.internal && !context.includeLoopback) continue;
+        if (alreadyBound[a.address]) continue;
         if (a.family === 'IPv6') {
           if (!context.ipv6) continue;
           // Skip IPv6 link-local (RFC 8445 §5.1.1.1)
@@ -1153,6 +1197,15 @@ function IceAgent(options) {
 
   function gatherRelayCandidate(server, done) {
     if (!context.primarySocket) { done(); return; }
+
+    // Re-gather (ICE restart): a live TURN client already exists for this
+    // server — its relay candidate was re-announced by startGathering, and
+    // allocating again would hold TWO allocations on the TURN server (and
+    // orphan the old one, which the previous pair may still be relaying
+    // media through). Reuse the existing allocation instead.
+    const existingKey = server.parsed.host + ':' + server.parsed.port;
+    if (context.turnClients[existingKey]) { done(); return; }
+
     const baseAddr = context.primarySocket.address();
 
     let finished = false;
@@ -1160,6 +1213,15 @@ function IceAgent(options) {
       if (finished) return;
       finished = true;
       if (timer) { clearTimeout(timer); context._gather_timers.delete(timer); }
+
+      // LEAK FIX: on failure (allocate error, auth failure, timeout, agent
+      // closed) the TURN client Socket — with its open transport and session
+      // timers — was never closed and never stored anywhere teardown() could
+      // reach. Every failed relay gather leaked a bound socket. Close it here;
+      // on success it's stored in context.turnClients and teardown owns it.
+      if ((err || context.closed) && _relaySocketRef) {
+        try { _relaySocketRef.close(); } catch (_) {}
+      }
       if (context.closed) return;   // don't emit after close
 
       if (!err && relayInfo && turnSocket) {
@@ -1189,8 +1251,12 @@ function IceAgent(options) {
       done();
     }
 
-    // Use the Socket client from ./socket.js to allocate (lazy import)
+    // Use the Socket client from ./socket.js to allocate (lazy import).
+    // _relaySocketRef mirrors turnSocket for finish()'s leak-fix close path
+    // (finish is defined above this declaration, so it can't close over the
+    // inner assignment directly in all engines' TDZ-safe way — keep one ref).
     let turnSocket;
+    let _relaySocketRef = null;
     import('./socket.js').then(function(mod) {
       if (context.closed) { finish(new Error('agent closed')); return; }
       try {
@@ -1244,6 +1310,7 @@ function IceAgent(options) {
           wsPath:             server.wsPath    || null,
           wsUrl:              server.wsUrl     || null,
         });
+        _relaySocketRef = turnSocket;
         attachTurnSocket(turnSocket);
       } catch (e) {
         finish(e);
@@ -2507,6 +2574,11 @@ function IceAgent(options) {
       context.remoteCandidatesEnded = false;
       context.nominationStarted = false;
       context._endOfCandidatesEmitted = false;
+
+      // Local candidates are PRESERVED (their sockets carry _previousPair's
+      // media). The next gather() re-announces them to the SDP layer —
+      // add_local_candidate's dedup would otherwise swallow them.
+      context._reEmitOnGather = true;
 
       // Reset gather counters so checkGatheringComplete() works after re-gather
       context._gathering_host  = false;

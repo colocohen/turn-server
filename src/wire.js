@@ -329,6 +329,7 @@ attrs[ATTR.ALTERNATE_SERVER]    = attrs[ATTR.MAPPED_ADDRESS];
 function make_str_codec(max_bytes) {
   return {
     encode: function(v) {
+      if (v == null) return new Uint8Array(0); // null-safe: encode as empty
       var bytes = typeof v === 'string' ? _te.encode(v) : v;
       if (max_bytes && bytes.length > max_bytes) bytes = bytes.slice(0, max_bytes);
       return bytes;
@@ -386,9 +387,17 @@ attrs[ATTR.REQUESTED_TRANSPORT] = {
   decode: function(d) { return d[0]; }
 };
 
+// RFC 5766 §14.6 — EVEN-PORT. The attribute's PRESENCE requests an even
+// relay port; the high (R) bit additionally asks to reserve port+1 for a
+// follow-up allocation via RESERVATION-TOKEN.
+//   encode: true (legacy: even + reserve) or { reserve: boolean }
+//   decode: { reserve: boolean }   (attribute present ⇒ even was requested)
 attrs[ATTR.EVEN_PORT] = {
-  encode: function(v) { return new Uint8Array([v ? 0x80 : 0x00]); },
-  decode: function(d) { return (d[0] & 0x80) !== 0; }
+  encode: function(v) {
+    var reserve = (v === true) || !!(v && v.reserve);
+    return new Uint8Array([reserve ? 0x80 : 0x00]);
+  },
+  decode: function(d) { return { reserve: (d[0] & 0x80) !== 0 }; }
 };
 
 attrs[ATTR.RESERVATION_TOKEN] = {
@@ -445,17 +454,18 @@ attrs[ATTR.ICE_CONTROLLING] = attrs[ATTR.ICE_CONTROLLED];
 // draft-ietf-tram-stun-origin — ORIGIN (string, like a URL origin)
 attrs[ATTR.ORIGIN] = make_str_codec(763);
 
-// RFC 8656 — ICMP attribute (type(2) + code(2) + data(4))
+// RFC 8656 §18.14 — ICMP attribute: Reserved(16) | ICMP Type(8) | ICMP Code(8) | Error Data(32)
 attrs[ATTR.ICMP] = {
   encode: function(v) {
     var o = new Uint8Array(8);
-    w_u16(o, 0, v.type || 0);
-    w_u16(o, 2, v.code || 0);
+    // bytes 0-1: reserved (zero)
+    w_u8(o, 2, v.type || 0);
+    w_u8(o, 3, v.code || 0);
     w_u32(o, 4, v.data || 0);
     return o;
   },
   decode: function(d) {
-    return { type: r_u16(d, 0)[0], code: r_u16(d, 2)[0], data: r_u32(d, 4)[0] };
+    return { type: d[2], code: d[3], data: r_u32(d, 4)[0] };
   }
 };
 
@@ -612,29 +622,26 @@ attrs[ATTR.RESPONSE_PORT] = {
 // RFC 8656 — ADDITIONAL-ADDRESS-FAMILY (same format as REQUESTED-ADDRESS-FAMILY)
 attrs[ATTR.ADDITIONAL_ADDRESS_FAMILY] = attrs[ATTR.REQUESTED_ADDRESS_FAMILY];
 
-// RFC 8656 — ADDRESS-ERROR-CODE (family + error code)
+// RFC 8656 §18.9 — ADDRESS-ERROR-CODE:
+//   Family(8) | Reserved(13) | Class(3) | Number(8), then Reason Phrase.
+// Fixed part is 4 bytes (same shape as ERROR-CODE with Family replacing
+// the first reserved byte); the reason phrase starts at byte 4.
 attrs[ATTR.ADDRESS_ERROR_CODE] = {
   encode: function(v) {
-    var out = new Uint8Array(8);
+    var rb = v.reason ? _te.encode(v.reason) : new Uint8Array(0);
+    if (rb.length > 763) rb = rb.slice(0, 763);
+    var out = new Uint8Array(4 + rb.length);
     w_u8(out, 0, v.family || 0);
-    // bytes 1-2: reserved
-    w_u8(out, 3, Math.floor(v.code / 100) & 0x07);
-    w_u8(out, 4, v.code % 100);
-    if (v.reason) {
-      var rb = _te.encode(v.reason);
-      var out2 = new Uint8Array(5 + rb.length);
-      out2.set(out.subarray(0, 5), 0);
-      out2.set(rb, 5);
-      return out2;
-    }
-    return out.subarray(0, 5);
+    // byte 1 + top 5 bits of byte 2: reserved (zero)
+    w_u8(out, 2, Math.floor(v.code / 100) & 0x07);
+    w_u8(out, 3, v.code % 100);
+    if (rb.length) w_bytes(out, 4, rb);
+    return out;
   },
   decode: function(d) {
     var family = d[0];
-    var cls = d[3] & 0x07;
-    var num = d[4];
-    var code = cls * 100 + num;
-    var reason = d.length > 5 ? _td.decode(d.slice(5)) : '';
+    var code = (d[2] & 0x07) * 100 + d[3];
+    var reason = d.length > 4 ? _td.decode(d.slice(4)) : '';
     return { family: family, code: code, reason: reason };
   }
 };
@@ -686,19 +693,15 @@ attrs[ATTR.PASSWORD_ALGORITHMS] = {
 
 /* ==================== Integrity / Fingerprint ============================== */
 
-// RFC 8265 OpaqueString / SASLprep — basic normalization
-// Full SASLprep requires ICU/Unicode tables. This covers the common cases:
-// NFKC normalization, trim, reject control characters.
+// RFC 8265 OpaqueString / SASLprep — basic normalization.
+// Full SASLprep requires ICU/Unicode tables. This implementation performs
+// NFKC normalization only. Control characters are NOT rejected here — the
+// normalized string is passed through unchanged, and credentials containing
+// them will simply fail integrity validation against a compliant peer.
 function saslprep(str) {
   if (typeof str !== 'string') return str;
   // NFKC normalization (Node.js supports this natively)
-  var normalized = str.normalize('NFKC');
-  // Reject ASCII control characters (0x00-0x1F, 0x7F) except space
-  for (var i = 0; i < normalized.length; i++) {
-    var c = normalized.charCodeAt(i);
-    if ((c < 0x20 && c !== 0) || c === 0x7F) return normalized; // pass through, let server reject
-  }
-  return normalized;
+  return str.normalize('NFKC');
 }
 
 function compute_long_term_key(username, realm, password) {
