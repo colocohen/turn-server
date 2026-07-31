@@ -290,6 +290,18 @@ function IceAgent(options) {
   //   - nominationStarted=true (flag)   +   nominationTimer=<handle> (bookkeeping)
   //   - selectedPair=<pair>    (flag)   +   consentTimer=<handle>    (bookkeeping)
 
+  function _iceDiag() {
+    if (typeof process === 'undefined' || !process.env || process.env.WEBRTC_DEBUG !== '1') return;
+    try { console.log.apply(console, ['[ice-diag]'].concat([].slice.call(arguments))); } catch (_e) {}
+  }
+
+  function _pairDesc(p) {
+    if (!p) return 'none';
+    return (p.local && p.local.ip) + ':' + (p.local && p.local.port) + '→' +
+           (p.remote && p.remote.ip) + ':' + (p.remote && p.remote.port) +
+           ' [' + (p.remote && p.remote.type) + ' prio=' + p.priority + ']';
+  }
+
   function set_context(opts) {
     if (!opts || typeof opts !== 'object') return;
     // Once closed, ignore further mutations except the terminal state transition.
@@ -493,6 +505,7 @@ function IceAgent(options) {
         const prev = context.selectedPair;
         context.selectedPair = opts.selectedPair;
         has_changed = true;
+        _iceDiag('selectedPair:', _pairDesc(prev), '→', _pairDesc(context.selectedPair));
         if (context.selectedPair) {
           // Track socket for direct sends (relay pairs use turnClient instead)
           const sock = getSocketForLocalCandidate(context.selectedPair.local);
@@ -605,15 +618,28 @@ function IceAgent(options) {
     }
 
 
-    /* 2.5 — Auto-select: pick the highest-priority nominated-and-valid pair */
-    if (!context.selectedPair && !context.closed) {
-      let best = null;
+    /* 2.5 — Auto-select: the highest-priority nominated-and-valid pair.
+     *
+     * NOT first-past-the-post: under aggressive nomination (RFC 5245-era
+     * behavior that pion/webrtc-rs still use — USE-CANDIDATE on every
+     * check) several pairs become nominated, and WHICH validates first is
+     * a network race. If we lock the first one while the peer selects by
+     * priority, the two sides can settle on different 5-tuples — observed
+     * live against webrtc-rs, whose srflx gathering socket is distinct
+     * from its advertised host socket: we locked the peer-reflexive pair
+     * (their srflx-base), their DTLS sat on their host socket, and the
+     * ClientHello went into a void. Both RFC 5245 §8.1.1.2 semantics and
+     * libwebrtc/pion practice: the controlled side keeps converging to
+     * the highest-priority nominated valid pair. The selectedPair setter
+     * handles replacement (emits with prev, retargets primarySocket). */
+    if (!context.closed) {
+      let best = context.selectedPair || null;
       for (let i = 0; i < context.validList.length; i++) {
         const p = context.validList[i];
         if (!p.valid || !p.nominated) continue;
         if (!best || p.priority > best.priority) best = p;
       }
-      if (best) {
+      if (best && best !== context.selectedPair) {
         params_to_set.selectedPair = best;
         // ICE restart complete — drop the previous pair; new selectedPair
         // (assigned by the recursive set_context call) takes over send().
@@ -633,14 +659,32 @@ function IceAgent(options) {
     }
 
 
-    /* 2.7 — Once selected, stop check scheduler + drain triggered queue */
+    /* 2.7 — Stop the check scheduler once selected AND settled: while a
+     * higher-priority pair could still validate (waiting / in-progress /
+     * frozen), checks must continue or cascade 2.5's convergence can
+     * never happen — the upgrade pair only becomes `valid` through OUR
+     * completed check. Terminates: such pairs either succeed (upgrade,
+     * then no higher pair remains) or fail (leave the set); the global
+     * 45s policy bounds the whole phase. */
     if (context.selectedPair) {
-      if (context.checkTimer) {
-        clearInterval(context.checkTimer);
-        context.checkTimer = null;
+      let upgradePossible = false;
+      for (let i = 0; i < context.checkList.length; i++) {
+        const p = context.checkList[i];
+        if (p === context.selectedPair) continue;
+        if (p.priority <= context.selectedPair.priority) continue;
+        if (p.state === 'waiting' || p.state === 'in-progress' || p.state === 'frozen') {
+          upgradePossible = true;
+          break;
+        }
       }
-      if (context.triggeredQueue && context.triggeredQueue.length > 0) {
-        context.triggeredQueue.length = 0;
+      if (!upgradePossible) {
+        if (context.checkTimer) {
+          clearInterval(context.checkTimer);
+          context.checkTimer = null;
+        }
+        if (context.triggeredQueue && context.triggeredQueue.length > 0) {
+          context.triggeredQueue.length = 0;
+        }
       }
     }
 
@@ -1511,8 +1555,16 @@ function IceAgent(options) {
     if (context.triggeredQueue && context.triggeredQueue.length > 0) {
       next = context.triggeredQueue.shift();
     } else {
+      const now = Date.now();
       for (let i = 0; i < context.checkList.length; i++) {
-        if (context.checkList[i].state === 'waiting') { next = context.checkList[i]; break; }
+        const p = context.checkList[i];
+        if (p.state !== 'waiting') continue;
+        // Recoverable-error cooldown: the pair is active — which also
+        // keeps the check timer alive below — but its next attempt is
+        // not yet due (retry pacing for RFC 8445 §7.2.5.2.4 errors).
+        if (p.retryAfter && p.retryAfter > now) continue;
+        next = p;
+        break;
       }
     }
 
@@ -1541,6 +1593,7 @@ function IceAgent(options) {
   /* ── Outgoing connectivity check ── */
 
   function sendBindingCheck(pair) {
+    _iceDiag('check →', _pairDesc(pair), 'state=' + pair.state);
     if (context.closed) return;
     if (!context.remoteUfrag || !context.remotePwd) return;
 
@@ -1645,11 +1698,44 @@ function IceAgent(options) {
     if (context.closed) return;
 
     if (err) {
-      // 487 role conflict → switch role, re-queue check
+      // STUN error responses — RFC 8445 §7.2.5.2.4: a pair is failed only
+      // on an *unrecoverable* [RFC5389] error. The recoverable set below
+      // mirrors Chrome's libwebrtc (p2p/base/connection.cc,
+      // OnConnectionRequestErrorResponse): 401 Unauthorized, 420 Unknown
+      // Attribute, and 500 Server Error are answered with a retry —
+      // "Recoverable error, retry" — because they are routinely transient.
+      // The canonical case: our connectivity checks legitimately race the
+      // peer's processing of our answer (trickle ICE), and until the peer
+      // learns our ufrag it rejects checks with 401 (RFC 5389 §10.1.2).
+      // Failing the pair on that race — as this code previously did for
+      // every non-487 code — killed otherwise-perfect connections within
+      // one RTT. pion/ice goes further and discards error responses
+      // entirely, retrying until its global timeout; we take libwebrtc's
+      // middle path. The retry is paced by returning the pair to
+      // 'waiting' after ~half the STUN RTO, and remains bounded by the
+      // agent's overall failure policy, so a peer that answers 401
+      // forever still converges to 'failed'.
+      //
+      // Anything else — including 400 — stays fatal, exactly as in
+      // libwebrtc ("killing connection"). Note: werift ≤0.15 rejects
+      // pre-answer checks with 400 where RFC 5389 §10.1.2 mandates 401;
+      // such peers fail against Chrome for the same reason.
       if (msg) {
         const ec = msg.getAttribute(wire.ATTR.ERROR_CODE);
         if (ec && ec.code === 487) {
+          // 487 role conflict → switch role, re-queue check
           handleRoleConflictFromResponse(pair);
+          return;
+        }
+        if (ec && (ec.code === 401 || ec.code === 420 || ec.code === 500)) {
+          // Return the pair to the scheduler immediately, with a cooldown
+          // stamp the tick loop honors. Doing this synchronously — rather
+          // than via a detached timer — keeps the pair in 'waiting' at all
+          // times, so runCheckTick's no-active-pairs branch can never tear
+          // down the check timer (and declare failure) in the window
+          // between the error response and the retry becoming due.
+          pair.state = 'waiting';
+          pair.retryAfter = Date.now() + 250;   // ~½ STUN RTO (RFC 5389 §7.2.1)
           return;
         }
       }
@@ -1731,6 +1817,7 @@ function IceAgent(options) {
     }
 
     validPair.valid = true;
+    _iceDiag('validated:', _pairDesc(validPair), 'nominated=' + !!(validPair.weNominated || validPair.peerNominated));
 
     // Nomination inheritance from the triggering pair:
     // RFC 8445 §7.2.5.3.4 — if the original check had USE-CANDIDATE (we
@@ -1990,6 +2077,8 @@ function IceAgent(options) {
     // USE-CANDIDATE from controlled peers (RFC doesn't mandate rejection),
     // but in practice only the controlling peer should set it.
     const hasUseCandidate = (msg.getAttribute(wire.ATTR.USE_CANDIDATE) !== null);
+    _iceDiag('request ←', rinfo.address + ':' + rinfo.port,
+      'useCand=' + hasUseCandidate, 'pair=' + _pairDesc(pair));
     if (hasUseCandidate) pair.peerNominated = true;
 
     // RFC 8445 §7.3.1.4: Triggered check — queue a check from our side for
@@ -2494,6 +2583,19 @@ function IceAgent(options) {
      *  available (before the first nomination, or after close).  */
     send: function(buf) {
       const pair = context.selectedPair || context._previousPair;
+      if (typeof process !== 'undefined' && process.env && process.env.WEBRTC_DEBUG === '1') {
+        if (!context._txDiagCount) context._txDiagCount = 0;
+        if (context._txDiagCount < 12) {
+          context._txDiagCount++;
+          try {
+            console.log('[ice-diag] app-send #' + context._txDiagCount +
+              ' len=' + buf.length + ' firstByte=' + buf[0] +
+              (pair ? (' → ' + pair.remote.ip + ':' + pair.remote.port +
+                       ' via ' + pair.local.ip + ':' + pair.local.port)
+                    : ' DROPPED (no pair)'));
+          } catch (_e) {}
+        }
+      }
       if (!pair) return false;
       return sendViaPair(pair, buf);
     },
