@@ -47,7 +47,11 @@ import {
   addressFamilyOf,
   candidateKey,
   pairKey,
+  isMdnsHost,
+  isResolvableMdnsCandidate,
 } from './ice_candidate.js';
+import * as iceMdns from './ice_mdns.js';
+import * as icePortmap from './ice_portmap.js';
 
 
 /* ========================= Constants ========================= */
@@ -182,6 +186,67 @@ function IceAgent(options) {
   const resolvedControlling = options.controlling !== undefined ? !!options.controlling :
                               (resolvedMode === 'lite' ? false : true);
 
+  // ── mDNS candidates (draft-ietf-mmusic-mdns-ice-candidates) ──
+  //
+  //   options.mdns:
+  //     false / undefined  — no mDNS. Inbound ".local" candidates are
+  //                          DROPPED (never handed to dgram.send(), whose
+  //                          per-call getaddrinfo made behavior differ by
+  //                          OS and flooded the libuv threadpool).
+  //     true               — resolve inbound ".local" candidates.
+  //     { resolve, register, instance, module, mdnsOptions,
+  //       timeout, unicast }
+  //         resolve   default true when mdns is enabled
+  //         register  default false — conceal OUR host candidates behind
+  //                   UUID ".local" names (privacy clients: Electron/P2P).
+  //                   Never useful on servers; lite mode ignores it.
+  //         instance / module / mdnsOptions / timeout / unicast — passed
+  //                   to ice_mdns.acquire() (see src/ice_mdns.js).
+  //
+  // Shaped as a per-source config (not one boolean) so future gathering
+  // sources (e.g. a port-mapper/UPnP source) can sit beside it without
+  // reshaping the public API.
+  // ── Port-mapping assisted gathering (UPnP-IGD / NAT-PMP / PCP) ──
+  //
+  //   options.portMapping:
+  //     false / undefined — off. (webrtc-server turns this on for full-mode
+  //                         clients; at the agent layer — mechanism, not
+  //                         policy — nothing talks to the router unasked.)
+  //     true              — map each host base on the gateway and advertise
+  //                         the external address as an srflx candidate.
+  //     { instance, instance6, module, description, lifetime, timeout,
+  //       mapperOptions } — passed to ice_portmap.acquire().
+  //
+  // Ignored entirely in lite mode and under iceTransportPolicy 'relay'
+  // (same reasoning as srflx: lite gathers host-only; relay forbids both).
+  const _pmOpt = options.portMapping;
+  const resolvedPortMapping = {
+    enabled: !!_pmOpt && resolvedMode !== 'lite',
+    options: (typeof _pmOpt === 'object' && _pmOpt) ? {
+               instance:      _pmOpt.instance,
+               instance6:     _pmOpt.instance6,
+               module:        _pmOpt.module,
+               description:   _pmOpt.description,
+               lifetime:      _pmOpt.lifetime,
+               timeout:       _pmOpt.timeout,
+               mapperOptions: _pmOpt.mapperOptions,
+             } : {},
+  };
+
+  const _mdnsOpt = options.mdns;
+  const resolvedMdns = {
+    resolve:  !!_mdnsOpt && (typeof _mdnsOpt !== 'object' || _mdnsOpt.resolve !== false),
+    register: !!(_mdnsOpt && typeof _mdnsOpt === 'object' && _mdnsOpt.register === true
+                 && resolvedMode !== 'lite'),
+    options:  (typeof _mdnsOpt === 'object' && _mdnsOpt) ? {
+                instance:    _mdnsOpt.instance,
+                module:      _mdnsOpt.module,
+                mdnsOptions: _mdnsOpt.mdnsOptions,
+                timeout:     _mdnsOpt.timeout,
+                unicast:     _mdnsOpt.unicast,
+              } : {},
+  };
+
   const ev = new EventEmitter();
   const self = this;
 
@@ -201,6 +266,29 @@ function IceAgent(options) {
     portRange:            options.portRange || [0, 0],           // [min, max]; 0 = any
     components:           options.components || 1,
     tieBreaker:           crypto.randomBytes(8),
+
+    // ── mDNS (draft-ietf-mmusic-mdns-ice-candidates) runtime state ──
+    mdns: {
+      resolve:         resolvedMdns.resolve,
+      register:        resolvedMdns.register,
+      options:         resolvedMdns.options,
+      handle:          null,   // acquired ice_mdns handle (refcounted, shared)
+      acquiring:       null,   // [cb, ...] while acquire() is in flight
+      pendingResolves: 0,      // in-flight inbound resolutions — gates 'failed'
+      registeredIps:   [],     // OUR ips registered outbound (teardown cleanup)
+    },
+    _gathering_mdns_reg: 0,    // outbound registrations in flight — gates
+                               // gatheringState 'complete'
+
+    // ── Port-mapping runtime state ──
+    portmap: {
+      enabled:     resolvedPortMapping.enabled,
+      options:     resolvedPortMapping.options,
+      handle:      null,   // acquired ice_portmap handle
+      mappedPorts: [],     // [{ port, family }] — teardown cleanup
+      errorOnce:   false,  // dead-gateway/CGNAT reported once, not per base
+    },
+    _gathering_portmap: 0,     // mappings in flight — gates 'complete'
 
     // ── State (scalar, equality + emit inline) ──
     state:                'new',
@@ -430,7 +518,7 @@ function IceAgent(options) {
         // Non-trickle (legacy) mode: batch all candidates until gathering
         // completes, then emit them all at once via cascade 2.1.
         if (context.trickle) {
-          ev.emit('candidate', cand);
+          ev.emit('candidate', maskCandidateForSignaling(cand));
         }
         formPairsForNewLocal(cand);   // may push new pairs to checkList
       }
@@ -444,6 +532,16 @@ function IceAgent(options) {
           context.remoteCandidatesEnded = true;
           has_changed = true;
         }
+      } else if (cand && isMdnsHost(cand.ip)) {
+        // ".local" concealment name — NEVER treat as a literal address.
+        // Resolution (or drop) happens here, before pair formation, so
+        // candidateKey / findRemoteCandidate always operate on the final
+        // IP and pair keys never contain hostnames. Re-entry with the
+        // resolved candidate lands in the plain branch below; the replay
+        // buffer re-sending the same ".local" candidate is harmless — the
+        // second resolution is a cache hit and the resolved (ip, port)
+        // dedups normally.
+        handleMdnsRemoteCandidate(cand);
       } else if (cand && !findRemoteCandidate(cand.ip, cand.port)) {
         context.remoteCandidates.push(cand);
         has_changed = true;
@@ -555,7 +653,7 @@ function IceAgent(options) {
         const batch = context.localCandidates.slice().sort(function(a, b) {
           return b.priority - a.priority;
         });
-        for (let i = 0; i < batch.length; i++) ev.emit('candidate', batch[i]);
+        for (let i = 0; i < batch.length; i++) ev.emit('candidate', maskCandidateForSignaling(batch[i]));
       }
       ev.emit('candidate', null);
     }
@@ -748,6 +846,143 @@ function IceAgent(options) {
     }
   }
 
+
+  /* ========================= mDNS candidates ========================= */
+  // draft-ietf-mmusic-mdns-ice-candidates. All policy lives here and in
+  // ice_mdns.js — the rest of the agent only ever sees resolved IPs.
+
+  /** Lazily acquire the process-wide mDNS handle; dedup concurrent callers. */
+  function withMdns(cb) {
+    const m = context.mdns;
+    if (m.handle) return cb(null, m.handle);
+    if (m.acquiring) { m.acquiring.push(cb); return; }
+    m.acquiring = [cb];
+    iceMdns.acquire(m.options, function(err, handle) {
+      const waiters = m.acquiring;
+      m.acquiring = null;
+      if (!err && !context.closed) m.handle = handle;
+      else if (!err && context.closed) { try { handle.release(); } catch (_) {} }
+      for (let i = 0; i < waiters.length; i++) waiters[i](err, m.handle);
+    });
+  }
+
+  /**
+   * Inbound ".local" candidate. Draft rules, in order:
+   *   - iceTransportPolicy 'relay' → ignore (draft §3.2 step 2).
+   *   - lite mode → ignore. A lite agent never initiates checks; it learns
+   *     the peer's working address from the SOURCE of inbound checks
+   *     (prflx), so resolving concealment names buys nothing by protocol —
+   *     and lite deployments (cloud) can't reach the LAN's multicast anyway.
+   *   - resolution disabled → drop + candidateerror (visible, not silent:
+   *     the operator should know connectivity lost a path and why).
+   *   - not a strict UUID label → drop + candidateerror (hostile peers
+   *     must not aim our checks at "printer.local").
+   *   - resolve via ice_mdns (single-IP rule enforced there); on success
+   *     re-enter set_context with the real IP + mdnsName kept for logs.
+   */
+  function handleMdnsRemoteCandidate(cand) {
+    if (context.iceTransportPolicy === 'relay') return;
+    if (context.mode === 'lite') return;
+
+    if (!context.mdns.resolve) {
+      ev.emit('candidateerror', {
+        type: 'mdns', server: null, address: cand.ip,
+        error: new Error(
+          'Dropped ".local" remote candidate — mDNS resolution is not ' +
+          'enabled on this agent (pass mdns: true, or inject an instance ' +
+          'via mdns.instance).'),
+      });
+      return;
+    }
+
+    if (!isResolvableMdnsCandidate(cand.ip)) {
+      ev.emit('candidateerror', {
+        type: 'mdns', server: null, address: cand.ip,
+        error: new Error(
+          'Dropped ".local" remote candidate — not a single UUID label ' +
+          '(draft-ietf-mmusic-mdns-ice-candidates §3.1/§3.2): ' + cand.ip),
+      });
+      return;
+    }
+
+    context.mdns.pendingResolves++;
+    withMdns(function(err, handle) {
+      if (err || context.closed) return finishMdnsResolve(cand, err);
+      handle.resolve(cand.ip, function(err2, ip) {
+        if (context.closed) return finishMdnsResolve(cand, err2 || null, null);
+        finishMdnsResolve(cand, err2, ip);
+      });
+    });
+  }
+
+  function finishMdnsResolve(cand, err, ip) {
+    context.mdns.pendingResolves--;
+
+    if (context.closed) return;
+
+    if (err || !ip) {
+      if (err) {
+        ev.emit('candidateerror', {
+          type: 'mdns', server: null, address: cand.ip, error: err,
+        });
+      }
+      // This resolution may have been the last thing keeping 'checking'
+      // alive — re-evaluate terminal failure now that it's off the books.
+      maybeFailAfterMdns();
+      return;
+    }
+
+    const resolved = Object.assign({}, cand, {
+      ip:       ip,
+      mdnsName: cand.ip,   // original concealment name, for logs/stats
+    });
+    set_context({ add_remote_candidate: resolved });
+  }
+
+  /**
+   * Mirror of runCheckTick's terminal condition, for the moment the last
+   * pending mDNS resolution fails: if the check scheduler already stopped
+   * (or never started) and nothing valid exists, the ICE session is dead.
+   * While pendingResolves > 0 this never fires — a resolution in flight
+   * can still create pairs.
+   */
+  function maybeFailAfterMdns() {
+    if (context.mdns.pendingResolves > 0) return;
+    if (context.state !== 'checking') return;
+    if (context.checkTimer) return;      // scheduler alive — it will decide
+    if (context.selectedPair) return;
+    const anyActive = context.checkList.some((p) =>
+      p.state === 'waiting' || p.state === 'in-progress' || p.state === 'frozen');
+    if (anyActive) return;
+    const anyValid = context.checkList.some((p) => p.valid);
+    if (!anyValid) set_context({ state: 'failed' });
+  }
+
+  /**
+   * Signaling-boundary mask (outbound registration mode only).
+   * Internal state always keeps real IPs — checks, prflx comparisons and
+   * pair keys are untouched. Only the copy handed to the outside world is
+   * concealed:
+   *   - host candidates registered with mDNS: ip → UUID ".local" name
+   *   - srflx/relay: raddr/rport scrubbed (0.0.0.0/:: + 9) — otherwise the
+   *     related-address field would leak exactly the host IP the ".local"
+   *     name exists to conceal. Matches Chrome's behavior and JSEP §5.2.1.
+   */
+  function maskCandidateForSignaling(c) {
+    if (!c || !context.mdns.register) return c;
+    if (c.mdnsName) {
+      return Object.assign({}, c, { ip: c.mdnsName });
+    }
+    if ((c.type === 'srflx' || c.type === 'relay') && c.relatedAddress) {
+      const v6 = c.relatedAddress.indexOf(':') >= 0;
+      return Object.assign({}, c, {
+        relatedAddress: v6 ? '::' : '0.0.0.0',
+        relatedPort:    9,
+      });
+    }
+    return c;
+  }
+
   function tryMakePair(local, remote) {
     if (local.component !== remote.component) return null;
     if (local.protocol !== remote.protocol) return null;
@@ -841,7 +1076,7 @@ function IceAgent(options) {
         const existing = context.localCandidates.slice().sort(function(a, b) {
           return b.priority - a.priority;
         });
-        for (let i = 0; i < existing.length; i++) ev.emit('candidate', existing[i]);
+        for (let i = 0; i < existing.length; i++) ev.emit('candidate', maskCandidateForSignaling(existing[i]));
       }
     }
 
@@ -909,6 +1144,20 @@ function IceAgent(options) {
             });
           }
         }
+
+        // Port-mapping gathering — one per host base, in parallel with
+        // srflx/relay. Runs on the same collected bases; the gateway
+        // discovery inside ice_portmap is shared process-wide, so only the
+        // first agent in the process pays it.
+        if (context.portmap.enabled) {
+          for (let k = 0; k < bases.length; k++) {
+            context._gathering_portmap++;
+            gatherPortmapCandidate(bases[k], function() {
+              context._gathering_portmap--;
+              checkGatheringComplete();
+            });
+          }
+        }
       }
 
       if (!liteMode) {
@@ -955,9 +1204,104 @@ function IceAgent(options) {
     if (context.closed) return;
     if (context.gatheringState !== 'gathering') return;
     if (context._gathering_host) return;
+    if (context._gathering_mdns_reg > 0) return;
     if (context._gathering_srflx > 0) return;
     if (context._gathering_relay > 0) return;
+    if (context._gathering_portmap > 0) return;
     set_context({ gatheringState: 'complete' });
+  }
+
+
+  /* ── Port-mapping candidate gathering ── */
+  //
+  // For one host base: ask the gateway (via the shared ice_portmap handle)
+  // to forward the base's own port, and advertise external ip:port as an
+  // srflx candidate — same class as a STUN-derived mapping, because that is
+  // exactly what it is: our address as seen/allocated on the NAT, with the
+  // host base underneath. Distinct foundation ('portmap' in the server slot
+  // of the RFC 8445 §5.1.1.3 tuple) keeps frozen-candidate logic from
+  // treating it as the same path as a STUN srflx from the same base.
+  //
+  // done() is ALWAYS called exactly once — success, failure, or budget —
+  // so gathering completion never wedges on a silent gateway (ice_portmap
+  // enforces the budget internally with handle.cancel()).
+
+  function gatherPortmapCandidate(baseSock, done) {
+    let finished = false;
+    function finish() { if (!finished) { finished = true; done(); } }
+
+    let baseAddr;
+    try { baseAddr = baseSock.address(); } catch (_) { return finish(); }
+    const family = (baseAddr.family === 'IPv6' || baseAddr.address.indexOf(':') >= 0)
+      ? 'IPv6' : 'IPv4';
+
+    withPortmap(function(err, handle) {
+      if (err || context.closed) {
+        if (err) reportPortmapErrorOnce(err, baseAddr.address);
+        return finish();
+      }
+      handle.mapPort(baseAddr.port, family, function(err2, mapping) {
+        if (context.closed) return finish();
+        if (err2) {
+          // CGNAT / no-gateway kill the source: one clear candidateerror
+          // for the first base, silence for the rest. Per-base budget
+          // errors are reported per base — they can differ.
+          if (err2.code === 'EPORTMAPCGNAT' || err2.code === 'EPORTMAPRELEASED') {
+            reportPortmapErrorOnce(err2, baseAddr.address);
+          } else {
+            ev.emit('candidateerror', {
+              type: 'portmap', server: null, base: baseAddr.address, error: err2,
+            });
+          }
+          return finish();
+        }
+
+        context.portmap.mappedPorts.push({ port: baseAddr.port, family: family });
+
+        const cand = {
+          foundation:     computeFoundation('srflx', baseAddr.address, 'udp', 'portmap'),
+          component:      COMPONENT_RTP,
+          protocol:       'udp',
+          priority:       computeCandidatePriority('srflx', LOCAL_PREFERENCE_DEFAULT, COMPONENT_RTP),
+          ip:             mapping.externalIp,
+          port:           mapping.externalPort,
+          type:           'srflx',
+          relatedAddress: baseAddr.address,
+          relatedPort:    baseAddr.port,
+          tcpType:        null,
+          base:           { ip: baseAddr.address, port: baseAddr.port, family: family },
+          via:            mapping.via,       // 'pcp' | 'natpmp' | 'upnp'
+          // Transport hooks — traffic to the mapped port arrives on the
+          // base socket itself; no separate transport.
+          socket:         baseSock,
+          turnClient:     null,
+        };
+        set_context({ add_local_candidate: cand });
+        finish();
+      });
+    });
+  }
+
+  function withPortmap(cb) {
+    const p = context.portmap;
+    if (p.handle) return cb(null, p.handle);
+    if (p.acquiring) { p.acquiring.push(cb); return; }
+    p.acquiring = [cb];
+    icePortmap.acquire(p.options, function(err, handle) {
+      const waiters = p.acquiring;
+      p.acquiring = null;
+      if (!err && !context.closed) p.handle = handle;
+      else if (!err && context.closed) { try { handle.release(); } catch (_) {} }
+      for (let i = 0; i < waiters.length; i++) waiters[i](err, p.handle);
+    });
+  }
+
+  function reportPortmapErrorOnce(err, baseIp) {
+    if (context.portmap.errorOnce) return;
+    context.portmap.errorOnce = true;
+    ev.emit('candidateerror', {
+      type: 'portmap', server: null, base: baseIp || null, error: err,
+    });
   }
 
 
@@ -1093,7 +1437,57 @@ function IceAgent(options) {
       turnClient:     null,
     };
 
-    set_context({ add_local_candidate: cand });
+    // Outbound concealment (mdns.register): register a UUID ".local" name
+    // for this address BEFORE the candidate is added, so the very first
+    // emission already carries the name (cand.mdnsName → masked at the
+    // signaling boundary; internal ip stays real for checks). skipProbe
+    // registration completes in ~0ms, but it is still async — the
+    // _gathering_mdns_reg counter keeps gatheringState from reaching
+    // 'complete' (and the null terminator from firing) underneath us.
+    // Loopback / link-local are never registered: nothing to conceal.
+    const concealable = context.mdns.register &&
+      boundAddr.address !== '127.0.0.1' && boundAddr.address !== '::1' &&
+      !boundAddr.address.startsWith('169.254.') &&
+      !/^fe80:/i.test(boundAddr.address);
+
+    if (!concealable) {
+      set_context({ add_local_candidate: cand });
+      return;
+    }
+
+    context._gathering_mdns_reg++;
+    withMdns(function(err, handle) {
+      function add(name) {
+        if (name) {
+          cand.mdnsName = name;
+          context.mdns.registeredIps.push(cand.ip);
+        }
+        set_context({ add_local_candidate: cand });
+        context._gathering_mdns_reg--;
+        checkGatheringComplete();
+      }
+      if (err || context.closed) {
+        // Registration is best-effort privacy: on failure, surface the
+        // error and fall back to the plain candidate rather than losing
+        // connectivity. (err → the operator asked for concealment and
+        // should know it did not happen.)
+        if (err) {
+          ev.emit('candidateerror', {
+            type: 'mdns', server: null, address: cand.ip, error: err,
+          });
+        }
+        return add(null);
+      }
+      handle.register(cand.ip, function(err2, name) {
+        if (err2) {
+          ev.emit('candidateerror', {
+            type: 'mdns', server: null, address: cand.ip, error: err2,
+          });
+          return add(null);
+        }
+        add(name);
+      });
+    });
   }
 
   function bindUdpSocket(ip, family, cb) {
@@ -1568,8 +1962,11 @@ function IceAgent(options) {
         // All pairs terminated — if none succeeded, we fail.
         // Nomination → 'connected' is Part 2b, so for now we stay in 'checking'
         // when pairs succeed.
+        // Exception: an in-flight mDNS resolution can still create new
+        // pairs — hold off; finishMdnsResolve → maybeFailAfterMdns picks
+        // this up when the last one lands.
         const anyValid = context.checkList.some((p) => p.valid);
-        if (!anyValid) {
+        if (!anyValid && context.mdns.pendingResolves === 0) {
           set_context({ state: 'failed' });
         }
       }
@@ -2369,6 +2766,33 @@ function IceAgent(options) {
     if (context.consentTimer)    { clearInterval(context.consentTimer); context.consentTimer = null; }
     if (context.nominationTimer) { clearTimeout(context.nominationTimer); context.nominationTimer = null; }
 
+    // mDNS: send goodbye for every name we registered, then drop our hold
+    // on the shared instance (destroyed for real only when the last agent
+    // in the process releases). In-flight resolutions self-cancel on the
+    // closed flag.
+    if (context.mdns.handle) {
+      for (let i = 0; i < context.mdns.registeredIps.length; i++) {
+        try { context.mdns.handle.unregister(context.mdns.registeredIps[i]); } catch (_) {}
+      }
+      context.mdns.registeredIps = [];
+      try { context.mdns.handle.release(); } catch (_) {}
+      context.mdns.handle = null;
+    }
+
+    // Port mappings: remove this agent's forwarding rules (the candidates
+    // they served die with the agent), then drop the shared-mapper hold.
+    // A crash skips this — which is why mappings carry a finite auto-renewed
+    // lease and reclaim themselves.
+    if (context.portmap.handle) {
+      for (let i = 0; i < context.portmap.mappedPorts.length; i++) {
+        const m = context.portmap.mappedPorts[i];
+        try { context.portmap.handle.unmapPort(m.port, m.family); } catch (_) {}
+      }
+      context.portmap.mappedPorts = [];
+      try { context.portmap.handle.release(); } catch (_) {}
+      context.portmap.handle = null;
+    }
+
     // Cancel outer gather timeouts (srflx / relay)
     if (context._gather_timers) {
       context._gather_timers.forEach(function(t) { clearTimeout(t); });
@@ -2526,7 +2950,7 @@ function IceAgent(options) {
     },
 
     /** Convenience: just the local candidates. */
-    get localCandidates()  { return context.localCandidates.slice(); },
+    get localCandidates()  { return context.localCandidates.map(maskCandidateForSignaling); },
     get remoteCandidates() { return context.remoteCandidates.slice(); },
     get selectedPair()     { return context.selectedPair; },
     get state()            { return context.state; },

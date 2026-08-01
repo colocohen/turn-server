@@ -407,11 +407,44 @@ function stripZoneId(ip) {
 }
 
 /**
- * Does this hostname look like an mDNS ICE candidate (RFC 8828)?
- * Chrome emits these to protect host IPs from being leaked via ICE.
+ * mDNS ICE candidate helpers.
+ *
+ * The concealment mechanism is draft-ietf-mmusic-mdns-ice-candidates —
+ * shipped by Chrome 75+, Safari, and Firefox, but never published as an
+ * RFC. (RFC 8839 merely makes an FQDN legal as a connection-address;
+ * RFC 8828 is the IP-handling requirements doc that motivates the
+ * concealment. Neither defines the .local scheme itself.)
+ *
+ * Two predicates with distinct jobs:
+ *
+ *   isMdnsHost                — LOOSE detection. "This is .local space,
+ *                               not a literal IP" — never hand it to
+ *                               dgram.send() / dns.lookup(), never treat
+ *                               it as a numeric address.
+ *
+ *   isResolvableMdnsCandidate — STRICT eligibility. "This is a name we
+ *                               are willing to resolve via mDNS." Per the
+ *                               draft: exactly one label + ".local" (a
+ *                               value with more than one "." is processed
+ *                               as a plain FQDN — §3.2 step 1), and the
+ *                               label is a version-4 UUID (§3.1 gathering
+ *                               format). The draft is explicit about why
+ *                               agents SHOULD NOT resolve anything else:
+ *                               a hostile peer could otherwise aim our
+ *                               ICE connectivity checks at LAN devices
+ *                               with well-known names (printer.local).
  */
 function isMdnsHost(ip) {
   return typeof ip === 'string' && /\.local$/i.test(ip);
+}
+
+// UUID v4 label + ".local", nothing else. Chrome/Safari/Firefox all emit
+// exactly this shape (e.g. "01234567-89ab-4cde-8f01-23456789abcd.local").
+const MDNS_CANDIDATE_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.local$/i;
+
+function isResolvableMdnsCandidate(ip) {
+  return typeof ip === 'string' && MDNS_CANDIDATE_RE.test(ip);
 }
 
 
@@ -452,6 +485,7 @@ export {
   addressFamilyOf,
   stripZoneId,
   isMdnsHost,
+  isResolvableMdnsCandidate,
 
   // Keys
   candidateKey,
