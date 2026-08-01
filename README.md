@@ -309,7 +309,8 @@ transparent to the protocol layer.
 - **iceTransportPolicy** - `'all'` or `'relay'` (TURN-only, for privacy/firewall scenarios)
 - **MESSAGE-INTEGRITY validation** on 401/438/487 error responses (prevents role-flip spoofing)
 - **Link-local filtering** - skips 169.254.x.x (RFC 3927) and IPv6 fe80:: / 100::
-- **mDNS support** - `.local` candidate addresses (RFC 8839)
+- **mDNS candidates** (draft-ietf-mmusic-mdns-ice-candidates) - resolves the concealed `.local` candidates every modern browser sends, and can conceal your own host candidates behind UUID names (`register` mode, for privacy-sensitive clients). Strict draft compliance: UUID-only resolution (hostile `printer.local` candidates are rejected), single-IP rule, relay-policy exclusion
+- **Port-mapping assisted gathering** (UPnP-IGD / NAT-PMP / PCP via [`port-mapper`](https://npmjs.com/package/port-mapper)) - asks the gateway to forward a port and advertises the external address as an srflx candidate. A real forwarding rule works from **any** peer - including behind symmetric NAT, where STUN srflx is per-destination and near-useless. Often yields a direct connection with **no STUN and no TURN server at all**
 
 
 ## 🧰 ICE Agent
@@ -383,6 +384,73 @@ agent.send(Buffer.from('hello'));
 | `candidateerror` | `(error)` | Gathering a srflx/relay candidate failed (e.g., STUN timeout, TURN auth) |
 | `rolechange` | `('controlling' \| 'controlled')` | Role flipped (RFC 8445 §7.3.1.1) |
 | `restart` | `({ ufrag, pwd })` | `agent.restart()` was called |
+
+### Candidate sources beyond STUN/TURN
+
+Most ICE stacks know exactly two ways to discover an address: ask a STUN
+server, or allocate a TURN relay. This agent has **four**:
+
+| Source | Produces | Works when | Needs a server? |
+|---|---|---|---|
+| Host interfaces | `host` | always | no |
+| STUN binding | `srflx` | NAT is well-behaved (fails behind symmetric NAT) | yes |
+| TURN allocation | `relay` | always | yes (and relays all traffic) |
+| **Gateway port mapping** (UPnP/NAT-PMP/PCP) | `srflx` | gateway cooperates (~most home/SOHO routers) | **no** |
+
+Plus **mDNS**, which is not a new source but makes the sources you have
+actually usable: browsers conceal their host candidates behind `.local`
+names, and an agent that cannot resolve them silently loses every LAN
+direct path. This agent resolves them (and can conceal its own).
+
+Why this matters in practice:
+
+- **P2P without infrastructure.** A port-mapped candidate is a real
+  forwarding rule on the router - reachable by any peer, resilient to
+  symmetric NAT, no third-party server in the media path and none in the
+  discovery path either. For Electron/desktop P2P apps this is the same
+  trick qBittorrent and Syncthing ship by default, applied to WebRTC.
+- **LAN connections that browsers can complete.** Chrome/Safari/Firefox
+  send only `.local` host candidates. Resolving them is the difference
+  between a 0.5ms direct LAN path and bouncing everything off a relay.
+- **Defense in depth.** All four sources gather **in parallel**; ICE picks
+  the best pair that actually verifies. Add STUN/TURN servers and they
+  compose - the mapping is simply one more (usually better) srflx.
+
+```js
+const agent = new IceAgent({
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  mdns: true,               // resolve browsers' .local candidates
+  portMapping: true,        // + gateway-assisted srflx (opt-in here;
+                            //   webrtc-server enables it for clients)
+});
+
+// Privacy-sensitive client (Electron): also conceal our own addresses
+const agent2 = new IceAgent({
+  mdns: { register: true },        // host candidates go out as UUID .local
+  portMapping: { description: 'MyApp' },   // shown in the router's UI
+});
+```
+
+Both features are lazy `optionalDependencies` ([`mdns-local`](https://npmjs.com/package/mdns-local),
+[`port-mapper`](https://npmjs.com/package/port-mapper)) - nothing loads,
+no socket binds, and no router is spoken to unless the option is enabled.
+Both accept `{ instance }` injection if your app already runs one, and both
+share one process-wide instance across any number of agents (refcounted -
+an SFU with 200 agents does not open 200 multicast sockets).
+
+Behavior by configuration:
+
+| | `mode: 'full'` | `mode: 'lite'` | `iceTransportPolicy: 'relay'` |
+|---|---|---|---|
+| resolve inbound `.local` | ✅ when enabled | ignored (lite learns peers from inbound checks) | ignored (draft rule) |
+| `register` concealment | ✅ opt-in | forced off | n/a |
+| port-mapping gathering | ✅ when enabled | forced off | forced off (srflx-class) |
+
+Failures never block: CGNAT / double-NAT is detected at negotiation
+(one informative `candidateerror`, zero wasted mappings), a silent gateway
+is abandoned on a ~3s budget (NAT-PMP's retransmission tail alone can run
+minutes), and an unresolvable `.local` name just means that one path is
+skipped.
 
 ### Multiple ICE servers
 
@@ -636,6 +704,8 @@ resolve('turn:example.com', (err, parsed) => {
 | **ICE agent (RFC 8445)** | ✅ full + lite | ❌ | ❌ | ✅ |
 | **Consent freshness (RFC 7675)** | ✅ | ❌ | ❌ | ✅ |
 | **ICE restart (RFC 8445 §9)** | ✅ seamless | ❌ | ❌ | ✅ |
+| **mDNS candidates (browser `.local`)** | ✅ resolve + conceal | ❌ | ❌ | ❌ |
+| **Port-mapping gathering (UPnP/PMP/PCP)** | ✅ | ❌ | ❌ | ❌ |
 | **RFC 5769 test vectors** | ✅ 22/22 | ❌ | ✅ | ✅ |
 | **Attributes** | 62 | ~8 | ~15 | 62+ |
 | | | | | |
@@ -795,6 +865,8 @@ turn-server/
 - **EVEN-PORT / RESERVATION-TOKEN full flow (RFC 5766 §14.6/§14.9) - token in the Allocate response, cross-connection claim, 30s TTL**
 - **ICMP error forwarding (RFC 8656 §11.5) - Data indication with ICMP attribute + client `icmp` event**
 - **ICE restart re-announces candidates; re-gather binds only new interfaces and reuses TURN allocations**
+- **mDNS candidates (draft-ietf-mmusic-mdns-ice-candidates) - inbound `.local` resolution with strict UUID validation + opt-in outbound concealment (`register`), via lazy optional `mdns-local`**
+- **Port-mapping assisted gathering (UPnP-IGD / NAT-PMP / PCP) - gateway-forwarded srflx candidates with CGNAT detection and budgeted cancellation, via lazy optional `port-mapper`**
 - 450+ tests passing (297 core + 153 ICE)
 
 _Community contributions are welcome! Please ⭐ star the repo to follow progress._
