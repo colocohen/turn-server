@@ -128,14 +128,17 @@ function parseIceServerUri(urls) {
   let parsed = wire.parseUri(uri);
   if (parsed) return parsed;
 
-  // Fallback: simple 'host:port' or 'scheme:host:port'
-  let m = uri.match(/^(stun|stuns|turn|turns):(?:\/\/)?([^:?\/]+)(?::(\d+))?/);
+  // Fallback: simple 'host:port' or 'scheme:host:port'.
+  // Scheme matching is case-insensitive (RFC 3986 §3.1) — mirrored from
+  // wire.parseUri's contract so both paths agree.
+  let m = uri.match(/^(stun|stuns|turn|turns):(?:\/\/)?([^:?\/]+)(?::(\d+))?/i);
   if (!m) return null;
+  const _scheme = m[1].toLowerCase();
   return {
-    scheme: m[1],
-    isTurn: m[1] === 'turn' || m[1] === 'turns',
-    secure: m[1].endsWith('s'),
-    host: m[2],
+    scheme: _scheme,
+    isTurn: _scheme === 'turn' || _scheme === 'turns',
+    secure: _scheme.endsWith('s'),
+    host: m[2].toLowerCase(),
     port: m[3] ? parseInt(m[3], 10) : 3478,
     transport: 'udp',
   };
@@ -289,18 +292,6 @@ function IceAgent(options) {
   // mutated imperatively alongside the state flag that DOES cascade. E.g.:
   //   - nominationStarted=true (flag)   +   nominationTimer=<handle> (bookkeeping)
   //   - selectedPair=<pair>    (flag)   +   consentTimer=<handle>    (bookkeeping)
-
-  function _iceDiag() {
-    if (typeof process === 'undefined' || !process.env || process.env.WEBRTC_DEBUG !== '1') return;
-    try { console.log.apply(console, ['[ice-diag]'].concat([].slice.call(arguments))); } catch (_e) {}
-  }
-
-  function _pairDesc(p) {
-    if (!p) return 'none';
-    return (p.local && p.local.ip) + ':' + (p.local && p.local.port) + '→' +
-           (p.remote && p.remote.ip) + ':' + (p.remote && p.remote.port) +
-           ' [' + (p.remote && p.remote.type) + ' prio=' + p.priority + ']';
-  }
 
   function set_context(opts) {
     if (!opts || typeof opts !== 'object') return;
@@ -505,7 +496,6 @@ function IceAgent(options) {
         const prev = context.selectedPair;
         context.selectedPair = opts.selectedPair;
         has_changed = true;
-        _iceDiag('selectedPair:', _pairDesc(prev), '→', _pairDesc(context.selectedPair));
         if (context.selectedPair) {
           // Track socket for direct sends (relay pairs use turnClient instead)
           const sock = getSocketForLocalCandidate(context.selectedPair.local);
@@ -1593,7 +1583,6 @@ function IceAgent(options) {
   /* ── Outgoing connectivity check ── */
 
   function sendBindingCheck(pair) {
-    _iceDiag('check →', _pairDesc(pair), 'state=' + pair.state);
     if (context.closed) return;
     if (!context.remoteUfrag || !context.remotePwd) return;
 
@@ -1817,7 +1806,6 @@ function IceAgent(options) {
     }
 
     validPair.valid = true;
-    _iceDiag('validated:', _pairDesc(validPair), 'nominated=' + !!(validPair.weNominated || validPair.peerNominated));
 
     // Nomination inheritance from the triggering pair:
     // RFC 8445 §7.2.5.3.4 — if the original check had USE-CANDIDATE (we
@@ -2077,8 +2065,6 @@ function IceAgent(options) {
     // USE-CANDIDATE from controlled peers (RFC doesn't mandate rejection),
     // but in practice only the controlling peer should set it.
     const hasUseCandidate = (msg.getAttribute(wire.ATTR.USE_CANDIDATE) !== null);
-    _iceDiag('request ←', rinfo.address + ':' + rinfo.port,
-      'useCand=' + hasUseCandidate, 'pair=' + _pairDesc(pair));
     if (hasUseCandidate) pair.peerNominated = true;
 
     // RFC 8445 §7.3.1.4: Triggered check — queue a check from our side for
@@ -2526,7 +2512,17 @@ function IceAgent(options) {
       const cand = (typeof candOrString === 'string')
         ? parseCandidate(candOrString)
         : candOrString;
-      if (cand) set_context({ add_remote_candidate: cand });
+      if (cand) {
+        // Boundary hygiene for object-form candidates: the string parser
+        // canonicalizes token case (protocol/type are case-insensitive
+        // ABNF literals — RFC 8839 itself spells "UDP"), but callers that
+        // hand us pre-parsed objects bypass it. Pair formation compares
+        // these against our lowercase locals, so normalize here too.
+        if (typeof cand.protocol === 'string') cand.protocol = cand.protocol.toLowerCase();
+        if (typeof cand.type === 'string') cand.type = cand.type.toLowerCase();
+        if (typeof cand.tcpType === 'string') cand.tcpType = cand.tcpType.toLowerCase();
+        set_context({ add_remote_candidate: cand });
+      }
     },
 
     /** Convenience: just the local candidates. */
@@ -2583,19 +2579,6 @@ function IceAgent(options) {
      *  available (before the first nomination, or after close).  */
     send: function(buf) {
       const pair = context.selectedPair || context._previousPair;
-      if (typeof process !== 'undefined' && process.env && process.env.WEBRTC_DEBUG === '1') {
-        if (!context._txDiagCount) context._txDiagCount = 0;
-        if (context._txDiagCount < 12) {
-          context._txDiagCount++;
-          try {
-            console.log('[ice-diag] app-send #' + context._txDiagCount +
-              ' len=' + buf.length + ' firstByte=' + buf[0] +
-              (pair ? (' → ' + pair.remote.ip + ':' + pair.remote.port +
-                       ' via ' + pair.local.ip + ':' + pair.local.port)
-                    : ' DROPPED (no pair)'));
-          } catch (_e) {}
-        }
-      }
       if (!pair) return false;
       return sendViaPair(pair, buf);
     },

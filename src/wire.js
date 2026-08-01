@@ -1,4 +1,3 @@
-
 import crypto from 'node:crypto';
 
 /* ================================ Constants ================================ */
@@ -1129,22 +1128,31 @@ function decode_message(buf) {
 // IPv4: stun:host:port, turn:host:port?transport=udp
 // IPv6: stun:[::1]:port, turn:[2001:db8::1]:port?transport=tcp
 function parseUri(uri) {
-  // Try IPv6 bracket notation first: scheme:[ipv6]:port?params
-  // Accepts both colon form (stun:host) and authority form (ws://host).
-  var m = uri.match(/^(stuns?|turns?|wss?):(?:\/\/)?\[([^\]]+)\](?::(\d+))?(?:[/?](.*))?$/);
+  // Case-insensitivity contract (parse boundary):
+  //  - URI schemes are case-insensitive (RFC 3986 §3.1: "STUN:", "Turn:"
+  //    are the same scheme; producers should lowercase, consumers MUST
+  //    accept any casing).
+  //  - The ?transport= parameter — both its NAME and its value tokens
+  //    ("udp"/"tcp", RFC 7064/7065 ABNF) — is likewise case-insensitive,
+  //    since ABNF string literals match either case (RFC 5234 §2.3).
+  //  - Hostnames are case-insensitive by DNS; normalized for consistency.
+  //  What must NOT be normalized here: nothing — but note for the wider
+  //  library: STUN USERNAME/REALM/credentials are opaque octet strings
+  //  (RFC 5389) and are correctly compared byte-exact elsewhere.
+  var m = uri.match(/^(stuns?|turns?|wss?):(?:\/\/)?\[([^\]]+)\](?::(\d+))?(?:[/?](.*))?$/i);
   // Fall back to IPv4/hostname: scheme:host:port?params  (or scheme://host...)
-  if (!m) m = uri.match(/^(stuns?|turns?|wss?):(?:\/\/)?([^/?:]+)(?::(\d+))?(?:[/?](.*))?$/);
+  if (!m) m = uri.match(/^(stuns?|turns?|wss?):(?:\/\/)?([^/?:]+)(?::(\d+))?(?:[/?](.*))?$/i);
   if (!m) return null;
 
-  var scheme = m[1];
-  var host = m[2];
+  var scheme = m[1].toLowerCase();
+  var host = m[2].toLowerCase();
   var port = m[3] ? parseInt(m[3], 10) : null;
   var params = {};
 
   if (m[4]) {
     m[4].split('&').forEach(function(p) {
       var kv = p.split('=');
-      params[kv[0]] = kv[1] || '';
+      params[kv[0].toLowerCase()] = (kv[1] || '').toLowerCase();
     });
   }
 

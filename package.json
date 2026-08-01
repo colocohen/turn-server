@@ -1,6 +1,6 @@
 {
   "name": "turn-server",
-  "version": "0.5.0",
+  "version": "0.5.6",
   "description": "STUN/TURN server + client + full ICE agent for Node.js - UDP, TCP, TLS, WebSocket and DTLS transports",
   "type": "module",
   "main": "index.js",
@@ -55,10 +55,8 @@
       "url": "https://github.com/sponsors/colocohen"
     }
   ],
-  "dependencies": {
-    "lemon-tls": "^0.4.0"
-  },
   "optionalDependencies": {
+    "lemon-tls": "^0.5.5",
     "ws": "^8.18.0"
   }
 }
