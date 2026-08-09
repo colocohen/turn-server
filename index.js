@@ -6,6 +6,8 @@ import { Server, createServer } from './src/server.js';
 import * as wire from './src/wire.js';
 import { IceAgent } from './src/ice_agent.js';
 import * as candidate from './src/ice_candidate.js';
+import * as iceMdns from './src/ice_mdns.js';
+import * as icePortmap from './src/ice_portmap.js';
 
 
 /* ====================== TURN URI + DNS SRV ====================== */
@@ -224,12 +226,12 @@ export {
   Session, Socket, Server, createServer,
   connect, getPublicIP, detectNAT, resolve,
   wire,
-  IceAgent, candidate,
+  IceAgent, candidate, iceMdns, icePortmap,
 };
 
 export default {
   Session, Socket, Server, createServer,
   connect, getPublicIP, detectNAT, resolve,
   wire,
-  IceAgent, candidate,
+  IceAgent, candidate, iceMdns, icePortmap,
 };

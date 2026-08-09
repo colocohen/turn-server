@@ -76,6 +76,23 @@ const CHECK_PACE_MS = 50;
 // other pairs complete, so we can nominate the actual best (not just first).
 const NOMINATION_DELAY_MS = 100;
 
+// ── [ice-diag] instrumentation gate + rate limiter ──
+// Enabled with WEBRTC_DEBUG=1 (same env var the webrtc-server layers use).
+// _diagRL(key, ms) returns true at most once per `ms` per key — lets us
+// log recurring hot-path events (binding responses, consent ticks)
+// without flooding.
+const _ICE_DBG = (typeof process !== 'undefined' && process.env &&
+                  (process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true'));
+const _diagRLState = {};
+function _diagRL(key, ms) {
+  if (!_ICE_DBG) return false;
+  const now = Date.now();
+  if (_diagRLState[key] && (now - _diagRLState[key]) < ms) return false;
+  _diagRLState[key] = now;
+  return true;
+}
+function _diagTs() { return new Date().toISOString().slice(11, 23); }
+
 // Consent Freshness — RFC 7675.
 // After ICE completes, we verify the path is still alive by sending a STUN
 // Binding Request every ~15s. If no success response for 30s, declare the
@@ -338,6 +355,7 @@ function IceAgent(options) {
     checkTimer:           null,
     nominationTimer:      null,
     consentTimer:         null,
+    consentActive:        false,  // consent freshness cycle is running (see 2.8)
 
     // ── State tracked by set_context cascades ──
     selectedPair:         null,   // when set → cascade: emit, state=connected, stop checks, start consent
@@ -409,6 +427,10 @@ function IceAgent(options) {
 
     if ('controlling' in opts) {
       if (opts.controlling !== context.controlling) {
+        if (context.controlling !== !!opts.controlling) {
+          console.log('[ice-diag] ' + _diagTs() + ' ROLE SET via opts: ' +
+                      context.controlling + ' → ' + !!opts.controlling);
+        }
         context.controlling = !!opts.controlling;
         has_changed = true;
         // Role change → recompute pair priorities + re-sort
@@ -431,6 +453,8 @@ function IceAgent(options) {
 
     if ('localUfrag' in opts) {
       if (opts.localUfrag !== context.localUfrag && opts.localUfrag) {
+        console.log('[ice-diag] ' + _diagTs() + ' localUfrag set via opts: ' +
+                    context.localUfrag + ' → ' + opts.localUfrag);
         context.localUfrag = opts.localUfrag;
         has_changed = true;
         _localCredsChanged = true;
@@ -488,6 +512,11 @@ function IceAgent(options) {
         const prev = context.state;
         context.state = opts.state;
         has_changed = true;
+        // [ice-diag] agent-side state transitions with precise timestamps —
+        // lets us line up the server's view against the browser's timeline.
+        if (_ICE_DBG) {
+          console.log('[ice-diag] ' + _diagTs() + ' ICE STATE ' + prev + ' → ' + context.state);
+        }
         ev.emit('statechange', context.state, prev);
       }
     }
@@ -739,8 +768,19 @@ function IceAgent(options) {
 
 
     /* 2.6 — Once selected, transition state to 'connected' */
+    // 'disconnected' is excluded alongside 'failed' and 'closed'. It is a
+    // consent-freshness verdict (RFC 7675), not a checklist verdict: the pair
+    // is still selected and still valid as far as the checklist knows, so
+    // without this exclusion every set_context({state:'disconnected'}) was
+    // undone by the very cascade run it triggered. The state oscillated
+    // disconnected -> connected forever and a dead peer never latched.
+    //
+    // Recovery is owned by consentTick, which sets 'connected' again itself
+    // once a consent response arrives and the age drops back under the
+    // threshold. That is the only place that knows the path came back.
     if (context.selectedPair &&
         context.state !== 'connected' &&
+        context.state !== 'disconnected' &&
         context.state !== 'failed' &&
         context.state !== 'closed') {
       params_to_set.state = 'connected';
@@ -778,8 +818,20 @@ function IceAgent(options) {
 
 
     /* 2.8 — Once selected, start consent freshness (RFC 7675) */
+    // Gated on consentActive, NOT on consentTimer. The handle is legitimately
+    // null for the duration of a tick (consentTick nulls it on entry), so
+    // gating on it made every state change that happened inside a tick look
+    // like "consent is not running" and restart the cycle.
+    //
+    // That was fatal for the one transition that matters: consentTick detects
+    // a dead path, sets 'disconnected', set_context re-runs this cascade, the
+    // cascade sees a null handle and calls initiateConsentFreshness, which
+    // resets consentLastSuccessAt — erasing the very evidence that produced
+    // the disconnect. The state flipped straight back to 'connected' and did
+    // so forever; 'failed' was unreachable, and a second consent timer was
+    // scheduled on every cycle. A dead peer stayed 'connected' indefinitely.
     if (context.selectedPair &&
-        !context.consentTimer &&
+        !context.consentActive &&
         context.mode !== 'lite' &&
         !context.closed) {
       initiateConsentFreshness();   // imperative: schedules first consentTick
@@ -1089,7 +1141,21 @@ function IceAgent(options) {
       const urlList = Array.isArray(urls) ? urls : [urls];
       for (let j = 0; j < urlList.length; j++) {
         const p = parseIceServerUri(urlList[j]);
-        if (!p) continue;
+        if (!p) {
+          // An unparseable URI used to be dropped without a word. An
+          // application that configured five TURN servers and mistyped one
+          // had no way to learn that its configuration had been discarded —
+          // gathering simply proceeded with fewer servers than asked for.
+          // Report it as a candidate error against the URI as written.
+          ev.emit('candidateerror', {
+            type:   'config',
+            server: urlList[j],
+            error:  new Error('Malformed ICE server URI — expected ' +
+                              'stun:/stuns:/turn:/turns: followed by a host: ' +
+                              String(urlList[j])),
+          });
+          continue;
+        }
         if (p.isTurn) {
           turnServers.push({
             uri:        urlList[j],
@@ -1502,7 +1568,20 @@ function IceAgent(options) {
       });
 
       sock.on('error', function(err) {
+        try {
+          var _ea = sock.address();
+          console.log('[ice-diag] ' + _diagTs() + ' SOCKET ERROR on ' +
+                      _ea.address + ':' + _ea.port + ' — ' + (err && err.message));
+        } catch (e) {
+          console.log('[ice-diag] ' + _diagTs() + ' SOCKET ERROR (unbound) — ' + (err && err.message));
+        }
         ev.emit('error', err);
+      });
+
+      sock.on('close', function() {
+        // Bound identity is unreadable post-close; capture at bind below.
+        console.log('[ice-diag] ' + _diagTs() + ' SOCKET CLOSED ' +
+                    (sock.__diagBound || '(identity unknown)'));
       });
 
       sock.on('listening', function() {
@@ -1512,6 +1591,8 @@ function IceAgent(options) {
       sock.bind({ address: ip, port: 0, exclusive: false }, function() {
         let bound;
         try { bound = sock.address(); } catch (e) { cb(null, null); return; }
+        sock.__diagBound = bound.address + ':' + bound.port;
+        console.log('[ice-diag] ' + _diagTs() + ' SOCKET BOUND ' + sock.__diagBound);
         cb(sock, { address: bound.address, port: bound.port, family });
       });
 
@@ -1572,7 +1653,10 @@ function IceAgent(options) {
         };
         set_context({ add_local_candidate: cand });
       } else if (err) {
-        ev.emit('candidateerror', { type: 'srflx', server: server.uri, base: baseAddr.address, error: err });
+        ev.emit('candidateerror', {
+          type: 'srflx', server: server.uri,
+          base: baseAddr.address, port: baseAddr.port, error: err,
+        });
       }
       done();
     }
@@ -1674,7 +1758,15 @@ function IceAgent(options) {
         };
         set_context({ add_local_candidate: cand });
       } else if (err) {
-        ev.emit('candidateerror', { type: 'relay', server: server.uri, error: err });
+        // Carry the local address and port, as the srflx path does. The
+        // consumer maps base/port onto RTCPeerConnectionIceErrorEvent's
+        // address/port, and W3C 4.8.2 ties those together: port 0 means no
+        // address is available. Emitting neither left a spec-following
+        // application unable to tell which local interface failed.
+        ev.emit('candidateerror', {
+          type: 'relay', server: server.uri,
+          base: baseAddr.address, port: baseAddr.port, error: err,
+        });
       }
       done();
     }
@@ -1845,13 +1937,36 @@ function IceAgent(options) {
   }
 
   function handleStunMessage(buf, rinfo, sock, turnSocket) {
+    // [ice-diag] FUNNEL ENTRY: every datagram classified as STUN logs its
+    // arrival (rate-limited per source). Combined with the outcome logs
+    // below, a disconnect investigation can now distinguish in one run:
+    // never-arrived (no stun-rx) / arrived-but-unparseable (DECODE FAILED)
+    // / parsed-but-dropped (validation 401s) / handled.
+    if (_diagRL('stunrx:' + rinfo.address + ':' + rinfo.port, 2000)) {
+      var _lsock = '?';
+      try { if (sock) { var _la = sock.address(); _lsock = _la.address + ':' + _la.port; } } catch (e) {}
+      console.log('[ice-diag] ' + _diagTs() + ' stun-rx from ' +
+                  rinfo.address + ':' + rinfo.port + ' → local ' + _lsock +
+                  ' len=' + buf.length);
+    }
     const msg = wire.decode_message(buf);
-    if (!msg) return;
+    if (!msg) {
+      if (_diagRL('stundecfail:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        console.log('[ice-diag] ' + _diagTs() + ' stun-rx DECODE FAILED from ' +
+                    rinfo.address + ':' + rinfo.port + ' len=' + buf.length +
+                    ' head=' + buf.slice(0, 8).toString('hex'));
+      }
+      return;
+    }
     const txHex = txIdHex(msg.transactionId);
 
     // 1. Pending transaction (our outgoing STUN req — connectivity check, gather, etc.)
     const pending = context.pendingTransactions[txHex];
     if (pending) {
+      if (_diagRL('stunresp:' + rinfo.address + ':' + rinfo.port, 5000)) {
+        console.log('[ice-diag] ' + _diagTs() + ' stun response consumed (kind=' +
+                    pending.kind + ') from ' + rinfo.address + ':' + rinfo.port);
+      }
       if (msg.cls === wire.CLASS.SUCCESS) {
         // For checks and consent: validate MESSAGE-INTEGRITY with remote password
         if ((pending.kind === 'check' || pending.kind === 'consent') && context.remotePwd) {
@@ -1884,6 +1999,15 @@ function IceAgent(options) {
     if (msg.method === wire.METHOD.BINDING && msg.cls === wire.CLASS.REQUEST) {
       handleBindingRequest(buf, msg, rinfo, sock, turnSocket);
       return;
+    }
+
+    // [ice-diag] Fallthrough — STUN we recognized but did not handle
+    // (unknown transaction response, indication, non-binding method).
+    if (_diagRL('stunfall:' + rinfo.address + ':' + rinfo.port, 2000)) {
+      console.log('[ice-diag] ' + _diagTs() + ' stun UNHANDLED from ' +
+                  rinfo.address + ':' + rinfo.port +
+                  ' method=' + msg.method + ' cls=' + msg.cls +
+                  ' (pendingTx=' + (context.pendingTransactions[txHex] ? 'yes' : 'no') + ')');
     }
   }
 
@@ -2265,8 +2389,9 @@ function IceAgent(options) {
 
 
   function initiateConsentFreshness() {
-    // Triggered by cascade 2.8: selectedPair set, not lite, no timer yet.
-    if (context.consentTimer) return;
+    // Triggered by cascade 2.8: selectedPair set, not lite, not already running.
+    if (context.consentActive) return;
+    context.consentActive = true;
     context.consentLastSuccessAt = Date.now();
     scheduleNextConsentTick();
   }
@@ -2285,7 +2410,25 @@ function IceAgent(options) {
 
     // Decide lifecycle transition based on last-success age.
     const age = Date.now() - context.consentLastSuccessAt;
+
+    // [ice-diag] every tick: shows the cadence, the last-success age, and
+    // the exact 5-tuple our consent goes to. If the path silently died,
+    // age climbs here tick after tick while everything else looks normal.
+    if (_ICE_DBG) {
+      const _p = context.selectedPair;
+      console.log('[ice-diag] ' + _diagTs() + ' consent-tick age=' + age + 'ms → ' +
+                  (_p.remote && _p.remote.ip) + ':' + (_p.remote && _p.remote.port) +
+                  ' (from ' + (_p.local && _p.local.ip) + ':' + (_p.local && _p.local.port) + ')' +
+                  ' state=' + context.state);
+    }
+
     if (age >= CONSENT_FAILED_MS) {
+      // Terminal. consentActive stays TRUE deliberately: clearing it here
+      // would let cascade 2.8 immediately start a fresh cycle against the
+      // same dead pair, which restarts the ticks and resets the age — the
+      // failure would not stay latched. The flag is cleared by teardown and
+      // by ICE restart, which are the only paths that can produce a pair
+      // worth checking again.
       set_context({ state: 'failed' });
       return;   // stop scheduling further
     }
@@ -2351,7 +2494,17 @@ function IceAgent(options) {
       callback: function(msg, _rinfo, err) {
         delete context.pendingTransactions[txHex];
         if (timer) clearTimeout(timer);
-        if (err) return;   // no response → leave lastSuccessAt stale
+        if (err) {
+          // [ice-diag] a consent timeout is the smoking gun for a dead
+          // server→peer (request) or peer→server (response) leg.
+          if (_ICE_DBG) {
+            console.log('[ice-diag] ' + _diagTs() + ' consent TIMEOUT (no response in 10s)');
+          }
+          return;   // no response → leave lastSuccessAt stale
+        }
+        if (_diagRL('consent-ok', 4000)) {
+          console.log('[ice-diag] ' + _diagTs() + ' consent response OK');
+        }
         // Stats: RTT from consent response + byte/packet counters.
         const rttMs = Date.now() - consentSentAt;
         pair.roundTripTime       = rttMs / 1000;
@@ -2373,12 +2526,24 @@ function IceAgent(options) {
     if (context.closed) return;
 
     // Verify USERNAME and MESSAGE-INTEGRITY with OUR password (RFC 8445 §7.3)
+    // [ice-diag] Every drop branch below LOGS (rate-limited): a silent
+    // validation failure looks identical to "packets stopped arriving"
+    // from the outside, and that ambiguity cost a full debugging session
+    // (bidi disconnect hunt, Aug 2026). Never again.
     if (!context.localPwd) {
-      // Not configured yet — silently drop
+      if (_diagRL('drop-nopwd:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        console.log('[ice-diag] ' + _diagTs() + ' DROP binding-req from ' +
+                    rinfo.address + ':' + rinfo.port + ' — context.localPwd is EMPTY');
+      }
       return;
     }
     const validated = wire.validateStunMessage(buf, context.localPwd);
     if (!validated) {
+      if (_diagRL('drop-integrity:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        console.log('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
+                    rinfo.address + ':' + rinfo.port + ' — MESSAGE-INTEGRITY failed ' +
+                    '(their HMAC pwd != our context.localPwd — credential divergence?)');
+      }
       sendBindingError(msg, rinfo, sock, turnSocket, 401, 'Unauthenticated');
       return;
     }
@@ -2386,13 +2551,21 @@ function IceAgent(options) {
     // USERNAME must be "<our-ufrag>:<their-ufrag>"
     const usernameAttr = msg.getAttribute(wire.ATTR.USERNAME);
     if (typeof usernameAttr !== 'string' || usernameAttr.indexOf(':') < 0) {
+      if (_diagRL('drop-badusr:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        console.log('[ice-diag] ' + _diagTs() + ' 400 binding-req from ' +
+                    rinfo.address + ':' + rinfo.port + ' — malformed USERNAME');
+      }
       sendBindingError(msg, rinfo, sock, turnSocket, 400, 'Bad Request');
       return;
     }
     const colonIdx = usernameAttr.indexOf(':');
     const usernameLocal = usernameAttr.substring(0, colonIdx);
     if (usernameLocal !== context.localUfrag) {
-      // Wrong local ufrag — probably a stale packet
+      if (_diagRL('drop-ufrag:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        console.log('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
+                    rinfo.address + ':' + rinfo.port + ' — USERNAME local part "' +
+                    usernameLocal + '" != context.localUfrag "' + context.localUfrag + '"');
+      }
       sendBindingError(msg, rinfo, sock, turnSocket, 401, 'Unauthenticated');
       return;
     }
@@ -2405,17 +2578,27 @@ function IceAgent(options) {
       // Both claim controlling
       if (compareTieBreakers(context.tieBreaker, icControlling.raw) >= 0) {
         // We win — tell them to switch (487)
+        if (_diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
+          console.log('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlling, we win) → ' +
+                      rinfo.address + ':' + rinfo.port + ' — our role=controlling');
+        }
         sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict');
         return;
       }
       // We lose — switch to controlled
+      console.log('[ice-diag] ' + _diagTs() + ' role conflict: both controlling, we LOSE → switching to controlled');
       switchRole(false);
     } else if (!context.controlling && icControlled !== null) {
       // Both claim controlled
       if (compareTieBreakers(context.tieBreaker, icControlled.raw) >= 0) {
+        if (_diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
+          console.log('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlled, we win) → ' +
+                      rinfo.address + ':' + rinfo.port + ' — our role=controlled');
+        }
         sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict');
         return;
       }
+      console.log('[ice-diag] ' + _diagTs() + ' role conflict: both controlled, we LOSE → switching to controlling');
       switchRole(true);
     }
 
@@ -2443,6 +2626,14 @@ function IceAgent(options) {
     }
 
     // Always respond — even before processing, the peer needs a Success
+    // [ice-diag] Log request+response per source (max 1/2s per source):
+    // proves whether the peer's checks/consent keep arriving and that we
+    // keep answering — and to WHICH address the answer goes.
+    if (_diagRL('bindreq:' + rinfo.address + ':' + rinfo.port, 2000)) {
+      console.log('[ice-diag] ' + _diagTs() + ' binding-req from ' +
+                  rinfo.address + ':' + rinfo.port +
+                  ' → responding (pair=' + (pair ? 'known' : 'NONE') + ')');
+    }
     sendBindingSuccess(msg, rinfo, sock, turnSocket);
 
     // Stats: we just sent a response.
@@ -2764,6 +2955,7 @@ function IceAgent(options) {
     // Stop all timers
     if (context.checkTimer)      { clearInterval(context.checkTimer);   context.checkTimer = null; }
     if (context.consentTimer)    { clearInterval(context.consentTimer); context.consentTimer = null; }
+    context.consentActive = false;
     if (context.nominationTimer) { clearTimeout(context.nominationTimer); context.nominationTimer = null; }
 
     // mDNS: send goodbye for every name we registered, then drop our hold
@@ -2908,6 +3100,23 @@ function IceAgent(options) {
       return context.remoteUfrag
         ? { ufrag: context.remoteUfrag, pwd: context.remotePwd, iceLite: context.remoteIceLite }
         : null;
+    },
+
+    /**
+     * Set the ICE role explicitly. Mirrors libwebrtc's per-negotiation
+     * policy: the offerer of EACH O/A round is controlling, the answerer
+     * controlled. RFC 8445 pins the role for the session, but Chrome
+     * re-derives it every round — a full-ICE peer that stays RFC-pure
+     * drifts out of sync after alternating renegotiations until both
+     * sides claim 'controlled' and every consent check 487s (found live:
+     * the M2 party-mode disconnect — sustained ROLE CONFLICT storm, all
+     * connections, ~6s after a renegotiation). Interop beats purity:
+     * follow the browser's policy. The tie-breaker path (§7.3.1.1)
+     * remains as the safety net. Idempotent — set_context no-ops when
+     * the role is unchanged.
+     */
+    setRole: function(controlling) {
+      set_context({ controlling: !!controlling });
     },
 
     setLocalParameters: function(params) {
@@ -3064,6 +3273,7 @@ function IceAgent(options) {
       if (context.checkTimer)      { clearInterval(context.checkTimer);   context.checkTimer = null; }
       if (context.nominationTimer) { clearTimeout(context.nominationTimer); context.nominationTimer = null; }
       if (context.consentTimer)    { clearTimeout(context.consentTimer);   context.consentTimer = null; }
+      context.consentActive = false;   // the new selectedPair starts its own cycle
 
       /* ── Reset ICE check state ──
        * NOTE: sockets, turnClients, turnPermissions are intentionally
@@ -3103,6 +3313,8 @@ function IceAgent(options) {
 
       // Apply new local creds atomically via direct mutation — these feed
       // Binding Request USERNAME/MESSAGE-INTEGRITY for the new session.
+      console.log('[ice-diag] ' + _diagTs() + ' RESTART: local creds rotated ' +
+                  context.localUfrag + ' → ' + ufrag + ' (remote creds dropped, awaiting new)');
       context.localUfrag = ufrag;
       context.localPwd   = pwd;
 

@@ -1,6 +1,6 @@
 {
   "name": "turn-server",
-  "version": "0.5.7",
+  "version": "0.6.0",
   "description": "STUN/TURN server + client + full ICE agent for Node.js - UDP, TCP, TLS, WebSocket and DTLS transports",
   "type": "module",
   "main": "index.js",
@@ -56,9 +56,9 @@
     }
   ],
   "optionalDependencies": {
-    "lemon-tls": "^0.5.5",
+    "lemon-tls": "^0.7.0",
     "mdns-local": "^0.1.0",
-    "port-mapper": "^0.1.0",
+    "port-mapper": "^0.1.3",
     "ws": "^8.18.0"
   }
 }
