@@ -575,6 +575,37 @@ function IceAgent(options) {
         context.remoteCandidates.push(cand);
         has_changed = true;
         formPairsForNewRemote(cand);
+      } else if (cand) {
+        // A SIGNALLED CANDIDATE OUTRANKS A DISCOVERED ONE.
+        //
+        // We may already hold this (ip, port) as PEER-REFLEXIVE, learned from
+        // an incoming binding request before the peer's signalling arrived —
+        // a normal race, since checks start as soon as the first candidate
+        // lands. The duplicate guard then dropped the signalled copy, and the
+        // entry stayed 'prflx' forever.
+        //
+        // That loses real information. RFC 8445 5.1.2: peer-reflexive means
+        // "discovered, never announced", and the API contract depends on it —
+        // getRemoteCandidates() returns what the peer TOLD us and correctly
+        // omits prflx, so it returned an empty list for a connection whose
+        // peer had signalled a perfectly good host candidate.
+        //
+        // Upgrade in place: keep the object (pairs and the check list point at
+        // it) and adopt the signalled type, foundation and priority, which are
+        // the peer's own values rather than our guesses.
+        const known = findRemoteCandidate(cand.ip, cand.port);
+        if (known && known.type === 'prflx' && cand.type && cand.type !== 'prflx') {
+          known.type = cand.type;
+          if (cand.foundation != null) known.foundation = cand.foundation;
+          if (cand.priority != null)   known.priority   = cand.priority;
+          if (cand.relatedAddress != null || cand.raddr != null) {
+            known.relatedAddress = cand.relatedAddress != null ? cand.relatedAddress : cand.raddr;
+          }
+          if (cand.relatedPort != null || cand.rport != null) {
+            known.relatedPort = cand.relatedPort != null ? cand.relatedPort : cand.rport;
+          }
+          has_changed = true;
+        }
       }
     }
 
