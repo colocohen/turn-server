@@ -2526,14 +2526,58 @@ function IceAgent(options) {
   function scheduleNextConsentTick() {
     if (context.closed) return;
     const jitter = 1 + (Math.random() * 2 - 1) * CONSENT_RANDOMIZATION;
-    const ms = Math.floor(CONSENT_INTERVAL_MS * jitter);
+    let ms = Math.floor(CONSENT_INTERVAL_MS * jitter);
+
+    // DON'T SLEEP PAST THE DEADLINE.
+    //
+    // The tick both sends a consent check and evaluates the age against the
+    // disconnect/failed thresholds. Scheduling purely on the interval means
+    // the evaluation lands wherever the interval happens to put it: measured
+    // ticks at 12.8s and 28.6s, with the next at ~44s — so a path that died
+    // at t=0 crossed the 30s threshold at 28.6s (not yet) and was not looked
+    // at again until 44s. Whether a dead peer was noticed at 30s or at 44s
+    // came down to jitter, which is why the same code reported disconnected
+    // on one run and connected on the next.
+    //
+    // Clamping the sleep so it never overshoots the next threshold keeps the
+    // send cadence at the RFC 7675 interval while making the DETECTION
+    // deadline mean what it says.
+    const age = Date.now() - context.consentLastSuccessAt;
+    const nextDeadline = (age < CONSENT_DISCONNECT_MS)
+      ? CONSENT_DISCONNECT_MS
+      : (age < CONSENT_FAILED_MS ? CONSENT_FAILED_MS : Infinity);
+    if (nextDeadline !== Infinity) {
+      const untilDeadline = nextDeadline - age;
+      if (untilDeadline > 0 && untilDeadline < ms) ms = untilDeadline;
+    }
     context.consentTimer = setTimeout(consentTick, ms);
     if (context.consentTimer.unref) context.consentTimer.unref();
   }
 
   function consentTick() {
     context.consentTimer = null;
-    if (context.closed || !context.selectedPair) return;
+    if (context.closed) return;                 // done for good
+
+    // NO SELECTED PAIR RIGHT NOW IS NOT THE END OF THE CYCLE.
+    //
+    // Returning here left no timer scheduled, and consentActive stays true —
+    // so cascade 2.8, which is the only thing that restarts the cycle, sees
+    // an already-active cycle and does nothing. Consent was dead for the rest
+    // of the connection's life.
+    //
+    // selectedPair is momentarily null while a pair is being replaced (an ICE
+    // restart, a better pair nominated), so this is not an exotic window: it
+    // is a normal part of a long call. Measured — a peer that vanished was
+    // detected after 31s on one run and never on the next, from the same
+    // code, which is the signature of a race rather than a wrong threshold.
+    //
+    // Reschedule instead and let the next tick decide; the age check below is
+    // the thing that ends the cycle, and it ends it deliberately by NOT
+    // rescheduling once 'failed' is reached.
+    if (!context.selectedPair) {
+      scheduleNextConsentTick();
+      return;
+    }
 
     // Decide lifecycle transition based on last-success age.
     const age = Date.now() - context.consentLastSuccessAt;
