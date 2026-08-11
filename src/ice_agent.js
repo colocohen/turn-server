@@ -102,6 +102,11 @@ const CONSENT_INTERVAL_MS       = parseInt(process.env.ICE_CONSENT_INTERVAL_MS  
 const CONSENT_RANDOMIZATION     = 0.2;     // ±20% per RFC 7675 §5.1
 const CONSENT_DISCONNECT_MS     = parseInt(process.env.ICE_CONSENT_DISCONNECT_MS || '30000', 10);
 const CONSENT_FAILED_MS         = parseInt(process.env.ICE_CONSENT_FAILED_MS     || '45000', 10);
+// Lite liveness (passive) — how often the observer wakes to read the
+// last-request age. The THRESHOLDS are deliberately the consent ones:
+// disconnected/failed mean the same thing regardless of which side's
+// evidence proved the path dead.
+const LITE_LIVENESS_TICK_MS     = parseInt(process.env.ICE_LITE_LIVENESS_TICK_MS || '5000', 10);
 
 // Gathering — global safety cap
 const GATHER_SRFLX_TIMEOUT_MS = 5000;
@@ -361,6 +366,19 @@ function IceAgent(options) {
     selectedPair:         null,   // when set → cascade: emit, state=connected, stop checks, start consent
     nominationStarted:    false,  // when true → nomination timer is scheduled
     consentLastSuccessAt: 0,      // updated when a consent reply arrives
+    // ── Lite liveness (passive; RFC-8445 §11 keepalives as evidence) ──
+    // Consent (RFC 7675) is a SENDER's mechanism and cascade 2.8 rightly
+    // skips it in lite — but that left lite with NO producer of
+    // 'disconnected' at all: a vanished peer stayed 'connected' forever
+    // (found live: an SFU recv transport whose browser tab refreshed kept
+    // sending RTP into the void indefinitely). The full-ICE peer is
+    // REQUIRED to send keepalive binding requests on the live pair
+    // (RFC 8445 §11, "MUST ... regardless of whether the data stream is
+    // currently inactive"), so their absence IS the liveness signal —
+    // observed, never transmitted: zero bytes on the wire from us.
+    liteLivenessTimer:    null,   // bookkeeping (rule at 'Timer handles')
+    liteLivenessActive:   false,  // cycle running (mirrors consentActive)
+    lastRequestReceivedAt: 0,     // any AUTHENTICATED binding request
 
     // ── ICE restart — RFC 8445 §9 ──
     // During a restart, the PREVIOUS selectedPair keeps forwarding media
@@ -733,7 +751,26 @@ function IceAgent(options) {
         context.remoteCandidates.length > 0 &&
         context.checkList.length > 0 &&
         !context.selectedPair) {
-      params_to_set.state = 'checking';
+      // A RESTART DOES NOT GO BACK TO 'checking'.
+      //
+      // RFC 8445 9.3.2: while a restart is in progress the agent keeps
+      // serving media over the PREVIOUS pair, which is exactly what
+      // _previousPair exists for (see its note above). The connection is not
+      // in doubt — new candidates are being checked alongside a working one —
+      // so the state stays 'connected' and only moves if the restart fails.
+      //
+      // Reporting 'checking' told every application watching
+      // iceConnectionState that the call was reconnecting, on a call that had
+      // never stopped working. On a mobile network, where restarts happen
+      // routinely, that is a "reconnecting" indicator flashing at a user
+      // whose video never dropped a frame.
+      //
+      // The checks themselves are unaffected: cascade 2.3 starts its
+      // scheduler on `checking` OR on a restart in progress, so the new pairs
+      // are probed either way.
+      if (context.state !== 'connected') {
+        params_to_set.state = 'checking';
+      }
     }
 
 
@@ -741,7 +778,10 @@ function IceAgent(options) {
      *        Same prerequisites as 2.2 — we need creds + candidates + pairs.
      *        This way, artificially setting state='checking' without inputs
      *        doesn't launch a tick that would immediately fail. */
-    if (context.state === 'checking' &&
+    if ((context.state === 'checking' ||
+         // Restart in progress: the state deliberately stays 'connected'
+         // (see 2.2), but the new candidate pairs still have to be probed.
+         (context.state === 'connected' && context._previousPair)) &&
         !context.checkTimer &&
         !context.selectedPair &&
         context.mode !== 'lite' &&
@@ -866,6 +906,18 @@ function IceAgent(options) {
         context.mode !== 'lite' &&
         !context.closed) {
       initiateConsentFreshness();   // imperative: schedules first consentTick
+    }
+
+    /* 2.8b — Lite counterpart: passive liveness (see the context-field
+     * note). Same gate shape as 2.8 with the mode flipped; same
+     * activation-flag discipline (liteLivenessActive, NOT the timer
+     * handle — the 2.8 lesson about in-tick null handles applies
+     * verbatim here). */
+    if (context.selectedPair &&
+        !context.liteLivenessActive &&
+        context.mode === 'lite' &&
+        !context.closed) {
+      initiateLiteLiveness();       // imperative: schedules first liveness tick
     }
 
 
@@ -2419,6 +2471,50 @@ function IceAgent(options) {
   }
 
 
+  function initiateLiteLiveness() {
+    // Triggered by cascade 2.8b: selectedPair set, lite, not already running.
+    if (context.liteLivenessActive) return;
+    context.liteLivenessActive = true;
+    // Seed the clock at activation — the same reasoning consent uses:
+    // never judge age against a zero from before the session existed.
+    context.lastRequestReceivedAt = Date.now();
+    scheduleNextLiteLivenessTick();
+  }
+
+  function scheduleNextLiteLivenessTick() {
+    if (context.closed) return;
+    context.liteLivenessTimer = setTimeout(liteLivenessTick, LITE_LIVENESS_TICK_MS);
+    if (context.liteLivenessTimer.unref) context.liteLivenessTimer.unref();
+  }
+
+  function liteLivenessTick() {
+    context.liteLivenessTimer = null;
+    if (context.closed || !context.selectedPair) return;
+
+    const age = Date.now() - context.lastRequestReceivedAt;
+
+    if (_ICE_DBG) {
+      console.log('[ice-diag] ' + _diagTs() + ' lite-liveness age=' + age + 'ms state=' + context.state);
+    }
+
+    if (age >= CONSENT_FAILED_MS) {
+      // Terminal — and liteLivenessActive stays TRUE deliberately, the
+      // exact latch lesson from consentTick: clearing it would let 2.8b
+      // start a fresh cycle, reseed the clock, and erase the very
+      // evidence that produced the failure. Cleared only by teardown and
+      // ICE restart, the only paths that can produce a live peer again.
+      set_context({ state: 'failed' });
+      return;   // stop scheduling further
+    }
+    if (age >= CONSENT_DISCONNECT_MS) {
+      if (context.state === 'connected') set_context({ state: 'disconnected' });
+    } else if (context.state === 'disconnected') {
+      set_context({ state: 'connected' });   // recovery: a request arrived
+    }
+
+    scheduleNextLiteLivenessTick();
+  }
+
   function initiateConsentFreshness() {
     // Triggered by cascade 2.8: selectedPair set, not lite, not already running.
     if (context.consentActive) return;
@@ -2655,6 +2751,16 @@ function IceAgent(options) {
       pair.bytesReceived += buf.length;
       pair.lastPacketReceivedTimestamp = Date.now();
     }
+
+    // Lite-liveness evidence: an authenticated request from the peer is
+    // proof of life for the session (we are past MI validation here).
+    // Deliberately not restricted to the selected pair — during pair
+    // upgrades / restarts the peer is alive regardless of which pair its
+    // check rode in on, and restricting produced false disconnects at
+    // exactly the moments paths churn. Direct mutation, not set_context:
+    // this is bookkeeping the TIMER reads (the 'Timer handles' rule),
+    // not a flag that drives cascades.
+    context.lastRequestReceivedAt = Date.now();
 
     // Always respond — even before processing, the peer needs a Success
     // [ice-diag] Log request+response per source (max 1/2s per source):
@@ -2985,7 +3091,9 @@ function IceAgent(options) {
   function teardown() {
     // Stop all timers
     if (context.checkTimer)      { clearInterval(context.checkTimer);   context.checkTimer = null; }
-    if (context.consentTimer)    { clearInterval(context.consentTimer); context.consentTimer = null; }
+    if (context.consentTimer)      { clearInterval(context.consentTimer);     context.consentTimer = null; }
+    if (context.liteLivenessTimer) { clearTimeout(context.liteLivenessTimer); context.liteLivenessTimer = null; }
+    context.liteLivenessActive = false;
     context.consentActive = false;
     if (context.nominationTimer) { clearTimeout(context.nominationTimer); context.nominationTimer = null; }
 
@@ -3303,7 +3411,10 @@ function IceAgent(options) {
       // start its own consent via cascade 2.8 when it's chosen.
       if (context.checkTimer)      { clearInterval(context.checkTimer);   context.checkTimer = null; }
       if (context.nominationTimer) { clearTimeout(context.nominationTimer); context.nominationTimer = null; }
-      if (context.consentTimer)    { clearTimeout(context.consentTimer);   context.consentTimer = null; }
+      if (context.consentTimer)      { clearTimeout(context.consentTimer);     context.consentTimer = null; }
+      if (context.liteLivenessTimer) { clearTimeout(context.liteLivenessTimer); context.liteLivenessTimer = null; }
+      context.liteLivenessActive = false;
+      context.lastRequestReceivedAt = 0;   // restart: new session, new clock (re-armed by 2.8b)
       context.consentActive = false;   // the new selectedPair starts its own cycle
 
       /* ── Reset ICE check state ──
