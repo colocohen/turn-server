@@ -2006,6 +2006,29 @@ function IceAgent(options) {
 
   function onTurnRelayedData(buf, peerIp, peerPort, turnSocket) {
     if (context.closed) return;
+    // A RELAYED PAYLOAD ARRIVES AS A Uint8Array, NOT A Buffer.
+    //
+    // The direct path emits what the UDP socket hands us, which is always a
+    // Buffer. The relayed path arrives as a plain Uint8Array by the time it
+    // reaches here, and a consumer calling readUInt16BE, readUInt32BE or any
+    // other Buffer method on it throws.
+    //
+    // (The conversion point was not pinned down: the socket produces a Buffer
+    // and wire's DATA decode is `d.slice(0)`, which preserves the type, so it
+    // happens somewhere between. Normalising at this boundary fixes it
+    // regardless, which is why it is here rather than at the origin.)
+    //
+    // Measured: every relayed RTP packet reached the SRTP layer and died on
+    // `srtpPacket.readUInt16BE is not a function`, 121 of 121, with the
+    // exception swallowed upstream — a call that connects, negotiates and
+    // then carries no media, silently.
+    //
+    // Normalising here rather than at each consumer keeps the two paths
+    // indistinguishable from the outside, which is what every listener on
+    // 'packet' already assumes. Buffer.from over the same memory adds no copy.
+    if (buf && !Buffer.isBuffer(buf) && typeof Buffer !== 'undefined') {
+      buf = Buffer.from(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength || buf.length);
+    }
     const type = wire.demux(buf);
     // HOT PATH: RTP/RTCP/DTLS is 99% of traffic on an established call.
     // Avoid allocating rinfo object in that case — consumers rarely need
