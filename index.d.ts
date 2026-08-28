@@ -93,6 +93,12 @@ export interface ServerOptions {
   maxPermissionsPerAllocation?: number;
   maxChannelsPerAllocation?: number;
   idleTimeout?: number;
+  /**
+   * How long (ms) a hook may defer its decision before the server gives up and
+   * **denies** the request. Default 5000. Applies to every hook that takes a
+   * `HookCallback`; the relay hot-path hooks are synchronous and unaffected.
+   */
+  hookTimeout?: number;
 
   // Security
   allowLoopback?: boolean;
@@ -157,6 +163,120 @@ export interface RelayInfo {
   channel: number | null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  Hooks
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Decision callback for every hook except the two relay hot-path hooks.
+ *
+ * May be called **synchronously or asynchronously** — nothing is sent and no
+ * state changes until it fires, so a database or Redis lookup inside the
+ * listener is safe. Only the first call counts.
+ *
+ *   cb(true)                        allow
+ *   cb(false)                       deny with the hook's default error code
+ *   cb(false, 486)                  deny with a specific code
+ *   cb(false, 508, 'No capacity')   deny with a code and a reason phrase
+ *
+ * `code` and `reason` are ignored by hooks whose rejection is a silent drop
+ * (`accept`, `beforeBindingResponse`), since those never send a response.
+ *
+ * A listener that never calls `cb` is **denied** once `hookTimeout` elapses.
+ */
+export type HookCallback = (allowed: boolean, code?: number, reason?: string) => void;
+
+/**
+ * Decision callback for the relay hot path (`beforeRelay`, `beforeData`).
+ *
+ * These run once per relayed packet, so they are **synchronous**: the listener
+ * must call `cb` in the same tick. A deferred answer is ignored and the packet
+ * is dropped. Keep the check in memory (a local token bucket, a `Map`); never
+ * await I/O here. Rejection is a silent drop, so there is no error code.
+ */
+export type SyncHookCallback = (allowed: boolean) => void;
+
+/** `accept` — a new connection or UDP 5-tuple. */
+export interface AcceptInfo {
+  source: Address;
+  transport: Transport;
+}
+
+/** `beforeBindingResponse` — before answering a STUN Binding request. */
+export interface BindingResponseInfo {
+  source: Address;
+  transport: Transport | null;
+}
+
+/** `authorize` — an authenticated request, before the method runs. */
+export interface AuthorizeInfo {
+  method: number;
+  methodName: string | null;
+  username: string | null;
+  source: Address | null;
+}
+
+/** `beforeAllocate` — an Allocate request. `lifetime` is writable. */
+export interface AllocateInfo {
+  username: string | null;
+  source: Address | null;
+  transport: number;
+  /** Writable: assign to grant a different lifetime than the client asked for. */
+  lifetime: number;
+  requestedFamily: number | null;
+  evenPort: unknown;
+  reservationToken: Bytes | null;
+  dontFragment: boolean;
+}
+
+/** `beforeRefresh` — a Refresh request. `lifetime` is writable. */
+export interface RefreshInfo {
+  username: string | null;
+  source: Address | null;
+  /** Writable: assign to grant a different lifetime. */
+  lifetime: number;
+  currentLifetime: number;
+}
+
+/** `beforePermission` — fires once per peer in a CreatePermission request. */
+export interface PermissionInfo {
+  username: string | null;
+  source: Address | null;
+  peer: Address;
+}
+
+/** `beforeChannelBind` — a ChannelBind request. */
+export interface ChannelBindInfo {
+  username: string | null;
+  source: Address | null;
+  channel: number;
+  peer: Address;
+}
+
+/** `beforeConnect` — a Connect request (TCP relay, RFC 6062). */
+export interface ConnectInfo {
+  username: string | null;
+  source: Address | null;
+  peer: Address;
+}
+
+/** `beforeData` — inbound relay packet (peer → client). Hot path. */
+export interface DataInfo {
+  peer: Address;
+  source: Address | null;
+  username: string | null;
+  size: number;
+  direction: 'inbound';
+}
+
+/** `auth:failure` — a real authentication failure, not the normal 401 challenge. */
+export interface AuthFailureInfo {
+  username: string | null;
+  code: number;
+  reason: 'bad-integrity' | 'unknown-user' | 'wrong-credentials'
+        | 'algorithm-mismatch' | 'invalid-token' | 'missing-credentials';
+}
+
 export interface Server {
   /** Raw internal context — advanced use only. */
   readonly context: Record<string, unknown>;
@@ -164,6 +284,25 @@ export interface Server {
   on(event: 'listening', listener: (info: { transport: Transport; address: string; port: number }) => void): this;
   on(event: 'connection', listener: (socket: Socket) => void): this;
   on(event: 'authenticate', listener: (username: string, realm: string | null, cb: (key: Bytes | string | null) => void) => void): this;
+  on(event: 'authenticate_oauth', listener: (token: Bytes, realm: string | null, cb: (err: Error | null, key?: Bytes | null) => void) => void): this;
+
+  // ── Hooks: cb may fire synchronously or asynchronously ──
+  on(event: 'accept', listener: (info: AcceptInfo, cb: HookCallback) => void): this;
+  on(event: 'beforeBindingResponse', listener: (info: BindingResponseInfo, cb: HookCallback) => void): this;
+  on(event: 'authorize', listener: (info: AuthorizeInfo, cb: HookCallback) => void): this;
+  on(event: 'quota', listener: (username: string | null, cb: HookCallback) => void): this;
+  on(event: 'beforeAllocate', listener: (info: AllocateInfo, cb: HookCallback) => void): this;
+  on(event: 'beforeRefresh', listener: (info: RefreshInfo, cb: HookCallback) => void): this;
+  on(event: 'beforePermission', listener: (info: PermissionInfo, cb: HookCallback) => void): this;
+  on(event: 'beforeChannelBind', listener: (info: ChannelBindInfo, cb: HookCallback) => void): this;
+  on(event: 'beforeConnect', listener: (info: ConnectInfo, cb: HookCallback) => void): this;
+
+  // ── Hooks: relay hot path, cb MUST fire synchronously ──
+  on(event: 'beforeRelay', listener: (info: RelayInfo, cb: SyncHookCallback) => void): this;
+  on(event: 'beforeData', listener: (info: DataInfo, cb: SyncHookCallback) => void): this;
+
+  on(event: 'onRelayed', listener: (socket: Socket, info: RelayInfo) => void): this;
+  on(event: 'auth:failure', listener: (socket: Socket, info: AuthFailureInfo) => void): this;
   on(event: 'allocate', listener: (socket: Socket, allocation: Allocation) => void): this;
   on(event: 'allocate:expired', listener: (socket: Socket, allocation: Allocation) => void): this;
   on(event: 'error', listener: (err: Error) => void): this;
@@ -217,13 +356,32 @@ export interface Allocation {
   [key: string]: unknown;
 }
 
+/** Per-allocation traffic counters, as returned by `session.getBandwidth()`. */
+export interface Bandwidth {
+  /** Bytes relayed peer → client. */
+  bytesIn: number;
+  /** Bytes relayed client → peer. */
+  bytesOut: number;
+  /** Packets relayed peer → client. */
+  packetsIn: number;
+  /** Packets relayed client → peer (Send indications and ChannelData). */
+  packetsOut: number;
+}
+
 export interface Session {
   readonly context: Record<string, unknown>;
   readonly isServer: boolean;
+  on(event: 'auth:failure', listener: (info: AuthFailureInfo) => void): this;
   on(event: string, listener: (...args: any[]) => void): this;
   off(event: string, listener: (...args: any[]) => void): this;
   message(buf: Bytes): void;
   getAllocation(): Allocation | null;
+  /**
+   * Live byte and packet counters for this allocation. Packet counts matter
+   * independently of bytes: 1 MB in one packet and 1 MB in 10,000 packets cost
+   * very different amounts of CPU, and the latter is a flood signature.
+   */
+  getBandwidth(): Bandwidth;
   enableAutoRefresh(): void;
   [key: string]: unknown;
 }
@@ -250,6 +408,8 @@ export interface SocketOptions {
   /** STUN retransmission base (ms) for UDP/DTLS; null/omit for reliable transports. */
   rto?: number | null;
   tcpTimeout?: number;
+  /** See `ServerOptions.hookTimeout`. Default 5000 ms. */
+  hookTimeout?: number;
 
   // TLS/DTLS client options
   servername?: string;

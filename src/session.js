@@ -49,6 +49,8 @@ function Session(options) {
     source: options.source || null,   // { ip, port, family }
     // { ip, port } — server listening address / RFC 5780 primary address
     localAddress: options.localAddress || null,
+    // 'udp' | 'tcp' | 'tls' | 'ws' | 'wss' | 'dtls' — surfaced in hook payloads
+    transportType: options.transportType || null,
 
     // server-side relay config
     relayIp: options.relayIp || null,
@@ -70,6 +72,12 @@ function Session(options) {
     // Bandwidth tracking (built-in counters)
     bytesIn: 0,
     bytesOut: 0,
+    packetsIn: 0,
+    packetsOut: 0,
+
+    // Deferred-hook budget. A hook that never calls cb would otherwise pin the
+    // request forever; fail closed once the budget is spent (see check_hook).
+    hookTimeout: options.hookTimeout || 5000,
 
     // allocation state (one per session / 5-tuple)
     allocation: null,
@@ -85,13 +93,59 @@ function Session(options) {
 
   /* ====================== Hook helper ====================== */
 
-  // Synchronous hook pattern. If no listener → default to allowed.
-  // Listener calls cb(true/false). Same pattern for all hooks.
-  function check_hook(name, info) {
+  // Hook pattern for everything except the two relay hot-path hooks. The
+  // listener calls cb(allowed, code?, reason?) either synchronously or
+  // asynchronously (a DB/Redis lookup is fine — nothing is sent until cb
+  // fires). If no listener is registered the action is auto-approved.
+  //
+  //   cb(true)                      — allow
+  //   cb(false)                     — deny, caller's default error code
+  //   cb(false, 486)                — deny with a specific code
+  //   cb(false, 486, 'Too many')    — deny with a code and reason phrase
+  //
+  // done(allowed, code, reason). A listener that never calls cb fails closed
+  // once context.hookTimeout elapses; a listener that calls cb synchronously
+  // never touches the timer or the event loop, so existing sync listeners keep
+  // their current behaviour and cost.
+  function check_hook(name, info, done) {
+    if (ev.listenerCount(name) === 0) return done(true, null, null);
+
+    var settled = false;
+    var timer = null;
+
+    function settle(allowed, code, reason) {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      done(!!allowed, code == null ? null : code, reason == null ? null : reason);
+    }
+
+    ev.emit(name, info, settle);
+
+    if (!settled) {
+      timer = setTimeout(function() { settle(false, null, null); }, context.hookTimeout);
+      if (timer.unref) timer.unref();
+    }
+  }
+
+  // Relay hot path only (beforeRelay / beforeData). Called once per packet, so
+  // it stays synchronous: a deferred decision here would reorder media and
+  // allocate a promise per datagram. Listeners must answer in the same tick.
+  function check_hook_sync(name, info) {
     if (ev.listenerCount(name) === 0) return true;
     var allowed = true;
     ev.emit(name, info, function(result) { allowed = !!result; });
     return allowed;
+  }
+
+  // Deny response for a hook rejection: honours an optional code/reason phrase
+  // supplied by the listener, otherwise falls back to the caller's default.
+  function send_hook_error(msg, code, reason, key, fallback) {
+    var final_code = code || fallback;
+    var attrs = [{ type: wire.ATTR.ERROR_CODE, value: reason
+      ? { code: final_code, reason: reason }
+      : { code: final_code } }];
+    send_error(msg, final_code, attrs, key);
   }
 
 
@@ -523,7 +577,7 @@ function Session(options) {
     // Hook: beforeRelay — client → peer via ChannelData. listenerCount guard
     // first so the info object isn't allocated per packet on the relay hot path.
     if (context.isServer && ev.listenerCount('beforeRelay') > 0) {
-      if (!check_hook('beforeRelay', {
+      if (!check_hook_sync('beforeRelay', {
         username: context.allocation ? context.allocation.username : null,
         source: context.source,
         peer: peer,
@@ -534,6 +588,7 @@ function Session(options) {
     }
 
     context.bytesOut += parsed.data.length;
+    context.packetsOut++;
     ev.emit('data', peer, parsed.data, parsed.channel);
   }
 
@@ -803,26 +858,28 @@ function Session(options) {
   function route_server_request(msg, key) {
     // Hook: authorize — called after auth, before executing any method
     var username = msg.getAttribute(wire.ATTR.USERNAME);
-    if (!check_hook('authorize', {
+    check_hook('authorize', {
       method: msg.method,
       methodName: wire.METHOD_NAME[msg.method] || null,
       username: username,
       source: context.source,
-    })) {
-      send_error(msg, 403, null, key); // Forbidden
-      return;
-    }
+    }, function(ok, code, reason) {
+      if (!ok) {
+        send_hook_error(msg, code, reason, key, 403); // Forbidden
+        return;
+      }
 
-    switch (msg.method) {
-      case wire.METHOD.BINDING:           handle_binding(msg); break;
-      case wire.METHOD.ALLOCATE:          handle_allocate(msg, key); break;
-      case wire.METHOD.REFRESH:           handle_refresh(msg, key); break;
-      case wire.METHOD.CREATE_PERMISSION: handle_create_permission(msg, key); break;
-      case wire.METHOD.CHANNEL_BIND:      handle_channel_bind(msg, key); break;
-      case wire.METHOD.CONNECT:           handle_connect(msg, key); break;
-      case wire.METHOD.CONNECTION_BIND:   handle_connection_bind(msg, key); break;
-      default: send_error(msg, 400, null, key); break;
-    }
+      switch (msg.method) {
+        case wire.METHOD.BINDING:           handle_binding(msg); break;
+        case wire.METHOD.ALLOCATE:          handle_allocate(msg, key); break;
+        case wire.METHOD.REFRESH:           handle_refresh(msg, key); break;
+        case wire.METHOD.CREATE_PERMISSION: handle_create_permission(msg, key); break;
+        case wire.METHOD.CHANNEL_BIND:      handle_channel_bind(msg, key); break;
+        case wire.METHOD.CONNECT:           handle_connect(msg, key); break;
+        case wire.METHOD.CONNECTION_BIND:   handle_connection_bind(msg, key); break;
+        default: send_error(msg, 400, null, key); break;
+      }
+    });
   }
 
 
@@ -831,29 +888,42 @@ function Session(options) {
   function handle_binding(msg) {
     if (context.source === null) { send_error(msg, 400, null, null); return; }
 
-    var response_attrs = [
-      { type: wire.ATTR.XOR_MAPPED_ADDRESS, value: context.source },
-    ];
+    // Hook: beforeBindingResponse — a Binding response is larger than the
+    // request that triggered it, and the source address of a UDP request is
+    // trivially spoofed, so an open Binding responder is a reflection
+    // amplifier. Rejecting drops the request silently: an error response is
+    // itself an amplified reply, so there is no code/reason to return here.
+    // Key the decision on a source prefix (/24, /56), not the exact address.
+    check_hook('beforeBindingResponse', {
+      source: context.source,
+      transport: context.transportType || null,
+    }, function(ok) {
+      if (!ok) return; // silent drop — never answer, not even an error
 
-    // RFC 5780 — RESPONSE-ORIGIN: address the response is sent from
-    if (context.localAddress) {
-      response_attrs.push({ type: wire.ATTR.RESPONSE_ORIGIN, value: context.localAddress });
-    }
+      var response_attrs = [
+        { type: wire.ATTR.XOR_MAPPED_ADDRESS, value: context.source },
+      ];
 
-    // RFC 5780 — OTHER-ADDRESS: the secondary address for NAT tests
-    if (context.secondaryAddress) {
-      response_attrs.push({ type: wire.ATTR.OTHER_ADDRESS, value: context.secondaryAddress });
-    }
+      // RFC 5780 — RESPONSE-ORIGIN: address the response is sent from
+      if (context.localAddress) {
+        response_attrs.push({ type: wire.ATTR.RESPONSE_ORIGIN, value: context.localAddress });
+      }
 
-    // RFC 5780 — CHANGE-REQUEST: client asks response from different IP/port
-    var change = msg.getAttribute(wire.ATTR.CHANGE_REQUEST);
-    if (change) {
-      // Emit 'change_request' — Socket layer must send the response from the alternate address
-      ev.emit('change_request', msg, change, response_attrs);
-      return; // Socket layer sends the response
-    }
+      // RFC 5780 — OTHER-ADDRESS: the secondary address for NAT tests
+      if (context.secondaryAddress) {
+        response_attrs.push({ type: wire.ATTR.OTHER_ADDRESS, value: context.secondaryAddress });
+      }
 
-    send_success(msg, response_attrs, null);
+      // RFC 5780 — CHANGE-REQUEST: client asks response from different IP/port
+      var change = msg.getAttribute(wire.ATTR.CHANGE_REQUEST);
+      if (change) {
+        // Emit 'change_request' — Socket layer must send the response from the alternate address
+        ev.emit('change_request', msg, change, response_attrs);
+        return; // Socket layer sends the response
+      }
+
+      send_success(msg, response_attrs, null);
+    });
   }
 
   function handle_allocate(msg, key) {
@@ -884,37 +954,60 @@ function Session(options) {
       return;
     }
 
-    // Quota check via synchronous event
+    // Quota event — same deferred contract as the hooks (sync or async).
     var username = msg.getAttribute(wire.ATTR.USERNAME);
-    if (ev.listenerCount('quota') > 0) {
-      var allowed = true;
-      ev.emit('quota', username, function(result) { allowed = result; });
-      if (!allowed) { send_error(msg, 486, null, key); return; }
+    check_quota(username, function(quota_ok, quota_code, quota_reason) {
+      if (!quota_ok) { send_hook_error(msg, quota_code, quota_reason, key, 486); return; }
+
+      var lifetime = msg.getAttribute(wire.ATTR.LIFETIME);
+      if (lifetime === null) lifetime = context.defaultAllocateLifetime;
+
+      // Hook: beforeAllocate — can inspect/modify allocation params or reject
+      var alloc_info = {
+        username: username,
+        source: context.source,
+        transport: transport,
+        lifetime: lifetime,
+        requestedFamily: requested_family,
+        evenPort: even_port,
+        reservationToken: reservation_token,
+        dontFragment: msg.getAttribute(wire.ATTR.DONT_FRAGMENT) || false,
+      };
+
+      check_hook('beforeAllocate', alloc_info, function(ok, code, reason) {
+        if (!ok) { send_hook_error(msg, code, reason, key, 403); return; }
+
+        // Hook may have modified lifetime
+        finish_allocate(msg, key, transport, alloc_info.lifetime, requested_family,
+                        even_port, reservation_token);
+      });
+    });
+  }
+
+  // Quota is an event rather than a check_hook (it takes a bare username, not
+  // an info object), but it follows the same deferred cb contract.
+  function check_quota(username, done) {
+    if (ev.listenerCount('quota') === 0) return done(true, null, null);
+
+    var settled = false;
+    var timer = null;
+
+    function settle(allowed, code, reason) {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      done(!!allowed, code == null ? null : code, reason == null ? null : reason);
     }
 
-    var lifetime = msg.getAttribute(wire.ATTR.LIFETIME);
-    if (lifetime === null) lifetime = context.defaultAllocateLifetime;
+    ev.emit('quota', username, settle);
 
-    // Hook: beforeAllocate — can inspect/modify allocation params or reject
-    var alloc_info = {
-      username: username,
-      source: context.source,
-      transport: transport,
-      lifetime: lifetime,
-      requestedFamily: requested_family,
-      evenPort: even_port,
-      reservationToken: reservation_token,
-      dontFragment: msg.getAttribute(wire.ATTR.DONT_FRAGMENT) || false,
-    };
-
-    if (!check_hook('beforeAllocate', alloc_info)) {
-      send_error(msg, 403, null, key);
-      return;
+    if (!settled) {
+      timer = setTimeout(function() { settle(false, null, null); }, context.hookTimeout);
+      if (timer.unref) timer.unref();
     }
+  }
 
-    // Hook may have modified lifetime
-    lifetime = alloc_info.lifetime;
-
+  function finish_allocate(msg, key, transport, lifetime, requested_family, even_port, reservation_token) {
     var alloc = create_allocation(msg, transport, lifetime);
 
     // Store flags for Socket layer
@@ -987,22 +1080,24 @@ function Session(options) {
       currentLifetime: context.allocation.lifetime,
     };
 
-    if (!check_hook('beforeRefresh', refresh_info)) {
-      send_error(msg, 403, null, key);
-      return;
-    }
+    check_hook('beforeRefresh', refresh_info, function(ok, code, reason) {
+      if (!ok) { send_hook_error(msg, code, reason, key, 403); return; }
 
-    // Hook may have modified lifetime
-    lifetime = refresh_info.lifetime;
+      // The allocation can expire while an async hook is pending.
+      if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
-    refresh_allocation(lifetime);
+      // Hook may have modified lifetime
+      var granted_lifetime = refresh_info.lifetime;
 
-    // lifetime=0 deallocates (context.allocation is now null) — respond 0.
-    // Otherwise respond with the granted (possibly clamped) lifetime.
-    var granted = (lifetime === 0 || !context.allocation) ? 0 : context.allocation.lifetime;
-    send_success(msg, [
-      { type: wire.ATTR.LIFETIME, value: granted },
-    ], key);
+      refresh_allocation(granted_lifetime);
+
+      // lifetime=0 deallocates (context.allocation is now null) — respond 0.
+      // Otherwise respond with the granted (possibly clamped) lifetime.
+      var granted = (granted_lifetime === 0 || !context.allocation) ? 0 : context.allocation.lifetime;
+      send_success(msg, [
+        { type: wire.ATTR.LIFETIME, value: granted },
+      ], key);
+    });
   }
 
   function handle_create_permission(msg, key) {
@@ -1016,21 +1111,29 @@ function Session(options) {
     }
     if (peers.length === 0) { send_error(msg, 400, null, key); return; }
 
-    // Hook: beforePermission — check each peer
-    for (var j = 0; j < peers.length; j++) {
-      if (!check_hook('beforePermission', {
-        username: context.allocation.username,
-        source: context.source,
-        peer: peers[j],
-      })) {
-        send_error(msg, 403, null, key);
+    // Hook: beforePermission — check each peer in turn. One rejection fails the
+    // whole request (RFC 8656 §9.2: CreatePermission is all-or-nothing), so the
+    // walk stops at the first denial and no permission is installed.
+    var j = 0;
+    (function next() {
+      if (j >= peers.length) {
+        // The allocation can expire while an async hook is pending.
+        if (context.allocation === null) { send_error(msg, 437, null, key); return; }
+        for (var k = 0; k < peers.length; k++) add_permission(peers[k].ip);
+        send_success(msg, [], key);
         return;
       }
-    }
 
-    for (var k = 0; k < peers.length; k++) add_permission(peers[k].ip);
-
-    send_success(msg, [], key);
+      var peer = peers[j++];
+      check_hook('beforePermission', {
+        username: context.allocation.username,
+        source: context.source,
+        peer: peer,
+      }, function(ok, code, reason) {
+        if (!ok) { send_hook_error(msg, code, reason, key, 403); return; }
+        next();
+      });
+    })();
   }
 
   function handle_channel_bind(msg, key) {
@@ -1045,20 +1148,22 @@ function Session(options) {
     if (channel_number < 0x4000 || channel_number > 0x4FFF) { send_error(msg, 400, null, key); return; }
 
     // Hook: beforeChannelBind
-    if (!check_hook('beforeChannelBind', {
+    check_hook('beforeChannelBind', {
       username: context.allocation.username,
       source: context.source,
       channel: channel_number,
       peer: peer,
-    })) {
-      send_error(msg, 403, null, key);
-      return;
-    }
+    }, function(allowed, code, reason) {
+      if (!allowed) { send_hook_error(msg, code, reason, key, 403); return; }
 
-    var ok = bind_channel(channel_number, peer);
-    if (!ok) { send_error(msg, 400, null, key); return; }
+      // The allocation can expire while an async hook is pending.
+      if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
-    send_success(msg, [], key);
+      var ok = bind_channel(channel_number, peer);
+      if (!ok) { send_error(msg, 400, null, key); return; }
+
+      send_success(msg, [], key);
+    });
   }
 
   function handle_send_indication(msg) {
@@ -1069,7 +1174,7 @@ function Session(options) {
     if (!has_permission(peer.ip)) return;
 
     // Hook: beforeRelay — client → peer direction. listenerCount guard first.
-    if (ev.listenerCount('beforeRelay') > 0 && !check_hook('beforeRelay', {
+    if (ev.listenerCount('beforeRelay') > 0 && !check_hook_sync('beforeRelay', {
       username: context.allocation.username,
       source: context.source,
       peer: peer,
@@ -1078,6 +1183,7 @@ function Session(options) {
     })) return; // silent drop
 
     context.bytesOut += data.length;
+    context.packetsOut++;
     ev.emit('relay', peer, data);
   }
 
@@ -1108,42 +1214,44 @@ function Session(options) {
     }
 
     // Hook: beforeConnect
-    if (!check_hook('beforeConnect', {
+    check_hook('beforeConnect', {
       username: context.allocation.username,
       source: context.source,
       peer: peer,
-    })) {
-      send_error(msg, 403, null, key);
-      return;
-    }
+    }, function(allowed, code, reason) {
+      if (!allowed) { send_hook_error(msg, code, reason, key, 403); return; }
 
-    // Assign connection ID
-    var connectionId = context.nextConnectionId++;
+      // The allocation can expire while an async hook is pending.
+      if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
-    context.tcpConnections[connectionId] = {
-      peer: peer,
-      state: 'pending',
-    };
+      // Assign connection ID
+      var connectionId = context.nextConnectionId++;
 
-    // Emit 'connect_peer' — Socket layer opens the actual TCP connection
-    ev.emit('connect_peer', connectionId, peer, function(err) {
-      if (err) {
-        delete context.tcpConnections[connectionId];
-        send_error(msg, 447, null, key); // Connection Timeout or Failure
-        return;
-      }
+      context.tcpConnections[connectionId] = {
+        peer: peer,
+        state: 'pending',
+      };
 
-      context.tcpConnections[connectionId].state = 'established';
+      // Emit 'connect_peer' — Socket layer opens the actual TCP connection
+      ev.emit('connect_peer', connectionId, peer, function(err) {
+        if (err) {
+          delete context.tcpConnections[connectionId];
+          send_error(msg, 447, null, key); // Connection Timeout or Failure
+          return;
+        }
 
-      send_success(msg, [
-        { type: wire.ATTR.CONNECTION_ID, value: connectionId },
-      ], key);
+        context.tcpConnections[connectionId].state = 'established';
 
-      // Send ConnectionAttempt indication to client
-      send_indication(wire.METHOD.CONNECTION_ATTEMPT, [
-        { type: wire.ATTR.XOR_PEER_ADDRESS, value: peer },
-        { type: wire.ATTR.CONNECTION_ID, value: connectionId },
-      ]);
+        send_success(msg, [
+          { type: wire.ATTR.CONNECTION_ID, value: connectionId },
+        ], key);
+
+        // Send ConnectionAttempt indication to client
+        send_indication(wire.METHOD.CONNECTION_ATTEMPT, [
+          { type: wire.ATTR.XOR_PEER_ADDRESS, value: peer },
+          { type: wire.ATTR.CONNECTION_ID, value: connectionId },
+        ]);
+      });
     });
   }
 
@@ -1626,7 +1734,14 @@ function Session(options) {
     getPeerByChannel: get_peer_by_channel,
     getChannelByPeer: function(ip, port) { return get_channel_by_peer(ip, port); },
     getAllocation: function() { return context.allocation; },
-    getBandwidth: function() { return { bytesIn: context.bytesIn, bytesOut: context.bytesOut }; },
+    getBandwidth: function() {
+      return {
+        bytesIn: context.bytesIn,
+        bytesOut: context.bytesOut,
+        packetsIn: context.packetsIn,
+        packetsOut: context.packetsOut,
+      };
+    },
 
     /** Send 300 Try Alternate to redirect client */
     redirect: function(msg, alternateServer) { send_redirect(msg, alternateServer); },

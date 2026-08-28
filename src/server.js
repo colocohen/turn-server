@@ -124,6 +124,18 @@ function Server(options) {
     // UDP idle timeout — remove 5-tuple entry after N ms of no traffic (default 5 min)
     idleTimeout: options.idleTimeout !== undefined ? options.idleTimeout : 300000,
 
+    // Budget for a hook that defers its decision (DB/Redis lookup). A hook that
+    // never calls cb would otherwise pin the connection forever, so the
+    // decision falls back to deny once this elapses. Also passed to each
+    // client Socket → Session so every hook shares one budget.
+    hookTimeout: options.hookTimeout || 5000,
+
+    // 5-tuples with an accept hook still pending. Further datagrams from the
+    // same 5-tuple are dropped while it sits here rather than queued: the
+    // client's STUN retransmission will re-deliver once the decision lands,
+    // and queuing would let a spoofed source grow our heap for free.
+    pendingAccepts: {},
+
     // Graceful shutdown
     draining: false,
 
@@ -221,7 +233,7 @@ function Server(options) {
 
   /* ====================== Socket factory ====================== */
 
-  function create_client_socket(source, send_fn, localAddress) {
+  function create_client_socket(source, send_fn, localAddress, transport) {
     // realmCallback: resolve per-client config
     // Can return string (realm only) or object { realm, mechanism, credentials, secret }
     var realm = context.realm;
@@ -264,6 +276,8 @@ function Server(options) {
       allowLoopback: context.allowLoopback,
       allowMulticast: context.allowMulticast,
       localAddress: localAddress || null,
+      transportType: transport || null,
+      hookTimeout: context.hookTimeout,
     });
 
     // Forward hooks from Session → Server EventEmitter
@@ -277,6 +291,11 @@ function Server(options) {
 
     session.on('authorize', function(info, cb) {
       if (ev.listenerCount('authorize') > 0) ev.emit('authorize', info, cb);
+      else cb(true);
+    });
+
+    session.on('beforeBindingResponse', function(info, cb) {
+      if (ev.listenerCount('beforeBindingResponse') > 0) ev.emit('beforeBindingResponse', info, cb);
       else cb(true);
     });
 
@@ -356,7 +375,7 @@ function Server(options) {
     // totalQuota: global allocation limit
     if (context.totalQuota > 0) {
       sess.on('beforeAllocate', function(info, cb) {
-        if (context.stats.activeAllocations >= context.totalQuota) { cb(false); return; }
+        if (context.stats.activeAllocations >= context.totalQuota) { cb(false, 486); return; }
         if (ev.listenerCount('beforeAllocate') > 0) ev.emit('beforeAllocate', info, cb);
         else cb(true);
       });
@@ -385,7 +404,7 @@ function Server(options) {
     sess.on('beforePermission', function(info, cb) {
       if (context.maxPermissionsPerAllocation > 0) {
         var alloc = sess.getAllocation();
-        if (alloc && Object.keys(alloc.permissions).length >= context.maxPermissionsPerAllocation) { cb(false); return; }
+        if (alloc && Object.keys(alloc.permissions).length >= context.maxPermissionsPerAllocation) { cb(false, 508); return; }
       }
       if (ev.listenerCount('beforePermission') > 0) ev.emit('beforePermission', info, cb);
       else cb(true);
@@ -394,7 +413,7 @@ function Server(options) {
     sess.on('beforeChannelBind', function(info, cb) {
       if (context.maxChannelsPerAllocation > 0) {
         var alloc = sess.getAllocation();
-        if (alloc && Object.keys(alloc.channels).length >= context.maxChannelsPerAllocation) { cb(false); return; }
+        if (alloc && Object.keys(alloc.channels).length >= context.maxChannelsPerAllocation) { cb(false, 508); return; }
       }
       if (ev.listenerCount('beforeChannelBind') > 0) ev.emit('beforeChannelBind', info, cb);
       else cb(true);
@@ -427,11 +446,29 @@ function Server(options) {
 
   /* ====================== Hook helper ====================== */
 
-  function check_hook(name, info) {
-    if (ev.listenerCount(name) === 0) return true;
-    var allowed = true;
-    ev.emit(name, info, function(result) { allowed = !!result; });
-    return allowed;
+  // Listener calls cb(allowed) synchronously or asynchronously; nothing
+  // proceeds until it fires. No listener → auto-approve, with no allocation
+  // and no trip through the event loop. A listener that never answers fails
+  // closed once context.hookTimeout elapses.
+  function check_hook(name, info, done) {
+    if (ev.listenerCount(name) === 0) return done(true);
+
+    var settled = false;
+    var timer = null;
+
+    function settle(allowed) {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      done(!!allowed);
+    }
+
+    ev.emit(name, info, settle);
+
+    if (!settled) {
+      timer = setTimeout(function() { settle(false); }, context.hookTimeout);
+      if (timer.unref) timer.unref();
+    }
   }
 
 
@@ -452,30 +489,48 @@ function Server(options) {
       if (context.draining) return;
       // Built-in maxConnections check
       if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) return;
-      // Hook: accept
-      if (!check_hook('accept', { source: src, transport: 'udp' })) return;
+      // A decision for this 5-tuple is already in flight — drop, don't queue.
+      if (context.pendingAccepts[key]) return;
 
       // Capture rinfo values in closure — locked to this 5-tuple client.
       var dst_port = rinfo.port;
       var dst_ip   = rinfo.address;
 
-      client = create_client_socket(src, function(buf) {
-        // HOT PATH: zero-copy Buffer view. buf is Uint8Array from
-        // wire.encode_message — Buffer.from(u.buffer, offset, len) creates
-        // a view over the same memory rather than copying ~1200 bytes.
-        var out = wire.to_buffer(buf);
-        send_fn(out, dst_port, dst_ip);
-      }, local_addr);
+      context.pendingAccepts[key] = true;
 
-      context.clients[key] = client;
-      client._idleTimer = setup_idle_timeout(key);
-      client._idleKey = key;
+      // Hook: accept
+      check_hook('accept', { source: src, transport: 'udp' }, function(ok) {
+        delete context.pendingAccepts[key];
+        if (!ok) return;
+        // State can move underneath a deferred hook: the server may have been
+        // destroyed or put into drain, or another packet may have won the race.
+        if (context.destroyed || context.draining) return;
+        if (context.clients[key]) return;
 
-      client.on('close', function() {
-        if (client._idleTimer) clearTimeout(client._idleTimer);
-        delete context.clients[key];
+        var c = create_client_socket(src, function(buf) {
+          // HOT PATH: zero-copy Buffer view. buf is Uint8Array from
+          // wire.encode_message — Buffer.from(u.buffer, offset, len) creates
+          // a view over the same memory rather than copying ~1200 bytes.
+          var out = wire.to_buffer(buf);
+          send_fn(out, dst_port, dst_ip);
+        }, local_addr, 'udp');
+
+        context.clients[key] = c;
+        c._idleTimer = setup_idle_timeout(key);
+        c._idleKey = key;
+
+        c.on('close', function() {
+          if (c._idleTimer) clearTimeout(c._idleTimer);
+          delete context.clients[key];
+        });
+
+        c.feed(msg);
       });
-    } else if (client._idleTimer) {
+
+      return;
+    }
+
+    if (client._idleTimer) {
       // Refresh idle timer without re-allocating the timer object.
       // timer.refresh() is available since Node 10 — re-arms the existing
       // handle, saving a syscall pair per packet.
@@ -560,12 +615,23 @@ function Server(options) {
 
       var src = { ip: conn.remoteAddress, port: conn.remotePort };
 
-      // Hook: accept
-      if (!check_hook('accept', { source: src, transport: 'tcp' })) {
-        conn.destroy();
-        return;
-      }
+      // Hook: accept. Nothing is read off the socket until the decision lands —
+      // the stream stays paused (no 'data' listener yet) so the kernel and the
+      // stream's own high-water mark apply backpressure instead of our heap.
+      conn.pause();
+      check_hook('accept', { source: src, transport: 'tcp' }, function(ok) {
+        if (!ok || context.destroyed || context.draining) {
+          conn.destroy();
+          return;
+        }
+        if (conn.destroyed) return; // peer hung up while the hook was pending
 
+        setup_tcp_connection(conn, src);
+        conn.resume();
+      });
+    });
+
+    function setup_tcp_connection(conn, src) {
       var tcp_buf = Buffer.alloc(0);
 
       var client = create_client_socket(src, function(buf) {
@@ -575,7 +641,7 @@ function Server(options) {
         if (conn.destroyed) return;
         var out = wire.to_buffer(buf);
         conn.write(out);
-      }, { ip: conn.localAddress, port: conn.localPort });
+      }, { ip: conn.localAddress, port: conn.localPort }, 'tcp');
 
       // Store by connection reference
       var key = 'tcp:' + src.ip + ':' + src.port;
@@ -604,7 +670,7 @@ function Server(options) {
         client.close();
         delete context.clients[key];
       });
-    });
+    }
 
     tcp.on('error', function(err) {
       err.transport = 'tcp'; err.port = port; err.address = address;
@@ -658,12 +724,23 @@ function Server(options) {
 
       var src = { ip: conn.remoteAddress, port: conn.remotePort };
 
-      // Hook: accept
-      if (!check_hook('accept', { source: src, transport: 'tls' })) {
-        conn.destroy();
-        return;
-      }
+      // Hook: accept. Same pause-until-decided contract as the plain TCP
+      // listener: no 'data' listener is attached yet, so the stream buffers
+      // behind its high-water mark rather than on our heap.
+      conn.pause();
+      check_hook('accept', { source: src, transport: 'tls' }, function(ok) {
+        if (!ok || context.destroyed || context.draining) {
+          conn.destroy();
+          return;
+        }
+        if (conn.destroyed) return; // peer hung up while the hook was pending
 
+        setup_tls_connection(conn, src);
+        conn.resume();
+      });
+    });
+
+    function setup_tls_connection(conn, src) {
       var tcp_buf = Buffer.alloc(0);
 
       var client = create_client_socket(src, function(buf) {
@@ -671,7 +748,7 @@ function Server(options) {
         if (conn.destroyed) return;
         var out = wire.to_buffer(buf);
         conn.write(out);
-      }, { ip: conn.localAddress, port: conn.localPort });
+      }, { ip: conn.localAddress, port: conn.localPort }, 'tls');
 
       var key = 'tls:' + src.ip + ':' + src.port;
       context.clients[key] = client;
@@ -697,7 +774,7 @@ function Server(options) {
         client.close();
         delete context.clients[key];
       });
-    });
+    }
 
     tls_server.on('error', function(err) {
       err.transport = 'tls'; err.port = port; err.address = address;
@@ -741,12 +818,39 @@ function Server(options) {
       src.port = ws._socket.remotePort || 0;
     }
 
-    // Hook: accept
-    if (!check_hook('accept', { source: src, transport: 'ws' })) {
-      try { ws.close(); } catch(e) {}
-      return;
-    }
+    // Hook: accept. A WebSocket carries STUN over a reliable transport, where
+    // there is no per-request retransmission to re-deliver a dropped frame —
+    // the client would simply stall until Ti (39.5s). So frames arriving while
+    // the decision is pending are held, not dropped. The source cannot be
+    // spoofed (the TCP handshake already completed), and the buffer is capped,
+    // so this cannot be used to grow our heap. Any BYO WebSocket works: the
+    // listener is attached immediately rather than relying on pause/resume.
+    var ws_pending = [];
+    var ws_client = null;
+    var WS_PENDING_MAX = 32;
 
+    ws.on('message', function(msg) {
+      if (context.destroyed) return;
+      // HOT PATH: msg is usually a Buffer from ws; if it's ArrayBuffer
+      // (browser-style), wrap once — no way to avoid here.
+      var data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : msg;
+      if (ws_client === null) {
+        if (ws_pending !== null && ws_pending.length < WS_PENDING_MAX) ws_pending.push(data);
+        return;
+      }
+      ws_client.feed(data);
+    });
+
+    check_hook('accept', { source: src, transport: 'ws' }, function(ok) {
+      if (!ok || context.destroyed || context.draining) {
+        ws_pending = null;
+        try { ws.close(); } catch(e) {}
+        return;
+      }
+      setup_ws_connection();
+    });
+
+    function setup_ws_connection() {
     var client = create_client_socket(src, function(buf) {
       try {
         if (ws.readyState === 1) { // OPEN
@@ -756,18 +860,10 @@ function Server(options) {
           ws.send(out);
         }
       } catch(e) {}
-    });
+    }, null, 'ws');
 
     var key = 'ws:' + src.ip + ':' + src.port + ':' + Date.now();
     context.clients[key] = client;
-
-    ws.on('message', function(msg) {
-      if (context.destroyed) return;
-      // HOT PATH: msg is usually a Buffer from ws; if it's ArrayBuffer
-      // (browser-style), wrap once — no way to avoid here.
-      var data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : msg;
-      client.feed(data);
-    });
 
     ws.on('error', function(err) { ev.emit('error', err); });
 
@@ -775,6 +871,13 @@ function Server(options) {
       client.close();
       delete context.clients[key];
     });
+
+    // Route live frames to the session, then flush anything held during the hook.
+    ws_client = client;
+    var held = ws_pending;
+    ws_pending = null;
+    if (held) for (var i = 0; i < held.length; i++) client.feed(held[i]);
+    }
   }
 
 
@@ -911,26 +1014,45 @@ function Server(options) {
         }
 
         var src = { ip: dsock.remoteAddress, port: dsock.remotePort };
-        if (!check_hook('accept', { source: src, transport: 'dtls' })) {
-          try { dsock.close(); } catch (e) {}
-          return;
-        }
 
+        // Hook: accept. The DTLS handshake (and its HelloVerifyRequest cookie)
+        // has already completed here, so the source is verified and records
+        // arriving during the decision are held rather than dropped — DTLS does
+        // not retransmit application data, only handshake flights.
+        var d_pending = [];
+        var d_client = null;
+        var D_PENDING_MAX = 32;
+
+        dsock.on('data', function(d) {
+          if (context.destroyed) return;
+          var data = (d instanceof ArrayBuffer) ? new Uint8Array(d) : d;
+          if (d_client === null) {
+            if (d_pending !== null && d_pending.length < D_PENDING_MAX) d_pending.push(data);
+            return;
+          }
+          d_client.feed(data);
+        });
+
+        check_hook('accept', { source: src, transport: 'dtls' }, function(ok) {
+          if (!ok || context.destroyed || context.draining) {
+            d_pending = null;
+            try { dsock.close(); } catch (e) {}
+            return;
+          }
+          setup_dtls_connection();
+        });
+
+        function setup_dtls_connection() {
         var client = create_client_socket(src, function(buf) {
           // One STUN/ChannelData message per DTLS datagram (no framing).
           try {
             var out = wire.to_buffer(buf);
             dsock.send(out);
           } catch (e) {}
-        }, localAddr);
+        }, localAddr, 'dtls');
 
         var key2 = 'dtls:' + src.ip + ':' + src.port;
         context.clients[key2] = client;
-
-        dsock.on('data', function(d) {
-          if (context.destroyed) return;
-          client.feed(d instanceof ArrayBuffer ? new Uint8Array(d) : d);
-        });
 
         dsock.on('error', function(e) { ev.emit('error', e); });
 
@@ -938,6 +1060,13 @@ function Server(options) {
           client.close();
           delete context.clients[key2];
         });
+
+        // Route live records to the session, then flush anything held.
+        d_client = client;
+        var held = d_pending;
+        d_pending = null;
+        if (held) for (var i = 0; i < held.length; i++) client.feed(held[i]);
+        }
       });
 
       dtlsServer.on('clientError', function(e) { ev.emit('error', e); });
@@ -1162,9 +1291,27 @@ function Server(options) {
     if (!entry) {
       if (context.draining) return;
       if (context.maxConnections > 0 && context.stats.activeConnections >= context.maxConnections) return;
-      if (!check_hook('accept', { source: { ip: rinfo.address, port: rinfo.port }, transport: 'dtls' })) return;
-      entry = createDtlsConn(key, rinfo, sock, localAddr);
-      if (!entry) return;
+      // A decision for this 5-tuple is already in flight — drop, don't queue.
+      // Unlike the dedicated-port DTLS listener, this hook fires on the first
+      // datagram, before any handshake, so the source is still spoofable and
+      // buffering would be a free way to grow our heap. DTLS retransmits its
+      // ClientHello, so the client recovers once the decision lands.
+      if (context.pendingAccepts[key]) return;
+      context.pendingAccepts[key] = true;
+
+      check_hook('accept', { source: { ip: rinfo.address, port: rinfo.port }, transport: 'dtls' }, function(ok) {
+        delete context.pendingAccepts[key];
+        if (!ok) return;
+        if (context.destroyed || context.draining) return;
+        if (context.dtlsConns[key]) return; // another datagram won the race
+
+        var e2 = createDtlsConn(key, rinfo, sock, localAddr);
+        if (!e2) return;
+        if (e2.idle && typeof e2.idle.refresh === 'function') e2.idle.refresh();
+        e2.session.feedDatagram(msg);
+      });
+
+      return;
     }
 
     if (entry.idle && typeof entry.idle.refresh === 'function') entry.idle.refresh();
@@ -1228,7 +1375,7 @@ function Server(options) {
       if (entry.client || context.destroyed) return;
       var client = create_client_socket({ ip: dst_ip, port: dst_port }, function(buf) {
         try { session.send(buf); } catch (e) {}
-      }, localAddr);
+      }, localAddr, 'dtls');
       entry.client = client;
       context.clients[key] = client;
       client.on('close', function() { delete context.clients[key]; });

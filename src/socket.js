@@ -73,6 +73,10 @@ function Socket(options) {
       password: options.password || null,
       source: options.source || null,
       localAddress: options.localAddress || null,
+      // Carried into hook payloads (beforeBindingResponse) so they can report
+      // the same transport label the accept hook sees.
+      transportType: options.transportType || null,
+      hookTimeout: options.hookTimeout,
       relayIp: options.relayIp || null,
       externalIp: options.externalIp || null,
       portRange: options.portRange || [49152, 65535],
@@ -470,7 +474,11 @@ function Socket(options) {
   /* ====================== Server-side: Relay data between client and peers ====================== */
 
   // Synchronous hook — same pattern as Session
-  function check_hook(name, info) {
+  // Relay hot path only (beforeData). Called once per inbound packet, so it
+  // stays synchronous — a deferred decision here would reorder media and
+  // allocate per datagram. Listeners must answer in the same tick. Every other
+  // hook goes through Session's async check_hook.
+  function check_hook_sync(name, info) {
     if (ev.listenerCount(name) === 0) return true;
     var allowed = true;
     ev.emit(name, info, function(result) { allowed = !!result; });
@@ -518,7 +526,7 @@ function Socket(options) {
       // Hook: beforeData — peer → client direction. Short-circuit on
       // listenerCount FIRST so the info object isn't allocated per packet when
       // no hook is registered (this is the relay hot path).
-      if (ev.listenerCount('beforeData') > 0 && !check_hook('beforeData', {
+      if (ev.listenerCount('beforeData') > 0 && !check_hook_sync('beforeData', {
         peer: from,
         source: session.context.source,
         username: session.getAllocation() ? session.getAllocation().username : null,
@@ -528,6 +536,7 @@ function Socket(options) {
 
       // Bandwidth tracking
       session.context.bytesIn += data.length;
+      session.context.packetsIn++;
 
       // Check if there's a channel binding for this peer
       var channel = session.getChannelByPeer(from.ip, from.port);
