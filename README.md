@@ -121,6 +121,7 @@ const server = createServer({
   totalQuota: 5000,
   maxDataSize: 65535,
   idleTimeout: 300000,             // 5 min - clean up dead UDP clients
+  hookTimeout: 5000,               // budget for a hook that defers its decision
 });
 
 // Dynamic auth via hook (database lookup, etc.)
@@ -275,7 +276,10 @@ transparent to the protocol layer.
 - Origin consistency checking
 
 ### Server - Production Features
-- Built-in convenience limits: `maxConnections` (enforced on **every** transport: UDP, TCP, TLS, WebSocket, DTLS), `userQuota`, `totalQuota`, `maxDataSize`, `maxPermissionsPerAllocation`, `maxChannelsPerAllocation`
+- Built-in convenience limits: `maxConnections` (enforced on **every** transport: UDP, TCP, TLS, WebSocket, DTLS), `userQuota`, `totalQuota`, `maxDataSize`, `maxPermissionsPerAllocation`, `maxChannelsPerAllocation` - each answering the RFC error code the client actually needs (486 / 508), not a blanket 403
+- Async hooks - every admission decision (`accept`, `authorize`, `beforeAllocate`, `beforeRefresh`, `beforePermission`, `beforeChannelBind`, `beforeConnect`, `beforeBindingResponse`) can await a database or Redis lookup; only the two per-packet relay hooks stay synchronous. A hook that never answers fails closed on a configurable `hookTimeout`
+- `beforeBindingResponse` hook - gate every STUN Binding reply to close the reflection/amplification vector, keyed on a source prefix
+- Per-allocation packet counters (`packetsIn` / `packetsOut`) alongside bytes, via `getBandwidth()`
 - UDP idle timeout - automatically removes dead 5-tuple entries (default 5 min)
 - Graceful shutdown - `drain(timeout, cb)` stops new connections on all transports, waits for existing
 - Statistics - `getStats()` returns 7 real-time counters, including a live `authFailures` count
@@ -521,7 +525,16 @@ connect('turn:my-turn.example.com:3478', { username: 'u', password: 'p' }, (err,
 
 ## 🪝 Hooks API
 
-Every decision point in the server is exposed as a hook. Hooks receive an info object and a callback - `cb(true)` to allow, `cb(false)` to deny. If no listener is attached, the action is auto-approved.
+Every decision point in the server is exposed as a hook. Hooks receive an info object and a callback. If no listener is attached, the action is auto-approved.
+
+```js
+cb(true)                          // allow
+cb(false)                         // deny with the hook's default error code
+cb(false, 486)                    // deny with a specific code
+cb(false, 508, 'No capacity')     // deny with a code and a reason phrase
+```
+
+**Almost every hook may answer asynchronously.** Nothing is sent and no state changes until `cb` fires, so a database or Redis lookup inside a listener is safe:
 
 ```js
 server.on('accept', (info, cb) => {
@@ -529,22 +542,81 @@ server.on('accept', (info, cb) => {
   cb(isAllowed(info.source.ip));
 });
 
-server.on('authenticate', (username, realm, cb) => {
-  // Return HMAC key from database
-  db.getKey(username, realm).then(key => cb(key));
-});
-
-server.on('beforeAllocate', (info, cb) => {
-  // info: { username, source, transport, lifetime }
-  // Modify lifetime: info.lifetime = 300;
+server.on('beforeAllocate', async (info, cb) => {
+  // info: { username, source, transport, lifetime, ... }
+  const count = await db.countAllocations(info.username);
+  if (count >= 5) return cb(false, 486, 'Per-user allocation quota exceeded');
+  info.lifetime = 300;              // hooks may also modify the lifetime
   cb(true);
 });
+```
 
+The two exceptions are the **relay hot path** - `beforeRelay` and `beforeData` run once per relayed packet, so they must answer in the same tick:
+
+```js
 server.on('beforeRelay', (info, cb) => {
-  // info: { username, source, peer, size, direction: 'inbound'|'outbound' }
-  cb(info.size < 65535);  // drop oversized packets
+  cb(bucket.take(info.username));   // in-memory only — never await here
 });
 ```
+
+That split is deliberate. A busy relay moves tens of thousands of packets per second; a round trip to Redis per packet is not merely slow, it is arithmetically impossible on one event loop. Keep per-packet state in memory (a local token bucket, a `Map`, or a `SharedArrayBuffer` with `Atomics` if you shard across `worker_threads`) and reserve async lookups for the rare decisions: `accept`, `authenticate`, `beforeAllocate`.
+
+### Timeouts and failure mode
+
+A listener that never calls `cb` would otherwise pin the request forever, so the decision **fails closed** once `hookTimeout` elapses:
+
+```js
+createServer({ hookTimeout: 5000 });   // default 5000 ms
+```
+
+A listener that answers synchronously never touches the timer or the event loop, so existing synchronous listeners keep their current behaviour and cost. Upgrading to async requires no code change on your side.
+
+### What happens to traffic while a hook is pending
+
+`accept` gates a connection before it exists, so each transport has to decide what to do with bytes that arrive during the decision:
+
+| Transport | Behaviour | Why |
+|---|---|---|
+| UDP | dropped | The source is spoofable at this point, so queuing would let an attacker grow the heap for free. STUN retransmits, so a legitimate client recovers. |
+| DTLS (shared socket) | dropped | Same - the hook fires on the first datagram, before any handshake. DTLS retransmits its ClientHello. |
+| TCP / TLS | held | The stream is paused until the decision lands; the kernel and the stream's high-water mark apply backpressure. No bytes are lost. |
+| WebSocket / DTLS (dedicated port) | held (max 32 frames) | The handshake already completed, so the source is verified - and STUN over a reliable transport has no per-request retransmission, so a dropped frame would stall the client until Ti (39.5s). |
+
+A burst from one UDP 5-tuple triggers the `accept` hook **once**, not once per packet.
+
+### Rejection codes
+
+Passing a code lets you return the error the client actually needs, instead of a blanket 403:
+
+| Hook | Default | Also useful |
+|---|---|---|
+| `authorize` | 403 Forbidden | - |
+| `beforeAllocate` | 403 Forbidden | 486 Allocation Quota Reached, 508 Insufficient Capacity |
+| `beforeRefresh` | 403 Forbidden | 437 Allocation Mismatch, 508 Insufficient Capacity |
+| `beforePermission` | 403 Forbidden | 508 Insufficient Capacity |
+| `beforeChannelBind` | 403 Forbidden | 400 Bad Request, 441 Wrong Credentials |
+| `beforeConnect` | 403 Forbidden | 446 Connection Already Exists, 447 Connection Timeout or Failure |
+| `quota` | 486 Allocation Quota Reached | 508 Insufficient Capacity |
+| `accept`, `beforeBindingResponse` | silent drop | n/a - no response is sent, so a code would have nowhere to go |
+| `beforeRelay`, `beforeData` | silent drop | n/a |
+
+The built-in limits use these too: `totalQuota` and `userQuota` now answer 486, and `maxPermissionsPerAllocation` / `maxChannelsPerAllocation` answer 508.
+
+### `beforeBindingResponse` - closing the amplification vector
+
+A Binding response is larger than the request that triggered it, and the source address of a UDP request is trivially spoofed. An open Binding responder is therefore a reflection amplifier: an attacker sends ~20 bytes with the victim's address and the server sends ~40 bytes to the victim.
+
+This hook fires before the response is generated. Rejecting sends **nothing at all** - not even an error, since an error response is itself an amplified reply:
+
+```js
+server.on('beforeBindingResponse', (info, cb) => {
+  // Key on a source PREFIX, not the exact address: the source is spoofed,
+  // so blocking a single IP achieves nothing.
+  cb(bindingBucket.take(prefix(info.source.ip)));   // /24 for IPv4, /56 for IPv6
+});
+```
+
+`accept` also fires per UDP 5-tuple, but only once; this hook runs before every response.
 
 ### The `authenticate` hook - sync or async, one contract
 
@@ -574,26 +646,81 @@ server.on('auth:failure', (socket, { username, code, reason }) => {
 });
 ```
 
-All 14 hooks:
+All 15 hooks:
 
-| Hook | When | Info |
-|------|------|------|
-| `accept` | New connection | source, transport |
-| `authenticate` | Long-term **and** short-term auth | username, realm → cb(passwordOrKey) or cb(err, passwordOrKey); sync **or** async |
-| `authenticate_oauth` | OAuth auth | token, realm → cb(err, key) |
-| `authorize` | After auth | username, method |
-| `quota` | Before allocate | username → cb(allowed) |
-| `beforeAllocate` | Allocate request | username, transport, lifetime |
-| `beforeRefresh` | Refresh request | username, lifetime |
-| `beforePermission` | Permission request | username, peer |
-| `beforeChannelBind` | Channel bind | username, channel, peer |
-| `beforeConnect` | TCP connect (6062) | username, peer |
-| `beforeRelay` | Data relay (out) | username, peer, size |
-| `beforeData` | Data relay (in) | peer, size |
-| `onRelayed` | After relay | direction, peer, size |
-| `redirect` | Client got 300 | server, domain |
+| Hook | When | Async? | Info |
+|------|------|:---:|------|
+| `accept` | New connection / UDP 5-tuple | ✅ | source, transport |
+| `beforeBindingResponse` | Before answering a STUN Binding | ✅ | source, transport |
+| `authenticate` | Long-term **and** short-term auth | ✅ | username, realm → cb(passwordOrKey) or cb(err, passwordOrKey) |
+| `authenticate_oauth` | OAuth auth | ✅ | token, realm → cb(err, key) |
+| `authorize` | After auth, before the method runs | ✅ | method, methodName, username, source |
+| `quota` | Before allocate | ✅ | username → cb(allowed) |
+| `beforeAllocate` | Allocate request | ✅ | username, source, transport, lifetime, requestedFamily, evenPort, reservationToken, dontFragment |
+| `beforeRefresh` | Refresh request | ✅ | username, source, lifetime, currentLifetime |
+| `beforePermission` | Permission request (once **per peer**) | ✅ | username, source, peer |
+| `beforeChannelBind` | Channel bind | ✅ | username, source, channel, peer |
+| `beforeConnect` | TCP connect (6062) | ✅ | username, source, peer |
+| `beforeRelay` | Data relay (out) - **hot path** | ❌ sync | username, source, peer, size, direction, channel |
+| `beforeData` | Data relay (in) - **hot path** | ❌ sync | peer, source, username, size, direction |
+| `onRelayed` | After relay (notification) | n/a | direction, peer, size |
+| `redirect` | Client got 300 | n/a | server, domain |
+
+`beforePermission` fires once for each peer in a CreatePermission request and the walk stops at the first rejection - CreatePermission is all-or-nothing (RFC 8656 §9.2), so no permission is installed if any peer is denied.
 
 Hooks and built-in limits work together - built-in checks run first, then your hook is called. Set a limit to `0` (default) to disable the built-in check and handle it entirely in your hook.
+
+### Rate limiting
+
+The library ships hooks, not policy: thresholds, keying and the bucket itself stay in your application. The three protocols fail in different ways, so they want different keys:
+
+- **TURN is a resource-over-time problem.** An allocation holds a relay port and moves bytes for its whole lifetime. Key on `username`, decide at `beforeAllocate`, and count what actually flows with `getBandwidth()`.
+- **STUN is an amplification vector.** The source address is spoofed, so key on a source *prefix* (`/24`, `/56`) at `beforeBindingResponse` - blocking a single address accomplishes nothing.
+- **ICE needs nothing extra server-side.** ICE rides on STUN and TURN underneath; protecting those protects it.
+
+```js
+import { createServer } from 'turn-server';
+
+const bindings = new TokenBucket({ rate: 50, burst: 100 });   // per /24, in memory
+const relayed  = new TokenBucket({ rate: 5e6, burst: 1e7 });  // per username, in memory
+
+const server = createServer({ auth: { /* ... */ }, relay: { /* ... */ } });
+
+// Amplification: silent drop, keyed on a prefix.
+server.on('beforeBindingResponse', (info, cb) => cb(bindings.take(prefix24(info.source.ip))));
+
+// Brute force: the server tells you about failures it detected itself.
+server.on('auth:failure', (sock, { username, reason }) => {
+  if (reason === 'bad-integrity' || reason === 'unknown-user') fail2ban.record(sock);
+});
+
+// Allocation admission: rare, so an async lookup is fine here.
+server.on('beforeAllocate', async (info, cb) => {
+  const n = await db.countAllocations(info.username);
+  if (n >= 5) return cb(false, 486, 'Per-user allocation quota exceeded');
+  cb(true);
+});
+
+// Throughput: hot path, so the bucket must be in memory.
+server.on('beforeRelay', (info, cb) => cb(relayed.take(info.username, info.size)));
+```
+
+`auth:failure` matters because it reports something you cannot otherwise observe. When your `authenticate` hook returns the correct key, you have said "this user exists" - the server then compares the HMAC and may still fail. That failure never reaches your code, which is exactly the blind spot a password-guessing attack lives in. The event fires on `bad-integrity`, `unknown-user`, `wrong-credentials`, `algorithm-mismatch`, `invalid-token` and `missing-credentials`, and never on the normal 401 challenge that begins every long-term handshake. Rejections your own hooks issued are not reported - you already know about those.
+
+Per-allocation counters, live:
+
+```js
+server.on('connection', (sock) => {
+  setInterval(() => {
+    const { bytesIn, bytesOut, packetsIn, packetsOut } = sock.getSession().getBandwidth();
+    // Packets matter independently of bytes: 1 MB in one packet and 1 MB in
+    // 10,000 packets cost very different amounts of CPU, and the second is a
+    // flood signature.
+  }, 1000);
+});
+```
+
+**Sharing a bucket across threads.** The hot-path hooks are synchronous, so a shared bucket cannot be reached over IPC or Redis - those are async by construction. Use a `SharedArrayBuffer` with `Atomics`, which is synchronous because the operations run directly on the CPU. Across separate *processes* that option is gone, and you either accept per-process limits or push the decision up to the rare hooks, where async is available.
 
 
 ## 🔌 Client API
@@ -729,7 +856,7 @@ resolve('turn:example.com', (err, parsed) => {
 | **DNS SRV** | ✅ | ❌ | ❌ | ❌ |
 | **Auto-refresh** | ✅ | ❌ | ❌ | ✅ |
 | | | | | |
-| **Hooks API** | ✅ 14 hooks | ❌ | ❌ | ❌ |
+| **Hooks API** | ✅ 15 hooks, async | ❌ | ❌ | ❌ |
 | **Convenience limits** | ✅ 6 options | ❌ | ❌ | ✅ config |
 | **Idle timeout** | ✅ | ❌ | ❌ | ✅ |
 | **Graceful drain** | ✅ | ❌ | ❌ | ❌ |
@@ -849,7 +976,7 @@ turn-server/
 - Multi-endpoint server (UDP + TCP + TLS + WebSocket + DTLS)
 - DTLS transport (RFC 7350) - STUN/TURN over DTLS via LemonTLS (client + server)
 - WebSocket client transport - via the global WebSocket (Node 22+) or an injected implementation
-- 14-hook API for full server control
+- 15-hook API for full server control, async by default (per-packet relay hooks stay sync), with per-hook rejection codes and a fail-closed `hookTimeout`
 - Built-in convenience limits (connections, quotas, bandwidth, permissions, channels)
 - Client: connect(), getPublicIP(), detectNAT(), DNS SRV, URI parsing, auto-refresh
 - UDP retransmission (Rc=7, Rm=16) + TCP timeout (Ti=39.5s)
@@ -867,6 +994,7 @@ turn-server/
 - **ICE restart re-announces candidates; re-gather binds only new interfaces and reuses TURN allocations**
 - **mDNS candidates (draft-ietf-mmusic-mdns-ice-candidates) - inbound `.local` resolution with strict UUID validation + opt-in outbound concealment (`register`), via lazy optional `mdns-local`**
 - **Port-mapping assisted gathering (UPnP-IGD / NAT-PMP / PCP) - gateway-forwarded srflx candidates with CGNAT detection and budgeted cancellation, via lazy optional `port-mapper`**
+- **Per-allocation packet counters (`packetsIn` / `packetsOut`) exposed through `getBandwidth()`**
 - 450+ tests passing (297 core + 153 ICE)
 
 _Community contributions are welcome! Please ⭐ star the repo to follow progress._
