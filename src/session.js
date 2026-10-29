@@ -3,7 +3,31 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
 import * as wire from './wire.js';
+import { createPeerPolicy } from './peer_policy.js';
 
+// Coarse clock for the per-datagram expiry checks (permission, channel):
+// those lifetimes are minutes, so 250ms resolution is plenty and saves the
+// Date.now() calls on every relayed packet. Started on first use; unref'd so
+// it never keeps the process alive.
+var _coarseNow = 0;
+var _coarseTimer = null;
+function coarseNow() {
+  if (_coarseTimer === null) {
+    _coarseNow = Date.now();
+    _coarseTimer = setInterval(function() { _coarseNow = Date.now(); }, 250);
+    if (_coarseTimer.unref) _coarseTimer.unref();
+  }
+  return _coarseNow;
+}
+
+
+// RFC 8489 §9.2 structured nonce: hex(unix seconds) ":" HMAC(key, ts + scope)
+// truncated to 16 hex digits; scope binds it to the client's ip:port.
+export function makeNonce(key, scope) {
+  var timestamp = Math.floor(Date.now() / 1000).toString(16);
+  var mac = crypto.createHmac('sha1', key).update(timestamp + scope).digest('hex').slice(0, 16);
+  return timestamp + ':' + mac;
+}
 
 function Session(options) {
   if (!(this instanceof Session)) return new Session(options);
@@ -65,6 +89,16 @@ function Session(options) {
     // Security — peer address blocking (coturn CVE-2020-26262)
     allowLoopback: !!options.allowLoopback,    // default false
     allowMulticast: !!options.allowMulticast,   // default false
+    allowPrivatePeers: !!options.allowPrivatePeers, // default false — RFC 1918, link-local, CGNAT, ULA
+    // fn(ip) → true when ip is an address this server's own relays are
+    // announced on (Socket layer). See is_blocked_peer.
+    isOwnRelayIp: typeof options.isOwnRelayIp === 'function' ? options.isOwnRelayIp : null,
+    allowedPeers: options.allowedPeers || null,     // CIDR list, wins over everything but reserved
+    deniedPeers: options.deniedPeers || null,       // CIDR list
+    // RFC 6062 TCP relay. Off by default: browsers never ask for it, and an
+    // open Connect is a port scanner into whatever the server can reach.
+    allowTcpRelay: !!options.allowTcpRelay,
+    maxTcpConnectionsPerAllocation: options.maxTcpConnectionsPerAllocation || 8,
     secureStun: !!options.secureStun,          // require auth for BINDING
     checkOriginConsistency: !!options.checkOriginConsistency,
     _sessionOrigin: null,
@@ -89,6 +123,9 @@ function Session(options) {
     lastTransactionId: null,
     lastResponse: null,
   };
+
+  // Built from the options above; rebuilt by set_context when they change.
+  var peerPolicy = createPeerPolicy(context);
 
 
   /* ====================== Hook helper ====================== */
@@ -153,7 +190,10 @@ function Session(options) {
 
   // RFC 8489 §9.2 — structured nonce: timestamp:HMAC(nonceKey, timestamp)
   // Server can validate nonce without storing it. Nonce is stale if timestamp too old.
-  var _nonceKey = crypto.randomBytes(16);
+  // A Server shares one key across its clients (options.nonceKey), so it can
+  // issue a nonce to a new 5-tuple without creating a client for it (see
+  // server.js stateless_challenge) and this Session still accepts it.
+  var _nonceKey = options.nonceKey || crypto.randomBytes(16);
 
   // Source-address binding: include source IP in HMAC so nonce can't be replayed from different 5-tuple
   function _nonce_scope() {
@@ -161,16 +201,19 @@ function Session(options) {
   }
 
   function generate_nonce() {
-    var timestamp = Math.floor(Date.now() / 1000).toString(16);
-    var mac = crypto.createHmac('sha1', _nonceKey).update(timestamp + _nonce_scope()).digest('hex').slice(0, 16);
-    context.nonce = timestamp + ':' + mac;
+    context.nonce = makeNonce(_nonceKey, _nonce_scope());
     context.nonceCreatedAt = Date.now();
     return context.nonce;
   }
 
+  // A challenge hands out a nonce the client will use from now on. One
+  // already past half its life is replaced first: handed out at 599 s of
+  // 600, it expired before the client's Allocate came back, which then got
+  // 438 — and Chrome gives up a TURN server on any Allocate error but
+  // 401/300/437 (turn_port.cc).
   function is_nonce_stale() {
     if (context.nonceCreatedAt === null) return true;
-    return (Date.now() - context.nonceCreatedAt) > context.nonceExpiry;
+    return (Date.now() - context.nonceCreatedAt) > context.nonceExpiry / 2;
   }
 
   function validate_nonce(nonce) {
@@ -190,11 +233,22 @@ function Session(options) {
   //                         | null (unknown user) | Error (treated as unknown)
   //     cb(err, result)   — Node style
   // Only the first invocation wins; later calls are ignored.
+  //
+  // A listener that never answers used to leave the request unanswered for
+  // good (and each retransmission asked again). After hookTimeout the user
+  // is treated as unknown — fail closed, like the other hooks.
   function make_auth_cb(onResult) {
     var settled = false;
+    var timer = setTimeout(function() {
+      if (settled) return;
+      settled = true;
+      onResult(null);
+    }, context.hookTimeout || 5000);
+    if (timer.unref) timer.unref();
     return function(a, b) {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       var result;
       if (arguments.length >= 2) {
         result = a ? null : b;                       // cb(err, result)
@@ -209,7 +263,13 @@ function Session(options) {
   // No response is sent until cb fires (async DB lookups are fully supported).
   function get_key_for_user(username, cb) {
     // 1. Static credentials — check first (exact username match)
-    if (context.credentials && context.credentials[username] != null) {
+    // Own keys only. USERNAME comes from the client, and credentials is a
+    // plain object: "constructor", "toString", "__proto__" … found the
+    // inherited Object.prototype members as "static credentials", whose
+    // "password" (their string form) anyone can compute — any client
+    // authenticated with them, and the 'authenticate' hook was never asked.
+    if (context.credentials && Object.prototype.hasOwnProperty.call(context.credentials, username) &&
+        context.credentials[username] != null) {
       return cb(wire.compute_long_term_key(username, context.realm, context.credentials[username]));
     }
 
@@ -259,9 +319,14 @@ function Session(options) {
       { type: wire.ATTR.REALM, value: context.realm },
       { type: wire.ATTR.NONCE, value: context.nonce },
       // RFC 8489 §9.1 — advertise supported password algorithms
+      // RFC 8489 §9.1 — the password algorithms this server can verify. MD5
+      // only: keys come from 'authenticate' as an MD5 long-term key or a
+      // password turned into one, so a SHA-256 key (§18.5.1.2) cannot be
+      // derived for every user. SHA-256 used to be advertised first anyway —
+      // a client that took it computed a key this server never checked
+      // against, and failed authentication every time.
       { type: wire.ATTR.PASSWORD_ALGORITHMS, value: [
-        { algorithm: 0x0002, params: new Uint8Array(0) }, // SHA256 preferred
-        { algorithm: 0x0001, params: new Uint8Array(0) }, // MD5 fallback
+        { algorithm: 0x0001, params: new Uint8Array(0) },
       ] },
     ];
 
@@ -276,8 +341,7 @@ function Session(options) {
       { type: wire.ATTR.REALM, value: context.realm },
       { type: wire.ATTR.NONCE, value: context.nonce },
       { type: wire.ATTR.PASSWORD_ALGORITHMS, value: [
-        { algorithm: 0x0002, params: new Uint8Array(0) },
-        { algorithm: 0x0001, params: new Uint8Array(0) },
+        { algorithm: 0x0001, params: new Uint8Array(0) },   // MD5 only — see send_challenge
       ] },
     ], null);
   }
@@ -286,7 +350,7 @@ function Session(options) {
   /* ====================== Response helpers ====================== */
 
   // key: HMAC key for MESSAGE-INTEGRITY, or null
-  function send_message(method, cls, tid, attributes, key) {
+  function send_message(method, cls, tid, attributes, key, integrity) {
     // FIX: concat instead of push — never mutate caller's array
     var final_attrs = attributes;
     if (context.software && cls !== wire.CLASS.INDICATION) {
@@ -299,6 +363,7 @@ function Session(options) {
       transactionId: tid,
       attributes: final_attrs,
       key: key || null,
+      integrity: integrity || 'sha1',
       fingerprint: context.useFingerprint !== false,
     });
 
@@ -312,14 +377,14 @@ function Session(options) {
   }
 
   function send_success(msg, attributes, key) {
-    send_message(msg.method, wire.CLASS.SUCCESS, msg.transactionId, attributes, key);
+    send_message(msg.method, wire.CLASS.SUCCESS, msg.transactionId, attributes, key, msg._integrity);
   }
 
   function send_error(msg, code, attributes, key) {
     if (!attributes) {
       attributes = [{ type: wire.ATTR.ERROR_CODE, value: { code: code } }];
     }
-    send_message(msg.method, wire.CLASS.ERROR, msg.transactionId, attributes, key);
+    send_message(msg.method, wire.CLASS.ERROR, msg.transactionId, attributes, key, msg._integrity);
   }
 
   // Indications: no fingerprint (RFC 5389 — FINGERPRINT is optional, and skipping it
@@ -422,6 +487,12 @@ function Session(options) {
     ev.emit('refresh', alloc);
   }
 
+  // Drop this allocation if it is still the current one — for the Socket
+  // layer, when it could not finish setting the allocation up.
+  function drop_allocation(alloc) {
+    if (context.allocation && context.allocation === alloc) expire_allocation();
+  }
+
   function expire_allocation() {
     var alloc = context.allocation;
     if (!alloc) return;
@@ -431,22 +502,23 @@ function Session(options) {
     ev.emit('allocate:expired', alloc);
   }
 
-  // CVE-2020-26262 — block dangerous peer addresses by default
+  // Which peers the relay may reach — see peer_policy.js. Works on the address
+  // bytes, so ::ffff:127.0.0.1, ::ffff:7f00:1 and 127.1 spelled any other way
+  // are all loopback (CVE-2020-26262, and its IPv4-mapped bypass).
   function is_blocked_peer(ip) {
-    if (!ip) return true;
-    // Loopback
-    if (!context.allowLoopback) {
-      if (ip === '127.0.0.1' || ip.startsWith('127.') || ip === '::1' || ip === '0:0:0:0:0:0:0:1') return true;
-    }
-    // Unspecified (0.0.0.0/8, ::/128)
-    if (ip === '0.0.0.0' || ip.startsWith('0.') || ip === '::' || ip === '0:0:0:0:0:0:0:0') return true;
-    // Multicast
-    if (!context.allowMulticast) {
-      var first = parseInt(ip.split('.')[0], 10);
-      if (first >= 224 && first <= 255) return true; // 224.0.0.0 - 255.255.255.255
-      if (ip.toLowerCase().startsWith('ff')) return true; // IPv6 multicast FFxx::
-    }
-    return false;
+    if (!peerPolicy.isBlocked(ip)) return false;
+    // A relay of this same server is never "another network": two browsers
+    // relaying through us reach each other at our announced relay address.
+    // When that address is one the policy blocks — a LAN address before the
+    // public one was known, a router WAN inside CGNAT 100.64/10 — every
+    // relay-to-relay CreatePermission got 403. The Socket layer delivers
+    // such traffic to our own relays only, in memory (see socket.js).
+    return !(context.isOwnRelayIp && context.isOwnRelayIp(ip));
+  }
+
+  // The policy alone, without the own-relay exemption.
+  function is_policy_blocked(ip) {
+    return peerPolicy.isBlocked(ip);
   }
 
   function add_permission(ip) {
@@ -463,18 +535,30 @@ function Session(options) {
     if (!alloc) return false;
     var exp = alloc.permissions[ip];
     if (!exp) return false;
-    if (Date.now() > exp) { delete alloc.permissions[ip]; return false; }
+    if (coarseNow() > exp) { delete alloc.permissions[ip]; return false; }
     return true;
   }
 
   function bind_channel(channel_number, peer) {
     var alloc = context.allocation;
     if (!alloc) return false;
+    // A channel is a permission too (RFC 8656 §12): one that may not be
+    // installed must not leave a channel behind that relays to it anyway.
+    if (is_blocked_peer(peer.ip)) return false;
 
     if (channel_number < 0x4000 || channel_number > 0x4FFF) return false;
 
-    // Channel already bound to a different peer?
+    // Channel already bound to a different peer? An expired binding still
+    // holds its number for 5 minutes (RFC 8656 §12: no rebinding to another
+    // peer before then), and is gone after that. Expired entries used to stay
+    // until ChannelData happened to look them up, so the number could stay
+    // refused for good.
     var existing = alloc.channels[channel_number];
+    if (existing && coarseNow() > existing.expiresAt + 300000) {
+      if (alloc._peerToChannel) delete alloc._peerToChannel[existing.peer.ip + ':' + existing.peer.port];
+      delete alloc.channels[channel_number];
+      existing = null;
+    }
     if (existing) {
       if (existing.peer.ip !== peer.ip || existing.peer.port !== peer.port) return false;
     }
@@ -492,7 +576,7 @@ function Session(options) {
     if (!alloc._peerToChannel) alloc._peerToChannel = {};
     alloc._peerToChannel[peer.ip + ':' + peer.port] = channel_number;
 
-    add_permission(peer.ip);
+    if (!add_permission(peer.ip)) return false;
     ev.emit('channel', { number: channel_number, peer: peer, allocation: alloc });
     return true;
   }
@@ -506,9 +590,13 @@ function Session(options) {
     if (ch_num === undefined) return null;
     var ch = alloc.channels[ch_num];
     if (!ch) { if (alloc._peerToChannel) delete alloc._peerToChannel[key]; return null; }
-    if (Date.now() > ch.expiresAt) {
-      delete alloc.channels[ch_num];
-      if (alloc._peerToChannel) delete alloc._peerToChannel[key];
+    if (coarseNow() > ch.expiresAt) {
+      // Expired: no longer relays, but the number stays reserved for 5
+      // minutes (RFC 8656 §12) — removed only after that.
+      if (coarseNow() > ch.expiresAt + 300000) {
+        delete alloc.channels[ch_num];
+        if (alloc._peerToChannel) delete alloc._peerToChannel[key];
+      }
       return null;
     }
     return ch_num;
@@ -519,7 +607,10 @@ function Session(options) {
     if (!alloc) return null;
     var ch = alloc.channels[channel_number];
     if (!ch) return null;
-    if (Date.now() > ch.expiresAt) { delete alloc.channels[channel_number]; return null; }
+    if (coarseNow() > ch.expiresAt) {
+      if (coarseNow() > ch.expiresAt + 300000) delete alloc.channels[channel_number];   // see get_channel_by_peer
+      return null;
+    }
     return ch.peer;
   }
 
@@ -571,8 +662,22 @@ function Session(options) {
 
   function process_channel_data(data) {
     var parsed = wire.decode_channel_data(data);
+    // Shorter than its own length field says: a truncated or malformed
+    // datagram. It used to be relayed cut short; RFC 8656 §12.4 — discard.
+    if (parsed === null) return;
+    // Client: the channel table is its own (no allocation object here), and
+    // permissions are the server's to enforce.
+    if (!context.isServer) {
+      var cpeer = get_client_channel_peer(parsed.channel);
+      if (!cpeer) return;
+      ev.emit('data', cpeer, parsed.data, parsed.channel);
+      return;
+    }
     var peer = get_peer_by_channel(parsed.channel);
     if (!peer) return;
+    // RFC 8656 §12.4: relay only while the peer's permission is live. The
+    // channel (10 min) outlives the permission (5 min) unless refreshed.
+    if (!has_permission(peer.ip)) return;
 
     // Hook: beforeRelay — client → peer via ChannelData. listenerCount guard
     // first so the info object isn't allocated per packet on the relay hot path.
@@ -671,8 +776,17 @@ function Session(options) {
       return;
     }
 
+    // Only requests are handled from here on. Any other class — an
+    // indication other than Send/Binding, a success or error response —
+    // used to fall through to route_server_request() with NO authentication:
+    // an Allocate sent as an indication got a relay, and a Refresh indication
+    // with LIFETIME 0 from anyone who knew a client's address deleted that
+    // client's allocation. A server answers requests and accepts Send
+    // indications; everything else is ignored (coturn does the same).
+    if (msg.cls !== wire.CLASS.REQUEST) return;
+
     // Everything else needs auth (if authMech !== 'none')
-    if (context.authMech !== 'none' && msg.cls === wire.CLASS.REQUEST) {
+    if (context.authMech !== 'none') {
       authenticate_and_handle(msg, raw);
       return;
     }
@@ -713,8 +827,15 @@ function Session(options) {
           send_error(msg, 401, null, null);
           return;
         }
-        // Validate integrity with the derived key
-        if (msg.integrity_offset !== null) {
+        // Validate integrity with the derived key — required (RFC 7635 §4):
+        // a token without MESSAGE-INTEGRITY proves nothing (it can be replayed
+        // by anyone who saw it), and such a request used to be accepted.
+        if (msg.integrity_offset === null) {
+          ev.emit('auth:failure', { username: null, code: 401, reason: 'no-integrity' });
+          send_error(msg, 401, null, null);
+          return;
+        }
+        {
           var valid = wire.validate_integrity(raw, msg.integrity_offset, key);
           if (!valid) {
             ev.emit('auth:failure', { username: null, code: 401, reason: 'bad-integrity' });
@@ -781,7 +902,8 @@ function Session(options) {
       // ICE connectivity checks use USERNAME = "remoteUfrag:localUfrag" with a
       // single shared password (ice-pwd), so credentials map won't match — the
       // direct password is the expected path for ICE.
-      finish(context.credentials[username] || context.password || null);
+      finish((context.credentials && Object.prototype.hasOwnProperty.call(context.credentials, username)
+              ? context.credentials[username] : null) || context.password || null);
     }
   }
 
@@ -815,6 +937,19 @@ function Session(options) {
         return;
       }
 
+      // A PASSWORD-ALGORITHM other than the one offered (MD5): RFC 8489
+      // §9.2.4 — 400. This used to be checked only for MESSAGE-INTEGRITY; with
+      // MESSAGE-INTEGRITY-SHA256 a client naming SHA-256 slipped through to a
+      // key check that could never pass.
+      var client_algo = msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHM);
+      if (client_algo && client_algo.algorithm !== 0x0001) {
+        ev.emit('auth:failure', { username: username, code: 400, reason: 'algorithm-mismatch' });
+        send_error(msg, 400, null, null);
+        return;
+      }
+      // Answer with the integrity type the request used (RFC 8489 §9.2.4).
+      if (msg.integrity_sha256_offset !== null) msg._integrity = 'sha256';
+
       // Validate integrity — prefer SHA256 if present, fall back to SHA1
       var valid = false;
       if (msg.integrity_sha256_offset !== null) {
@@ -831,16 +966,6 @@ function Session(options) {
       // RFC 8489 §9.2.1 — bid-down attack prevention
       // If server advertised PASSWORD-ALGORITHMS, client SHOULD include PASSWORD-ALGORITHM
       // If client uses SHA1 but SHA256 was offered, SHOULD reject
-      var client_algo = msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHM);
-      if (msg.integrity_sha256_offset === null && msg.integrity_offset !== null) {
-        // Client used SHA1 — check if we offered SHA256
-        if (client_algo && client_algo.algorithm !== 0x0001) {
-          // Mismatch: client claims one algo but used another
-          ev.emit('auth:failure', { username: username, code: 400, reason: 'algorithm-mismatch' });
-          send_error(msg, 400, null, null);
-          return;
-        }
-      }
 
       // Wrong credentials check
       if (context.allocation && context.allocation.username !== null) {
@@ -926,11 +1051,31 @@ function Session(options) {
     });
   }
 
+  function same_tid(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
   function handle_allocate(msg, key) {
     if (context.allocation !== null) {
+      // RFC 8656 §7.2: a retransmission of the Allocate that created this
+      // allocation gets that same success again — not 437. The retransmission
+      // cache (lastResponse) holds only the last response on the 5-tuple, and
+      // browsers send Binding requests on the same socket, so a lost success
+      // followed by any other answer turned Chrome's retransmit into a 437:
+      // an extra round trip, and an orphaned allocation holding a port.
+      var cur = context.allocation;
+      if (same_tid(cur._tid, msg.transactionId)) {
+        if (cur._successBuf) ev.emit('message', cur._successBuf);
+        return;   // still binding its relay port: the answer is on its way
+      }
       send_error(msg, 437, null, key);
       return;
     }
+    // The same Allocate again while the first copy is still being decided
+    // (quota / beforeAllocate hooks may answer asynchronously): one is enough.
+    if (same_tid(context._allocateInFlight, msg.transactionId)) return;
 
     var transport = msg.getAttribute(wire.ATTR.REQUESTED_TRANSPORT);
     if (transport === null) { send_error(msg, 400, null, key); return; }
@@ -938,12 +1083,27 @@ function Session(options) {
     if (transport !== wire.TRANSPORT.UDP && transport !== wire.TRANSPORT.TCP) {
       send_error(msg, 442, null, key); return;
     }
+    if (transport === wire.TRANSPORT.TCP && !context.allowTcpRelay) {
+      send_error(msg, 442, null, key); return;   // Unsupported Transport Protocol
+    }
 
     // RESERVATION-TOKEN and EVEN-PORT together is invalid
     var reservation_token = msg.getAttribute(wire.ATTR.RESERVATION_TOKEN);
     var even_port = msg.getAttribute(wire.ATTR.EVEN_PORT);
     if (reservation_token !== null && even_port !== null) {
       send_error(msg, 400, null, key);
+      return;
+    }
+
+    // RFC 8656 §7.2: a server that cannot send with the DF bit set treats
+    // DONT-FRAGMENT as an unknown comprehension-required attribute — 420.
+    // Node cannot set IP_DONTFRAG on a UDP socket; the attribute used to be
+    // accepted and ignored, so the client believed its path-MTU probing worked.
+    if (msg.getAttribute(wire.ATTR.DONT_FRAGMENT) !== null && !context.supportsDontFragment) {
+      send_error(msg, 420, [
+        { type: wire.ATTR.ERROR_CODE, value: { code: 420 } },
+        { type: wire.ATTR.UNKNOWN_ATTRIBUTES, value: [wire.ATTR.DONT_FRAGMENT] },
+      ], key);
       return;
     }
 
@@ -956,8 +1116,12 @@ function Session(options) {
 
     // Quota event — same deferred contract as the hooks (sync or async).
     var username = msg.getAttribute(wire.ATTR.USERNAME);
+    context._allocateInFlight = msg.transactionId;
+    function done_in_flight() {
+      if (same_tid(context._allocateInFlight, msg.transactionId)) context._allocateInFlight = null;
+    }
     check_quota(username, function(quota_ok, quota_code, quota_reason) {
-      if (!quota_ok) { send_hook_error(msg, quota_code, quota_reason, key, 486); return; }
+      if (!quota_ok) { done_in_flight(); send_hook_error(msg, quota_code, quota_reason, key, 486); return; }
 
       var lifetime = msg.getAttribute(wire.ATTR.LIFETIME);
       if (lifetime === null) lifetime = context.defaultAllocateLifetime;
@@ -975,7 +1139,11 @@ function Session(options) {
       };
 
       check_hook('beforeAllocate', alloc_info, function(ok, code, reason) {
+        done_in_flight();
         if (!ok) { send_hook_error(msg, code, reason, key, 403); return; }
+        // Another Allocate (a different transaction) won while this one's
+        // hooks were pending: one allocation per 5-tuple (RFC 8656 §7.2).
+        if (context.allocation !== null || context.state === 'closed') { send_error(msg, 437, null, key); return; }
 
         // Hook may have modified lifetime
         finish_allocate(msg, key, transport, alloc_info.lifetime, requested_family,
@@ -1009,6 +1177,7 @@ function Session(options) {
 
   function finish_allocate(msg, key, transport, lifetime, requested_family, even_port, reservation_token) {
     var alloc = create_allocation(msg, transport, lifetime);
+    alloc._tid = msg.transactionId;
 
     // Store flags for Socket layer
     alloc.evenPort = even_port;
@@ -1048,6 +1217,7 @@ function Session(options) {
         success_attrs.push({ type: wire.ATTR.RESERVATION_TOKEN, value: extra.reservationToken });
       }
       send_success(msg, success_attrs, key);
+      alloc._successBuf = context.lastResponse;   // for a retransmitted Allocate
     };
 
     alloc.reject = function(err) {
@@ -1055,7 +1225,9 @@ function Session(options) {
       alloc._responseSent = true;
       alloc._confirmed = true;
       expire_allocation();
-      send_error(msg, 508, null, key); // Insufficient Capacity
+      // 508 Insufficient Capacity, unless the Socket layer names another code
+      // (440 Address Family not Supported).
+      send_error(msg, (err && err.stunCode) || 508, null, key);
     };
 
     // Emit allocate event — Socket.js calls alloc.confirm(addr) asynchronously
@@ -1100,6 +1272,12 @@ function Session(options) {
     });
   }
 
+  // The address family of the current allocation's relay (wire.FAMILY).
+  function relay_family() {
+    var ra = context.allocation && context.allocation.relayAddress;
+    return ra && ra.ip && ra.ip.indexOf(':') >= 0 ? wire.FAMILY.IPV6 : wire.FAMILY.IPV4;
+  }
+
   function handle_create_permission(msg, key) {
     if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
@@ -1110,6 +1288,24 @@ function Session(options) {
       }
     }
     if (peers.length === 0) { send_error(msg, 400, null, key); return; }
+    for (var pv = 0; pv < peers.length; pv++) {
+      if (!peers[pv]) { send_error(msg, 400, null, key); return; }   // malformed XOR-PEER-ADDRESS
+    }
+    // RFC 8656 §9.1/§10.2: a peer of the other address family than the relay → 443.
+    for (var pf = 0; pf < peers.length; pf++) {
+      if (peers[pf].family !== relay_family()) { send_error(msg, 443, null, key); return; }
+    }
+
+    // RFC 8656 §9.1: a peer address the server's policy forbids → 403, and
+    // nothing installed (all-or-nothing). It used to answer 200 and quietly
+    // skip the peer, so the client believed the path was open.
+    for (var b = 0; b < peers.length; b++) {
+      if (is_blocked_peer(peers[b].ip)) {
+        ev.emit('peer:blocked', { peer: peers[b], source: context.source, method: 'CreatePermission' });
+        send_error(msg, 403, null, key);
+        return;
+      }
+    }
 
     // Hook: beforePermission — check each peer in turn. One rejection fails the
     // whole request (RFC 8656 §9.2: CreatePermission is all-or-nothing), so the
@@ -1119,7 +1315,9 @@ function Session(options) {
       if (j >= peers.length) {
         // The allocation can expire while an async hook is pending.
         if (context.allocation === null) { send_error(msg, 437, null, key); return; }
-        for (var k = 0; k < peers.length; k++) add_permission(peers[k].ip);
+        for (var k = 0; k < peers.length; k++) {
+          if (!add_permission(peers[k].ip)) { send_error(msg, 403, null, key); return; }
+        }
         send_success(msg, [], key);
         return;
       }
@@ -1129,6 +1327,7 @@ function Session(options) {
         username: context.allocation.username,
         source: context.source,
         peer: peer,
+        peers: peers,   // the whole request — a cap must count all it would add
       }, function(ok, code, reason) {
         if (!ok) { send_hook_error(msg, code, reason, key, 403); return; }
         next();
@@ -1143,9 +1342,15 @@ function Session(options) {
     var peer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
 
     if (channel_number === null || peer === null) { send_error(msg, 400, null, key); return; }
+    if (peer.family !== relay_family()) { send_error(msg, 443, null, key); return; }   // RFC 8656 §11.2
     // RFC 8656 §12 narrowed the usable channel range to 0x4000–0x4FFF (RFC 5766
     // allowed up to 0x7FFF); 0x5000–0xFFFF is reserved for RFC 7983 demux.
     if (channel_number < 0x4000 || channel_number > 0x4FFF) { send_error(msg, 400, null, key); return; }
+    if (is_blocked_peer(peer.ip)) {
+      ev.emit('peer:blocked', { peer: peer, source: context.source, method: 'ChannelBind' });
+      send_error(msg, 403, null, key);
+      return;
+    }
 
     // Hook: beforeChannelBind
     check_hook('beforeChannelBind', {
@@ -1194,8 +1399,15 @@ function Session(options) {
     // Must have allocation with TCP transport
     if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
+    // RFC 6062 §5.2: Connect is only for a TCP allocation.
+    if (!context.allowTcpRelay || context.allocation.transport !== wire.TRANSPORT.TCP) {
+      send_error(msg, 400, null, key); return;
+    }
+
     var peer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
     if (peer === null) { send_error(msg, 400, null, key); return; }
+
+    if (is_blocked_peer(peer.ip)) { send_error(msg, 403, null, key); return; }
 
     // Must have permission for this peer
     if (!has_permission(peer.ip)) {
@@ -1205,6 +1417,9 @@ function Session(options) {
 
     // Check if connection to this peer already exists
     var conn_keys = Object.keys(context.tcpConnections);
+    if (conn_keys.length >= context.maxTcpConnectionsPerAllocation) {
+      send_error(msg, 508, null, key); return;   // Insufficient Capacity
+    }
     for (var i = 0; i < conn_keys.length; i++) {
       var existing = context.tcpConnections[conn_keys[i]];
       if (existing.peer.ip === peer.ip && existing.peer.port === peer.port) {
@@ -1278,6 +1493,37 @@ function Session(options) {
 
   /* ====================== Client-side processing ====================== */
 
+  // Channels this client has bound (RFC 8656 §12.6): ChannelData from the
+  // server is delivered only on a bound channel, as data from its peer.
+  // number → { peer, expiresAt }. Filled from the CHANNEL-BIND request that
+  // succeeded; a refresh re-binds and extends it.
+  var _clientChannels = {};
+
+  function note_client_channel(attributes) {
+    var number = null, peer = null;
+    for (var i = 0; i < attributes.length; i++) {
+      if (attributes[i].type === wire.ATTR.CHANNEL_NUMBER) number = attributes[i].value;
+      else if (attributes[i].type === wire.ATTR.XOR_PEER_ADDRESS) peer = attributes[i].value;
+    }
+    if (number === null || !peer) return;
+    _clientChannels[number] = { peer: peer, expiresAt: Date.now() + 600000 }; // 10 minutes
+  }
+
+  function get_client_channel_peer(number) {
+    var ch = _clientChannels[number];
+    if (!ch) return null;
+    if (coarseNow() > ch.expiresAt) { delete _clientChannels[number]; return null; }
+    return ch.peer;
+  }
+
+  function get_client_channel_by_peer(ip, port) {
+    for (var n in _clientChannels) {
+      var p = get_client_channel_peer(+n);
+      if (p && p.ip === ip && p.port === port) return +n;
+    }
+    return null;
+  }
+
   // Pending request tracking for auto-retry on 401/438
   var _pendingRequest = null; // { method, attributes, retries }
   var _pendingTransactionId = null; // 12-byte Uint8Array
@@ -1293,6 +1539,7 @@ function Session(options) {
     }
 
     if (msg.cls === wire.CLASS.SUCCESS) {
+      if (msg.method === wire.METHOD.CHANNEL_BIND && _pendingRequest) note_client_channel(_pendingRequest.attributes);
       _pendingRequest = null;
       _pendingTransactionId = null;
       stop_retransmission();
@@ -1379,9 +1626,15 @@ function Session(options) {
 
   function get_client_key() {
     if (context.authMech === 'long-term' && context.username && context.realm && context.password) {
-      var inputs = context.username + ':' + context.realm + ':' + context.password;
+      // RFC 8489 §18.5.1.2: with PASSWORD-ALGORITHM SHA-256 the long-term
+      // key is SHA-256(username:realm:password), not MD5 — it used to be MD5
+      // whatever was chosen, which no RFC 8489 server accepts.
+      var sha256 = context.passwordAlgorithm === 0x0002;
+      var inputs = (sha256 ? 'sha256:' : 'md5:') + context.username + ':' + context.realm + ':' + context.password;
       if (_clientKeyInputs !== inputs) {
-        _clientKey = wire.compute_long_term_key(context.username, context.realm, context.password);
+        _clientKey = sha256
+          ? wire.compute_long_term_key_sha256(context.username, context.realm, context.password)
+          : wire.compute_long_term_key(context.username, context.realm, context.password);
         _clientKeyInputs = inputs;
       }
       return _clientKey;
@@ -1509,6 +1762,17 @@ function Session(options) {
     var has_changed = false;
 
     if (options && typeof options === 'object') {
+
+      // Peer policy — rebuilt as a whole so a new range list takes effect at once.
+      var POLICY_KEYS = ['allowLoopback', 'allowMulticast', 'allowPrivatePeers', 'allowedPeers', 'deniedPeers'];
+      var policy_changed = false;
+      for (var pk = 0; pk < POLICY_KEYS.length; pk++) {
+        if (POLICY_KEYS[pk] in options && options[POLICY_KEYS[pk]] !== context[POLICY_KEYS[pk]]) {
+          context[POLICY_KEYS[pk]] = options[POLICY_KEYS[pk]];
+          policy_changed = true;
+        }
+      }
+      if (policy_changed) peerPolicy = createPeerPolicy(context);
 
       if ('source' in options) {
         if (options.source !== context.source) {
@@ -1689,6 +1953,7 @@ function Session(options) {
   function close() {
     stop_retransmission();
     clear_refresh_timers();
+    _clientChannels = {};
     if (context.allocation) expire_allocation();
     context.state = 'closed';
     ev.emit('close');
@@ -1731,9 +1996,13 @@ function Session(options) {
     },
 
     hasPermission: has_permission,
-    getPeerByChannel: get_peer_by_channel,
-    getChannelByPeer: function(ip, port) { return get_channel_by_peer(ip, port); },
+    getPeerByChannel: function(n) { return context.isServer ? get_peer_by_channel(n) : get_client_channel_peer(n); },
+    getChannelByPeer: function(ip, port) {
+      return context.isServer ? get_channel_by_peer(ip, port) : get_client_channel_by_peer(ip, port);
+    },
     getAllocation: function() { return context.allocation; },
+    dropAllocation: drop_allocation,
+    isPolicyBlocked: is_policy_blocked,
     getBandwidth: function() {
       return {
         bytesIn: context.bytesIn,

@@ -268,6 +268,7 @@ transparent to the protocol layer.
 - SNICallback for multi-domain TLS (like `node:tls`)
 - realmCallback for per-client realm/auth configuration
 - relayCallback for per-allocation relay address selection
+- `relay.local` - relay straight into an application on the same process (see below)
 - EVEN-PORT and RESERVATION-TOKEN (RFC 5766 §14.6 / §14.9) - even-port allocation, port+1 reservation with the token returned in the Allocate response, cross-connection claim, 30-second reservation TTL
 - ICMP error forwarding (RFC 8656 §11.5) - relay send failures become Data indications carrying an ICMP attribute; the client surfaces them as an `icmp` event
 - TCP relay (RFC 6062) - CONNECT and CONNECTION_BIND
@@ -305,10 +306,13 @@ transparent to the protocol layer.
 - **Candidate types** - host, server-reflexive (srflx), peer-reflexive (prflx), relay (TURN) - IPv4 and IPv6
 - **Multi-homed gathering** - srflx fan-out per host base (RFC 8445 §5.1.1.1) across all interfaces
 - **Multiple ICE servers** - mixing STUN + TURN, multiple TURN servers, multiple URIs per server - all gathered in parallel with graceful degradation on failures
-- **Regular nomination** - controlling agent uses USE-CANDIDATE (RFC 8445 §8.1.1.1)
+- **Checks the way Chrome runs them** (full mode, libwebrtc's scheduler and timings) - every check a new transaction (no retransmission of the same bytes); 48ms between checks while nothing works, the selected pair kept alive every 2.5s (900ms while its RTT settles); pairs keep being checked after connecting - a late candidate's pair is checked and switched to when it is better (working > receiving > nominated > priority; an RTT-only switch must gain 10ms); dominated pairs on the same network are pruned, others kept as backups (checked every 25s)
+- **Nomination** - libwebrtc's default "semi-aggressive": USE-CANDIDATE on the selected pair's checks and on any pair that would beat it, so moving to a better pair is nominating it; toward an ICE-lite peer, only on the working selected pair. The controlled side selects a working pair before any nomination and moves to what the peer nominates
+- **Connection state from the pairs** (full) - disconnected once the selected pair stops answering (5 checks over 5s), failed when no pair is alive (15s unanswered); failed holds until an ICE restart
+- **Lite follows the peer** - the selected pair follows the path the controlling peer is using (USE-CANDIDATE on a pair that is receiving checks), so a peer that moves (network change → relay) is followed
 - **Peer-reflexive construction** - symmetric NAT handling per RFC 8445 §7.2.5.3 (new valid pair with prflx local, not re-marking original)
 - **Role conflict resolution** - RFC 8445 §7.3.1.1 tie-breaker with 487 error responses and role-flip
-- **Consent freshness** (RFC 7675) - 15s interval with ±20% jitter, disconnected at 30s, failed at 45s
+- **Liveness** - full: the selected pair's own checks (above); lite: passive, from the peer's checks - disconnected after 15s without one, failed at 30s (RFC 7675's consent expiry); `ICE_LITE_DISCONNECT_MS` / `ICE_LITE_FAILED_MS` override
 - **ICE restart** (RFC 8445 §9) - seamless media continuity via previous-pair fallback; `agent.send()` keeps working during restart window
 - **iceTransportPolicy** - `'all'` or `'relay'` (TURN-only, for privacy/firewall scenarios)
 - **MESSAGE-INTEGRITY validation** on 401/438/487 error responses (prevents role-flip spoofing)
@@ -372,6 +376,9 @@ agent.send(Buffer.from('hello'));
 | `includeLoopback` | `false` | Include `127.0.0.1` / `::1` in host candidates (testing only) |
 | `ipv6` | `true` | Gather IPv6 candidates |
 | `ufrag` / `pwd` | auto | Local credentials (auto-generated if omitted; 24-bit ufrag, 128-bit pwd) |
+| `socket` / `socket6` | — | Pre-bound UDP sockets shared with other protocols (server, usually with `mode: 'lite'`); the agent never closes them |
+| `announcedAddresses` | — | With `socket`: the addresses to announce instead of the bind address (`'1.2.3.4'` or `{ ip, port, tcpPort }`) |
+| `tcpSocket` / `tcpSocket6` | — | ICE over TCP, passive (RFC 6544): objects with `address()` and `send(buf, port, ip, cb)` that carry packets over TCP connections the caller accepts (webrtc-server's `router.tcp()` makes them). Each host address then also gets a `tcp … tcptype passive` candidate, below UDP; packets from those connections come in through `handlePacket(msg, rinfo)` with `rinfo.protocol: 'tcp'` |
 
 `iceServers[].urls` can be a string or an array. Each URL can carry `?transport=udp|tcp`. For `turns://` URLs, additional TLS options `servername`, `rejectUnauthorized`, `ca` are honored.
 
@@ -522,6 +529,65 @@ connect('turn:my-turn.example.com:3478', { username: 'u', password: 'p' }, (err,
 ```
 
 
+## 🔁 Relaying to an application on the same process - `relay.local`
+
+A relay whose peer is this server itself - a WebRTC server sharing its port, the
+usual case when a browser can only reach it through TURN - sends each datagram
+out to its own public address and waits for it to come back in. That costs a
+trip through the network stack per packet, and behind a home router that does
+not turn such packets around (NAT hairpinning) nothing arrives at all.
+
+`relay.local` lets the application claim the addresses that are its own. The
+datagram is then handed over in memory:
+
+```js
+const server = createServer({
+  relay: {
+    externalIp: '203.0.113.5',
+    // Called before each datagram a relay sends to a peer.
+    // null → sent to the network, as without the option.
+    local(ip, port) {
+      if (ip !== '203.0.113.5' || port !== 443) return null;
+      return function deliver(buf, from, reply) {
+        // buf:   the datagram (yours to keep)
+        // from:  { ip, port } — the relay address it was sent from
+        // reply: reply(buf) → the relay receives buf as if from ip:port;
+        //        false once the allocation is gone
+      };
+    },
+  },
+});
+```
+
+The answers go through the same path as a datagram from the network:
+permissions, `beforeData`, counters and channel bindings all apply. Delivery is
+asynchronous both ways, as a datagram's would be. It can be set or removed at
+any time with `setConfiguration({ relay: { local } })` / `{ local: null }`.
+
+`webrtc-server` does this for you: `new WebRTCRouter({ ..., turn: server })`.
+
+
+## 🛡 Security defaults
+
+A TURN relay sends whatever a client gives it to whatever address the client names, so the defaults are closed:
+
+| Option | Default | What it does |
+|---|---|---|
+| `allowPrivatePeers` | `false` | Refuse peers on private networks: 10/8, 172.16/12, 192.168/16, 169.254/16 (cloud metadata), 100.64/10 (CGNAT), fc00::/7, fe80::/10, documentation ranges. |
+| `allowLoopback` / `allowMulticast` | `false` | Refuse 127/8, ::1 / multicast and broadcast. 0.0.0.0/8, 240/4 and :: are always refused. |
+| `allowedPeers` / `deniedPeers` | — | CIDR lists (`'192.168.2.50'`, `'10.0.0.0/8'`, `'2001:db8::/32'`) — coturn's `allowed-peer-ip` / `denied-peer-ip`. Allowed wins over everything but the always-refused ranges. A bad range throws at startup. |
+| `allowTcpRelay` | `false` | RFC 6062 TCP allocations and Connect. Browsers never use them; open, Connect is a port scanner. |
+| `maxTcpConnectionsPerAllocation` | `8` | When `allowTcpRelay` is on. |
+| `ipQuota` | `0` (off) | Allocations per client IP. |
+| `unallocatedTimeout` | `30000` | A client with no allocation is dropped after this much quiet, on every transport. With an allocation, the allocation's lifetime decides. |
+| `handshakeTimeout` | `10000` | TLS listener: handshake deadline. Connections still in their handshake count against `maxConnections`. |
+
+Addresses are judged by their bytes, not their spelling: `::ffff:127.0.0.1`, `::ffff:7f00:1`, `::127.0.0.1`, `64:ff9b::7f00:1` (NAT64) and `2002:7f00:1::` (6to4) are all loopback.
+A refused peer gets **403** on CreatePermission, ChannelBind and Connect, and a `peer:blocked` event (`{ peer, source, method }`).
+
+ICE (`IceAgent`): a connectivity check without MESSAGE-INTEGRITY is answered **400** and never validates or nominates a pair; check and consent responses without it are dropped. `wire.validateStunMessage(buf, password)` requires MESSAGE-INTEGRITY whenever a password is given; `wire.verifyStunIntegrity(buf, msg, key)` does the same for an already-decoded message.
+
+Errors that belong to one client — a reset connection, a TLS handshake that failed or timed out, a malformed message — are emitted as `clientError (err, { transport, source })`, never as `error`, which is for the server's own listeners (EADDRINUSE and the like).
 
 ## 🪝 Hooks API
 
@@ -886,6 +952,10 @@ Optimizations applied:
 - O(1) channel↔peer reverse index
 - Pre-computed CRC32 table at module load
 - Chunk-accumulation TCP framing (no `Buffer.concat` per packet)
+- ChannelData frames from Node's buffer pool (`Buffer.allocUnsafe`, no zero-fill)
+- No closures per datagram: one send-error callback per client and per channel peer, one `send` function per external socket
+- In-process deliveries (`relay.local`, relay-to-relay) share one FIFO queue drained by a single `setImmediate`
+- Permission/channel expiry checked against a 250ms coarse clock instead of `Date.now()` per packet
 
 
 ## 🧪 Interoperability Testing
@@ -962,8 +1032,8 @@ turn-server/
 - NAT detection (RFC 5780) - CHANGE-REQUEST, OTHER-ADDRESS
 - OAuth (RFC 7635) - token-based auth with event delegation
 - ICE attributes (RFC 8445) - PRIORITY, USE-CANDIDATE, ICE-CONTROLLED/CONTROLLING
-- **ICE agent (RFC 8445) - full + lite modes, trickle, gathering (host/srflx/relay), connectivity checks, regular nomination, peer-reflexive construction, role conflict resolution, ICE restart with seamless media continuity**
-- **Consent Freshness (RFC 7675) - 15s interval with ±20% jitter, auto-transitions to disconnected/failed**
+- **ICE agent (RFC 8445) - full + lite modes, trickle, gathering (host/srflx/relay), Chrome-style connectivity checks and semi-aggressive nomination (switching to better pairs after connecting), peer-reflexive construction, role conflict resolution, ICE restart with seamless media continuity**
+- **Liveness - full: keepalive checks on the selected pair (disconnected ~5s, failed ~15s); lite: passive (15s / 30s)**
 - **Candidate primitives (RFC 8839) - priority formula, foundation computation, SDP parse/format, mDNS**
 - Multiplexing (RFC 7983) - STUN/TURN/DTLS demultiplexing
 - RFC 5769 test vectors - 22/22 validated

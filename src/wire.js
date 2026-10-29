@@ -293,6 +293,12 @@ function decode_address(data, xor_port, xor_ip, xor_ip6_extra) {
   var port;     [port, off] = r_u16(data, off);
   port ^= xor_port;
 
+  // Only IPv4 (8 bytes) and IPv6 (20 bytes). Any other family byte was
+  // decoded as IPv6 from whatever followed — an address nobody sent — and a
+  // short attribute read past its end. null: the attribute is malformed, and
+  // a request carrying it gets 400.
+  if (!((family === FAMILY.IPV4 && data.length === 8) || (family === FAMILY.IPV6 && data.length === 20))) return null;
+
   if (family === FAMILY.IPV4) {
     var addr; [addr, off] = r_bytes(data, off, 4);
     if (xor_ip) { for (var i = 0; i < 4; i++) addr[i] ^= xor_ip[i]; }
@@ -443,6 +449,7 @@ attrs[ATTR.ICE_CONTROLLED] = {
     return o;
   },
   decode: function(d) {
+    if (d.length !== 8) return null;   // malformed: a shorter value threw a RangeError
     var raw = d.slice(0, 8);
     var dv = new DataView(raw.buffer, raw.byteOffset, 8);
     return { raw: raw, value: dv.getBigUint64(0) };
@@ -782,8 +789,15 @@ function validate_integrity_by_length(raw_buf, integrity_offset, key) {
   var before_raw = raw_buf.slice(0, integrity_offset);
   var before = Buffer.isBuffer(before_raw) ? new Uint8Array(before_raw) : before_raw;
   var expected;
-  if (hmac_len === 20)      expected = compute_integrity(before, key);
-  else if (hmac_len <= 32)  expected = compute_integrity_sha256(before, key, hmac_len);
+  // RFC 8489 §14.6: a truncated MESSAGE-INTEGRITY-SHA256 is at least 16 bytes
+  // and a multiple of 4. Without that floor, a 1-byte MAC was accepted — one
+  // byte to guess, so at most 256 tries to authenticate as anyone without
+  // the password.
+  var attr_type = (raw_buf[integrity_offset] << 8) | raw_buf[integrity_offset + 1];
+  if (attr_type === ATTR.MESSAGE_INTEGRITY && hmac_len !== 20) return false;
+  if (attr_type === ATTR.MESSAGE_INTEGRITY_SHA256 && (hmac_len < 16 || hmac_len > 32 || hmac_len % 4 !== 0)) return false;
+  if (hmac_len === 20 && attr_type !== ATTR.MESSAGE_INTEGRITY_SHA256) expected = compute_integrity(before, key);
+  else if (hmac_len >= 16 && hmac_len <= 32 && hmac_len % 4 === 0) expected = compute_integrity_sha256(before, key, hmac_len);
   else if (hmac_len === 48) expected = compute_integrity_sha384(before, key);
   else if (hmac_len === 64) expected = compute_integrity_sha512(before, key);
   else return false;
@@ -803,6 +817,8 @@ function validate_integrity(raw_buf, integrity_offset, key) {
   // Same detach as validate_integrity_by_length — see comment there.
   var before_raw = raw_buf.slice(0, integrity_offset);
   var before = Buffer.isBuffer(before_raw) ? new Uint8Array(before_raw) : before_raw;
+  // MESSAGE-INTEGRITY is exactly 20 bytes (RFC 8489 §14.5).
+  if (((raw_buf[integrity_offset + 2] << 8) | raw_buf[integrity_offset + 3]) !== 20) return false;
   var expected = compute_integrity(before, key);
   var actual = raw_buf.slice(integrity_offset + 4, integrity_offset + 4 + 20);
   if (expected.length !== actual.length) return false;
@@ -892,31 +908,63 @@ function generateTransactionId() {
 // Standalone STUN validation for ICE connectivity checks.
 // Verifies FINGERPRINT and MESSAGE-INTEGRITY (short-term) without creating a Session.
 // Returns decoded message on success, null on failure.
+//
+// With a password, MESSAGE-INTEGRITY is REQUIRED: a message without it is
+// rejected (RFC 8445 §7.3 / RFC 8489 §9.1.3). Without a password only the
+// FINGERPRINT is checked.
 function validateStunMessage(buf, password) {
   var msg = decode_message(buf);
   if (!msg) return null;
+  if (!password) return check_fingerprint(buf, msg) ? msg : null;
+  return verifyStunIntegrity(buf, msg, compute_short_term_key(password)) ? msg : null;
+}
 
-  // Verify FINGERPRINT if present
-  if (msg.fingerprint_offset !== null) {
-    var fp_val = msg.getAttribute(ATTR.FINGERPRINT);
-    var expected_fp = compute_fingerprint(buf.slice(0, msg.fingerprint_offset));
-    if (fp_val !== expected_fp) return null;
-  }
+// Same check for a message already decoded from `buf` (no second decode), with
+// a precomputed short-term key (compute_short_term_key). FINGERPRINT if
+// present, and MESSAGE-INTEGRITY — required.
+function verifyStunIntegrity(buf, msg, key) {
+  if (!check_fingerprint(buf, msg)) return false;
+  if (msg.integrity_offset === null || !key) return false;
+  return validate_integrity(buf, msg.integrity_offset, key);
+}
 
-  // Verify MESSAGE-INTEGRITY with short-term key (ICE password)
-  if (msg.integrity_offset !== null && password) {
-    var key = compute_short_term_key(password);
-    if (!validate_integrity(buf, msg.integrity_offset, key)) return null;
-  }
-
-  return msg;
+function check_fingerprint(buf, msg) {
+  if (msg.fingerprint_offset === null) return true;
+  var fp_val = msg.getAttribute(ATTR.FINGERPRINT);
+  return fp_val === compute_fingerprint(buf.slice(0, msg.fingerprint_offset));
 }
 
 
 /* ========================= ChannelData / detect ========================== */
 
+// Pad a ChannelData message for a STREAM transport (TCP, TLS-over-TCP).
+//
+// RFC 8656 §12.5: over TCP and TLS the ChannelData message MUST be padded to a
+// multiple of four bytes, so the receiver can find where the next message
+// starts; over UDP (and WebSocket, which frames each message) the padding is
+// optional. encode_channel_data stays transport-agnostic, and the stream
+// writers call this.
+//
+// Without it, a relayed payload whose length is not a multiple of four — any
+// DTLS record, in practice — desynchronized the peer's TCP parser: Chrome's
+// ICE checks (STUN, always 4-aligned) succeeded through the relay, and the
+// DTLS handshake that followed never completed, so a WebRTC DataChannel over
+// TURN/TCP stayed "connecting" and the connection failed. The same held in
+// reverse: this library's own TCP reader expects the padding, and its own TCP
+// client did not send it.
+function pad_channel_data_for_stream(buf) {
+  if (!buf || buf.length < 4 || buf[0] < 0x40 || buf[0] > 0x4F) return buf;   // not ChannelData
+  var rem = buf.length % 4;
+  if (rem === 0) return buf;
+  var out = new Uint8Array(buf.length + (4 - rem));   // zero-filled padding
+  out.set(buf, 0);
+  return out;
+}
+
 function encode_channel_data(channel_number, data) {
-  var out = new Uint8Array(4 + data.length);
+  // Buffer.allocUnsafe: from Node's pool and not zero-filled — every byte is
+  // written below. Still a Uint8Array for every caller.
+  var out = Buffer.allocUnsafe(4 + data.length);
   w_u16(out, 0, channel_number);
   w_u16(out, 2, data.length);
   w_bytes(out, 4, data);
@@ -927,8 +975,10 @@ function encode_channel_data(channel_number, data) {
 // 2-element array allocation that r_u16()'s [val, off] return would incur on
 // the busiest path in the relay (millions of ChannelData/sec).
 function decode_channel_data(buf) {
+  if (buf.length < 4) return null;
   var channel = ((buf[0] << 8) | buf[1]) >>> 0;
   var len     = ((buf[2] << 8) | buf[3]) >>> 0;
+  if (4 + len > buf.length) return null;   // truncated: the caller discards it
   return { channel: channel, data: buf.subarray(4, 4 + len) };
 }
 
@@ -1084,25 +1134,44 @@ function decode_message(buf) {
   var fingerprint_offset = null;
   var end = HEADER_SIZE + msg_len;
 
+  // RFC 8489 §14.5/§14.6/§14.7: MESSAGE-INTEGRITY protects only what comes
+  // before it, so after it only MESSAGE-INTEGRITY-SHA256 and FINGERPRINT may
+  // follow (after MESSAGE-INTEGRITY-SHA256, only FINGERPRINT; after
+  // FINGERPRINT, nothing) — anything else is ignored. It used to be decoded
+  // like the rest: an on-path attacker could append LIFETIME=0 to a client's
+  // signed Refresh, or a peer to its CreatePermission, and the server acted
+  // on it. And of attributes that appear twice the FIRST counts (coturn does
+  // the same), not the last.
+  var seen_mi = false, seen_mi256 = false, seen_fp = false;
+
   while (off + 4 <= end) {
     var at; [at, off] = r_u16(buf, off);
     var al; [al, off] = r_u16(buf, off);
     if (off + al > end) break;
 
+    var ignored = seen_fp
+      || (seen_mi256 && at !== ATTR.FINGERPRINT)
+      || (seen_mi && at !== ATTR.MESSAGE_INTEGRITY_SHA256 && at !== ATTR.FINGERPRINT);
+    if (ignored) { off += al + ((4 - (al % 4)) % 4); continue; }
+
     var ar; [ar, ] = r_bytes(buf, off, al);
 
-    if (at === ATTR.MESSAGE_INTEGRITY) integrity_offset = off - 4;
-    if (at === ATTR.MESSAGE_INTEGRITY_SHA256) integrity_sha256_offset = off - 4;
-    if (at === ATTR.FINGERPRINT) fingerprint_offset = off - 4;
+    if (at === ATTR.MESSAGE_INTEGRITY) { integrity_offset = off - 4; seen_mi = true; }
+    if (at === ATTR.MESSAGE_INTEGRITY_SHA256) { integrity_sha256_offset = off - 4; seen_mi256 = true; }
+    if (at === ATTR.FINGERPRINT) { fingerprint_offset = off - 4; seen_fp = true; }
 
     var dv = ar;
     if (attrs[at] && attrs[at].decode) {
-      dv = (at === ATTR.XOR_MAPPED_ADDRESS || at === ATTR.XOR_PEER_ADDRESS || at === ATTR.XOR_RELAYED_ADDRESS)
-        ? attrs[at].decode(ar, tid) : attrs[at].decode(ar);
+      // A decoder that throws on a malformed value must not take the whole
+      // message (or a caller without try/catch) down: the attribute is null.
+      try {
+        dv = (at === ATTR.XOR_MAPPED_ADDRESS || at === ATTR.XOR_PEER_ADDRESS || at === ATTR.XOR_RELAYED_ADDRESS)
+          ? attrs[at].decode(ar, tid) : attrs[at].decode(ar);
+      } catch (e) { dv = null; }
     }
 
     attributes.push({ type: at, value: dv, raw: ar });
-    attribute_map[at] = dv;
+    if (!(at in attribute_map)) attribute_map[at] = dv;   // first occurrence wins
 
     off += al + ((4 - (al % 4)) % 4);
   }
@@ -1168,6 +1237,15 @@ function parseUri(uri) {
   } else if (secure && params.transport === 'udp') {
     // RFC 7350 §3.2: 'turns'/'stuns' + transport=udp == STUN/TURN over DTLS
     transport = 'dtls';
+  } else if (secure && params.transport === 'tcp') {
+    // RFC 7065 §3: 'turns' + transport=tcp == TURN over TLS over TCP. The
+    // secure scheme is what asks for TLS; transport=tcp only names what TLS
+    // runs on. This was returned as plain 'tcp', so connect() opened an
+    // unencrypted socket to a TLS port, sent cleartext STUN into a handshake
+    // that never began, and waited for an answer that could not come — while
+    // the bare 'turns:host' and 'turns:...?transport=udp' forms both worked.
+    // It is also the form browsers are usually configured with.
+    transport = 'tls';
   } else {
     transport = params.transport || (secure ? 'tls' : 'udp');
   }
@@ -1204,9 +1282,9 @@ export {
   compute_integrity_sha384, compute_integrity_sha512,
   compute_integrity_hmac, validate_integrity_by_length,
   add_integrity, add_fingerprint, compute_fingerprint,
-  encode_channel_data, decode_channel_data, is_stun, is_channel_data,
+  encode_channel_data, decode_channel_data, pad_channel_data_for_stream, is_stun, is_channel_data,
   tcp_frame, to_buffer, stun_stream_frame_length, parseUri,
   // RFC 7983 multiplexing (WebRTC stack)
   is_dtls, is_rtp, is_rtcp, demux,
-  generateTransactionId, validateStunMessage,
+  generateTransactionId, validateStunMessage, check_fingerprint, verifyStunIntegrity,
 };

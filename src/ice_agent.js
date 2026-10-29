@@ -1,8 +1,10 @@
 // src/ice_agent.js
 // ICE Agent (RFC 8445) — interactive connectivity establishment.
-// Supports: full ICE + ICE-Lite, vanilla + trickle gathering, regular nomination,
-// consent freshness (RFC 7675), ICE restart, TURN permissions for relay,
-// IPv4 + IPv6, peer-reflexive candidates, role conflict resolution.
+// Supports: full ICE + ICE-Lite, vanilla + trickle gathering, connectivity
+// checks and nomination as Chrome (libwebrtc) runs them — switching to a
+// better pair after connecting, liveness from the selected pair's checks —
+// ICE restart, TURN permissions for relay, IPv4 + IPv6, peer-reflexive
+// candidates, role conflict resolution.
 //
 // Usage:
 //   import { IceAgent } from 'turn-server';
@@ -63,18 +65,36 @@ const GATHERING_STATES = ['new', 'gathering', 'complete'];
 
 // (Type preferences live in ice-candidate.js.)
 
-// STUN retransmission — RFC 5389 §7.2.1
-const STUN_INITIAL_RTO_UDP = 500;     // ms
-const STUN_MAX_RETRANSMISSIONS = 7;   // → total ≈ 39.5s
-const STUN_RC = STUN_MAX_RETRANSMISSIONS;
-const STUN_RM = 16;                   // final timeout multiplier
-
-// Connectivity check pacing — RFC 8445 §6.1.4.2
-const CHECK_PACE_MS = 50;
-
-// Nomination — RFC 8445 §8.1.2. Wait this long after first valid pair to let
-// other pairs complete, so we can nominate the actual best (not just first).
-const NOMINATION_DELAY_MS = 100;
+// ── Full ICE: connectivity checks the way libwebrtc runs them ──
+//
+// Chrome is the peer that matters, and its ICE departs from the RFC-shaped
+// scheduler this agent had (RFC 5389 retransmissions, one-shot regular
+// nomination, a separate 15s consent cycle) in ways peers notice: it keeps
+// checking new pairs after it connects and moves to a better one, it learns
+// a path died within seconds, not 30-45. The values below are libwebrtc's
+// own (p2p/base/p2p_constants.h, connection.cc, basic_ice_controller.cc).
+//
+// Every check is a NEW transaction — never a retransmission of the same
+// bytes (a retransmission repeats the role it was sent with, the deadlock
+// the 487 fix had to untangle); a response is accepted for up to 60s.
+const PING_WEAK_MS               = 48;     // kWeakPingInterval: while nothing works, or a pair's first 3 checks
+const PING_STRONG_MS             = 480;    // kStrongPingInterval: the scheduler's pace once connected
+const PING_STABLE_WRITABLE_MS    = 2500;   // a working pair, RTT settled, nothing missing
+const PING_UNSTABLE_WRITABLE_MS  = 900;    // a working pair otherwise
+const PING_BACKUP_MS             = 25000;  // working pairs that are not the selected one
+const MIN_PINGS_AT_WEAK          = 3;      // kMinPingsAtWeakPingInterval
+const CHECK_RECEIVING_MS         = 250;    // the scheduler wakes at least this often (state upkeep)
+const RECEIVING_TIMEOUT_MS       = 2500;   // nothing received this long → not receiving
+const RECEIVING_SWITCH_DELAY_MS  = 1000;   // a receiving difference counts once it held this long
+const UNWRITABLE_TIMEOUT_MS      = 5000;   // working → unreliable: unanswered this long ...
+const UNWRITABLE_MIN_CHECKS      = 5;      // ... and this many checks
+const INACTIVE_TIMEOUT_MS        = 15000;  // unanswered this long → the pair is dead (timeout)
+const RESPONSE_TIMEOUT_MS        = 60000;  // a late response is still accepted this long
+const DEFAULT_RTT_MS             = 3000;   // before the first measurement
+const MIN_RTT_MS                 = 100;
+const MAX_RTT_MS                 = 60000;
+const RTT_RATIO                  = 3;      // smoothing: rtt = (3·rtt + sample) / 4
+const MIN_RTT_IMPROVEMENT_MS     = 10;     // kMinImprovement: an RTT-only switch must gain this
 
 // ── [ice-diag] instrumentation gate + rate limiter ──
 // Enabled with WEBRTC_DEBUG=1 (same env var the webrtc-server layers use).
@@ -93,20 +113,22 @@ function _diagRL(key, ms) {
 }
 function _diagTs() { return new Date().toISOString().slice(11, 23); }
 
-// Consent Freshness — RFC 7675.
-// After ICE completes, we verify the path is still alive by sending a STUN
-// Binding Request every ~15s. If no success response for 30s, declare the
-// session "disconnected". After 45s of no success, declare "failed".
-// Values are env-overridable for tests (so we don't wait 45s in unit tests).
-const CONSENT_INTERVAL_MS       = parseInt(process.env.ICE_CONSENT_INTERVAL_MS   || '15000', 10);
-const CONSENT_RANDOMIZATION     = 0.2;     // ±20% per RFC 7675 §5.1
-const CONSENT_DISCONNECT_MS     = parseInt(process.env.ICE_CONSENT_DISCONNECT_MS || '30000', 10);
-const CONSENT_FAILED_MS         = parseInt(process.env.ICE_CONSENT_FAILED_MS     || '45000', 10);
+// Lite liveness (passive): a full-ICE peer checks its selected pair at least
+// every few seconds (Chrome 2.5s, RFC 7675 consent every 4-6s — Firefox), so
+// silence is the signal. Disconnected after 15s without a check (two to
+// three missed consent checks — tighter would flap on RFC 7675 peers),
+// failed at 30s (RFC 7675: consent expires after 30 seconds).
+const LITE_DISCONNECT_MS        = parseInt(process.env.ICE_LITE_DISCONNECT_MS || '15000', 10);
+const LITE_FAILED_MS            = parseInt(process.env.ICE_LITE_FAILED_MS     || '30000', 10);
 // Lite liveness (passive) — how often the observer wakes to read the
 // last-request age. The THRESHOLDS are deliberately the consent ones:
 // disconnected/failed mean the same thing regardless of which side's
 // evidence proved the path dead.
 const LITE_LIVENESS_TICK_MS     = parseInt(process.env.ICE_LITE_LIVENESS_TICK_MS || '5000', 10);
+// Lite: a pair is "receiving" while the peer's checks keep arriving on it —
+// libwebrtc's receiving timeout (kReceivingTimeout, 2.5s). Decides whether
+// the selected pair is still the path the peer uses (cascade 2.5).
+const LITE_RECEIVING_MS         = 2500;
 
 // Gathering — global safety cap
 const GATHER_SRFLX_TIMEOUT_MS = 5000;
@@ -332,7 +354,6 @@ function IceAgent(options) {
     // ── Check list / pairs ──
     checkList:            [],
     validList:            [],
-    triggeredQueue:       [],
 
     // ── Selected pair ──
     selectedPair:         null,
@@ -342,6 +363,16 @@ function IceAgent(options) {
     primarySocket:        null,  // preferred socket for sending (set by selection)
     externalSocket:       options.socket  || null,  // externally-provided IPv4 socket
     externalSocket6:      options.socket6 || null,  // externally-provided IPv6 socket
+
+    // ── ICE-TCP, passive (RFC 6544) — lite servers only ──
+    // Objects shaped like a dgram socket — address() and send(buf, port, ip,
+    // cb) — that carry ICE over TCP connections someone else accepts (e.g.
+    // WebRTCRouter.tcp()). When present, every host address also gets a
+    // 'tcp … tcptype passive' candidate, below UDP in priority. Packets from
+    // those connections come in through handlePacket() with rinfo.protocol
+    // 'tcp'; replies and media go back through send().
+    tcpSocket:            options.tcpSocket  || null,
+    tcpSocket6:           options.tcpSocket6 || null,
 
     // ── Announced addresses — override host candidate IPs/ports.
     // Useful when the bind address ≠ public address (NAT, cloud, 0.0.0.0 bind).
@@ -356,16 +387,15 @@ function IceAgent(options) {
     // ── STUN transactions ──
     pendingTransactions:  {},    // txnIdHex → { kind: 'check'|'consent'|'gather-srflx', pair?, timer?, callback }
 
-    // ── Timers (bookkeeping — handles, not "state" that triggers cascades) ──
-    checkTimer:           null,
-    nominationTimer:      null,
-    consentTimer:         null,
-    consentActive:        false,  // consent freshness cycle is running (see 2.8)
+    // ── Full ICE check scheduler (bookkeeping — not cascade state) ──
+    pingTimer:            null,   // the scheduler's next wake-up (pingTick)
+    pingDueAt:            0,      // when it is due
+    lastPingAt:           0,      // last check sent, any pair (pacing)
+    lastTxSweepAt:        0,      // last expiry sweep of check transactions
+    hasBeenWritable:      false,  // a selected pair worked once → losing it is 'disconnected'
 
     // ── State tracked by set_context cascades ──
-    selectedPair:         null,   // when set → cascade: emit, state=connected, stop checks, start consent
-    nominationStarted:    false,  // when true → nomination timer is scheduled
-    consentLastSuccessAt: 0,      // updated when a consent reply arrives
+    selectedPair:         null,   // when set → cascade: emit, state=connected
     // ── Lite liveness (passive; RFC-8445 §11 keepalives as evidence) ──
     // Consent (RFC 7675) is a SENDER's mechanism and cascade 2.8 rightly
     // skips it in lite — but that left lite with NO producer of
@@ -377,7 +407,7 @@ function IceAgent(options) {
     // currently inactive"), so their absence IS the liveness signal —
     // observed, never transmitted: zero bytes on the wire from us.
     liteLivenessTimer:    null,   // bookkeeping (rule at 'Timer handles')
-    liteLivenessActive:   false,  // cycle running (mirrors consentActive)
+    liteLivenessActive:   false,  // cycle running
     lastRequestReceivedAt: 0,     // any AUTHENTICATED binding request
 
     // ── ICE restart — RFC 8445 §9 ──
@@ -412,10 +442,8 @@ function IceAgent(options) {
   // "Notification" fields that always set has_changed=true (signal events):
   //    add_local_candidate, add_remote_candidate, pair_validated, pair_failed
   //
-  // Timer handles (checkTimer, nominationTimer, consentTimer) are bookkeeping,
-  // mutated imperatively alongside the state flag that DOES cascade. E.g.:
-  //   - nominationStarted=true (flag)   +   nominationTimer=<handle> (bookkeeping)
-  //   - selectedPair=<pair>    (flag)   +   consentTimer=<handle>    (bookkeeping)
+  // Timer handles (pingTimer, liteLivenessTimer) are bookkeeping, mutated
+  // imperatively alongside the state that DOES cascade.
 
   function set_context(opts) {
     if (!opts || typeof opts !== 'object') return;
@@ -558,7 +586,7 @@ function IceAgent(options) {
 
     if ('add_local_candidate' in opts) {
       const cand = opts.add_local_candidate;
-      if (cand && !findLocalCandidate(cand.ip, cand.port)) {
+      if (cand && !findLocalCandidate(cand.ip, cand.port, cand.protocol || 'udp')) {
         context.localCandidates.push(cand);
         has_changed = true;
         // RFC 8838 — Trickle ICE: emit candidates as found.
@@ -622,6 +650,10 @@ function IceAgent(options) {
           if (cand.relatedPort != null || cand.rport != null) {
             known.relatedPort = cand.relatedPort != null ? cand.relatedPort : cand.rport;
           }
+          // Its pairs' priorities follow the candidate's (RFC 8445 §6.1.2.3)
+          // — kept at the guessed prflx priority, a pair the peer ranks
+          // higher could never win the selection.
+          if (cand.priority != null) recomputePairPriorities();
           has_changed = true;
         }
       }
@@ -654,14 +686,10 @@ function IceAgent(options) {
       if (opts.pair_triggered) has_changed = true;
     }
 
-
-    /* Nomination flag */
-
-    if ('nominationStarted' in opts) {
-      if (!!opts.nominationStarted !== !!context.nominationStarted) {
-        context.nominationStarted = !!opts.nominationStarted;
-        has_changed = true;
-      }
+    // Full ICE scheduler tick — pair states moved with time; re-run the
+    // selection and state cascades.
+    if ('pair_tick' in opts) {
+      if (opts.pair_tick) has_changed = true;
     }
 
 
@@ -678,16 +706,6 @@ function IceAgent(options) {
           if (sock && !context.selectedPair.local.turnClient) context.primarySocket = sock;
           ev.emit('selectedpair', context.selectedPair, prev || null);
         }
-      }
-    }
-
-
-    /* Consent success tracking */
-
-    if ('consentLastSuccessAt' in opts) {
-      if (opts.consentLastSuccessAt !== context.consentLastSuccessAt) {
-        context.consentLastSuccessAt = opts.consentLastSuccessAt;
-        has_changed = true;
       }
     }
 
@@ -737,95 +755,74 @@ function IceAgent(options) {
     }
 
 
-    /* 2.2 — Enter 'checking' when creds + pairs are ready (full mode).
-     *  Runs when:
-     *    - state='new' (fresh connection)
-     *    - state='connected' with _previousPair set (ICE restart, RFC 8445 §9):
-     *      old pair keeps forwarding media while we negotiate a new selection
-     */
-    if ((context.state === 'new' ||
-         (context.state === 'connected' && context._previousPair)) &&
-        context.mode !== 'lite' &&
+    /* 2.2 — Full ICE: start the check scheduler once there is something to
+     *  check — credentials and at least one pair. It then runs for the life
+     *  of the session (selected-pair keepalives ARE checks, as in libwebrtc;
+     *  there is no separate consent cycle), until failed, a restart or
+     *  close. pingTick drives everything time-based: pair states, the
+     *  selected pair, pruning, the connection state. */
+    if (context.mode !== 'lite' &&
+        !context.pingTimer &&
+        context.state !== 'failed' &&
         context.remoteUfrag && context.remotePwd &&
-        context.localCandidates.length > 0 &&
-        context.remoteCandidates.length > 0 &&
-        context.checkList.length > 0 &&
-        !context.selectedPair) {
-      // A RESTART DOES NOT GO BACK TO 'checking'.
-      //
-      // RFC 8445 9.3.2: while a restart is in progress the agent keeps
-      // serving media over the PREVIOUS pair, which is exactly what
-      // _previousPair exists for (see its note above). The connection is not
-      // in doubt — new candidates are being checked alongside a working one —
-      // so the state stays 'connected' and only moves if the restart fails.
-      //
-      // Reporting 'checking' told every application watching
-      // iceConnectionState that the call was reconnecting, on a call that had
-      // never stopped working. On a mobile network, where restarts happen
-      // routinely, that is a "reconnecting" indicator flashing at a user
-      // whose video never dropped a frame.
-      //
-      // The checks themselves are unaffected: cascade 2.3 starts its
-      // scheduler on `checking` OR on a restart in progress, so the new pairs
-      // are probed either way.
-      if (context.state !== 'connected') {
-        params_to_set.state = 'checking';
-      }
-    }
-
-
-    /* 2.3 — Start the check scheduler tick when state='checking' and ready.
-     *        Same prerequisites as 2.2 — we need creds + candidates + pairs.
-     *        This way, artificially setting state='checking' without inputs
-     *        doesn't launch a tick that would immediately fail. */
-    if ((context.state === 'checking' ||
-         // Restart in progress: the state deliberately stays 'connected'
-         // (see 2.2), but the new candidate pairs still have to be probed.
-         (context.state === 'connected' && context._previousPair)) &&
-        !context.checkTimer &&
-        !context.selectedPair &&
-        context.mode !== 'lite' &&
-        context.remoteUfrag && context.remotePwd &&
-        context.localCandidates.length > 0 &&
-        context.remoteCandidates.length > 0 &&
         context.checkList.length > 0 &&
         !context.closed) {
-      initiateChecks();   // imperative: unfreeze pairs, setInterval(runCheckTick)
+      schedulePingTick(0);
     }
 
 
-    /* 2.4 — Schedule nomination when controlling + first valid pair appears */
-    if (context.controlling &&
-        context.mode !== 'lite' &&
-        !context.nominationStarted &&
-        !context.selectedPair &&
-        context.validList.length > 0 &&
-        !context.closed) {
-      initiateNominationTimer();   // imperative: setTimeout → nominatePair()
-      params_to_set.nominationStarted = true;
-    }
-
-
-    /* 2.5 — Auto-select: the highest-priority nominated-and-valid pair.
+    /* 2.5 — The selected pair.
      *
-     * NOT first-past-the-post: under aggressive nomination (RFC 5245-era
-     * behavior that pion/webrtc-rs still use — USE-CANDIDATE on every
-     * check) several pairs become nominated, and WHICH validates first is
-     * a network race. If we lock the first one while the peer selects by
-     * priority, the two sides can settle on different 5-tuples — observed
-     * live against webrtc-rs, whose srflx gathering socket is distinct
-     * from its advertised host socket: we locked the peer-reflexive pair
-     * (their srflx-base), their DTLS sat on their host socket, and the
-     * ClientHello went into a void. Both RFC 5245 §8.1.1.2 semantics and
-     * libwebrtc/pion practice: the controlled side keeps converging to
-     * the highest-priority nominated valid pair. The selectedPair setter
-     * handles replacement (emits with prev, retargets primarySocket). */
+     * Lite: the highest-priority nominated valid pair, then following the
+     * path the peer actually uses (below).
+     *
+     * Full: libwebrtc's comparator (fullSelect) — a working pair over one
+     * that is not, receiving over not, then (controlled side) nominated,
+     * then priority; an RTT-only switch must gain 10ms. Also re-run on every
+     * scheduler tick, so a pair that starts or stops working moves the
+     * selection without waiting for an event. */
     if (!context.closed) {
       let best = context.selectedPair || null;
-      for (let i = 0; i < context.validList.length; i++) {
-        const p = context.validList[i];
-        if (!p.valid || !p.nominated) continue;
-        if (!best || p.priority > best.priority) best = p;
+      if (context.mode === 'lite' && best) {
+        // LITE FOLLOWS THE PATH THE PEER IS USING.
+        //
+        // A lite agent never checks, so the controlling peer decides the
+        // path alone and says so with USE-CANDIDATE — libwebrtc, facing a
+        // lite peer, puts it on the pings of its SELECTED pair only. When
+        // it moves (its network changed: a relay pair now), USE-CANDIDATE
+        // arrives on another pair; the old one, possibly of higher
+        // priority, goes quiet. Highest-priority-nominated alone kept us on
+        // that dead path — sending media to an address the peer no longer
+        // reads.
+        //
+        // Switch to a pair the peer is checking right now (receiving) and
+        // nominated after the selected one's last nomination; while the
+        // selected pair is still receiving, only to a higher-priority one
+        // (an aggressive-nomination peer converging, as before). The
+        // nomination-order guard keeps a backup ping (no USE-CANDIDATE) on
+        // an old pair from pulling us back to it.
+        const now = Date.now();
+        const sel = best;
+        const selReceiving = (now - sel.requestReceivedAt) < LITE_RECEIVING_MS;
+        for (let i = 0; i < context.validList.length; i++) {
+          const p = context.validList[i];
+          if (p === sel || !p.valid || !p.nominated) continue;
+          if ((now - p.requestReceivedAt) >= LITE_RECEIVING_MS) continue;
+          if (p.nominatedAt <= sel.nominatedAt) continue;
+          if (selReceiving) {
+            if (p.priority > best.priority) best = p;
+          } else if (best === sel || p.nominatedAt > best.nominatedAt) {
+            best = p;
+          }
+        }
+      } else if (context.mode === 'lite') {
+        for (let i = 0; i < context.validList.length; i++) {
+          const p = context.validList[i];
+          if (!p.valid || !p.nominated) continue;
+          if (!best || p.priority > best.priority) best = p;
+        }
+      } else {
+        best = fullSelect(Date.now()) || context.selectedPair || null;
       }
       if (best && best !== context.selectedPair) {
         params_to_set.selectedPair = best;
@@ -838,81 +835,42 @@ function IceAgent(options) {
     }
 
 
-    /* 2.6 — Once selected, transition state to 'connected' */
-    // 'disconnected' is excluded alongside 'failed' and 'closed'. It is a
-    // consent-freshness verdict (RFC 7675), not a checklist verdict: the pair
-    // is still selected and still valid as far as the checklist knows, so
-    // without this exclusion every set_context({state:'disconnected'}) was
-    // undone by the very cascade run it triggered. The state oscillated
-    // disconnected -> connected forever and a dead peer never latched.
-    //
-    // Recovery is owned by consentTick, which sets 'connected' again itself
-    // once a consent response arrives and the age drops back under the
-    // threshold. That is the only place that knows the path came back.
-    if (context.selectedPair &&
-        context.state !== 'connected' &&
-        context.state !== 'disconnected' &&
-        context.state !== 'failed' &&
-        context.state !== 'closed') {
-      params_to_set.state = 'connected';
-    }
-
-
-    /* 2.7 — Stop the check scheduler once selected AND settled: while a
-     * higher-priority pair could still validate (waiting / in-progress /
-     * frozen), checks must continue or cascade 2.5's convergence can
-     * never happen — the upgrade pair only becomes `valid` through OUR
-     * completed check. Terminates: such pairs either succeed (upgrade,
-     * then no higher pair remains) or fail (leave the set); the global
-     * 45s policy bounds the whole phase. */
-    if (context.selectedPair) {
-      let upgradePossible = false;
-      for (let i = 0; i < context.checkList.length; i++) {
-        const p = context.checkList[i];
-        if (p === context.selectedPair) continue;
-        if (p.priority <= context.selectedPair.priority) continue;
-        if (p.state === 'waiting' || p.state === 'in-progress' || p.state === 'frozen') {
-          upgradePossible = true;
-          break;
-        }
+    /* 2.6 — The connection state.
+     *
+     * Lite: 'connected' once selected; the passive liveness (2.8b) owns
+     * 'disconnected' / 'failed'.
+     *
+     * Full: derived from the pairs, as libwebrtc does
+     * (ComputeIceTransportState) — see computeFullState. */
+    if (context.mode === 'lite') {
+      // 'disconnected' is excluded alongside 'failed' and 'closed': it is the
+      // liveness verdict, and the pair is still selected — without this
+      // exclusion every set_context({state:'disconnected'}) was undone by the
+      // very cascade run it triggered. Recovery is owned by liteLivenessTick.
+      if (context.selectedPair &&
+          context.state !== 'connected' &&
+          context.state !== 'disconnected' &&
+          context.state !== 'failed' &&
+          context.state !== 'closed') {
+        params_to_set.state = 'connected';
       }
-      if (!upgradePossible) {
-        if (context.checkTimer) {
-          clearInterval(context.checkTimer);
-          context.checkTimer = null;
-        }
-        if (context.triggeredQueue && context.triggeredQueue.length > 0) {
-          context.triggeredQueue.length = 0;
-        }
-      }
+    } else if (!('state' in params_to_set) && !('selectedPair' in params_to_set)) {
+      // Not in the same pass as a new selected pair: set_context emits the
+      // state before it applies selectedPair, and 'connected' is the cue
+      // the SDP layer starts DTLS on — synchronously. Its first flight then
+      // went out through send() with no selected pair yet and was dropped;
+      // the handshake waited out DTLS's 1s retransmission. The recursive
+      // pass that applies the pair decides the state, right after.
+      const st = computeFullState(context.selectedPair);
+      if (st && st !== context.state) params_to_set.state = st;
     }
 
 
-    /* 2.8 — Once selected, start consent freshness (RFC 7675) */
-    // Gated on consentActive, NOT on consentTimer. The handle is legitimately
-    // null for the duration of a tick (consentTick nulls it on entry), so
-    // gating on it made every state change that happened inside a tick look
-    // like "consent is not running" and restart the cycle.
-    //
-    // That was fatal for the one transition that matters: consentTick detects
-    // a dead path, sets 'disconnected', set_context re-runs this cascade, the
-    // cascade sees a null handle and calls initiateConsentFreshness, which
-    // resets consentLastSuccessAt — erasing the very evidence that produced
-    // the disconnect. The state flipped straight back to 'connected' and did
-    // so forever; 'failed' was unreachable, and a second consent timer was
-    // scheduled on every cycle. A dead peer stayed 'connected' indefinitely.
-    if (context.selectedPair &&
-        !context.consentActive &&
-        context.mode !== 'lite' &&
-        !context.closed) {
-      initiateConsentFreshness();   // imperative: schedules first consentTick
-    }
-
-    /* 2.8b — Lite counterpart: passive liveness (see the context-field
-     * note). Same gate shape as 2.8 with the mode flipped; same
-     * activation-flag discipline (liteLivenessActive, NOT the timer
-     * handle — the 2.8 lesson about in-tick null handles applies
-     * verbatim here). */
+    /* 2.8b — Lite: passive liveness (see the context-field note). Gated on
+     * liteLivenessActive, NOT the timer handle — the handle is null for the
+     * duration of a tick, and a state change made inside the tick would
+     * otherwise look like "not running" and restart the cycle, erasing the
+     * very evidence that produced the change. */
     if (context.selectedPair &&
         !context.liteLivenessActive &&
         context.mode === 'lite' &&
@@ -938,18 +896,24 @@ function IceAgent(options) {
 
   /* ========================= Candidate lookup ========================= */
 
-  function findLocalCandidate(ip, port) {
+  // protocol: as findRemoteCandidate — a UDP and a TCP candidate on the same
+  // ip:port (ICE-TCP beside UDP on one port number) are two candidates.
+  function findLocalCandidate(ip, port, protocol) {
     for (let i = 0; i < context.localCandidates.length; i++) {
       const c = context.localCandidates[i];
-      if (c.ip === ip && c.port === port) return c;
+      if (c.ip === ip && c.port === port &&
+          (!protocol || (c.protocol || 'udp') === protocol)) return c;
     }
     return null;
   }
 
-  function findRemoteCandidate(ip, port) {
+  // protocol: only a candidate of that transport ('udp' / 'tcp') — the same
+  // ip:port over UDP and over TCP are two candidates.
+  function findRemoteCandidate(ip, port, protocol) {
     for (let i = 0; i < context.remoteCandidates.length; i++) {
       const c = context.remoteCandidates[i];
-      if (c.ip === ip && c.port === port) return c;
+      if (c.ip === ip && c.port === port &&
+          (!protocol || (c.protocol || 'udp') === protocol)) return c;
     }
     return null;
   }
@@ -961,6 +925,15 @@ function IceAgent(options) {
       p.priority = computePairPriority(context.controlling, p.local.priority, p.remote.priority);
     }
     context.checkList.sort((a, b) => b.priority - a.priority);
+    // A pair pruned under its old priority that now outranks the selected
+    // one is worth checking again — pruning only ever drops dominated pairs.
+    const sel = context.selectedPair;
+    for (let i = 0; i < context.checkList.length; i++) {
+      const p = context.checkList[i];
+      if (!p.pruned || (sel && p.priority <= sel.priority)) continue;
+      p.pruned = false;
+      if (p.writeState === 'timeout' && !p.errorFailed) p.writeState = 'init';
+    }
   }
 
 
@@ -1075,22 +1048,14 @@ function IceAgent(options) {
   }
 
   /**
-   * Mirror of runCheckTick's terminal condition, for the moment the last
-   * pending mDNS resolution fails: if the check scheduler already stopped
-   * (or never started) and nothing valid exists, the ICE session is dead.
-   * While pendingResolves > 0 this never fires — a resolution in flight
-   * can still create pairs.
+   * The last pending mDNS resolution ended: the connection state may now be
+   * decided (computeFullState holds 'failed' while resolutions are in
+   * flight — one can still create pairs).
    */
   function maybeFailAfterMdns() {
     if (context.mdns.pendingResolves > 0) return;
-    if (context.state !== 'checking') return;
-    if (context.checkTimer) return;      // scheduler alive — it will decide
-    if (context.selectedPair) return;
-    const anyActive = context.checkList.some((p) =>
-      p.state === 'waiting' || p.state === 'in-progress' || p.state === 'frozen');
-    if (anyActive) return;
-    const anyValid = context.checkList.some((p) => p.valid);
-    if (!anyValid) set_context({ state: 'failed' });
+    if (context.mode === 'lite') return;
+    set_context({ pair_tick: true });
   }
 
   /**
@@ -1135,22 +1100,36 @@ function IceAgent(options) {
       local:           local,
       remote:          remote,
       priority:        computePairPriority(context.controlling, local.priority, remote.priority),
-      state:           'frozen',    // frozen | waiting | in-progress | succeeded | failed
+      // waiting | in-progress | succeeded | failed (W3C pair state). Full
+      // checks every pair as soon as it exists (libwebrtc has no frozen
+      // stage); lite never checks — its pairs go straight to succeeded.
+      state:           context.mode === 'lite' ? 'frozen' : 'waiting',
       valid:           false,
 
-      // Nomination tracking (Part 2b)
+      // Nomination tracking
       nominated:       false,       // both sides agree — pair is the chosen one
       peerNominated:   false,       // remote sent USE-CANDIDATE on this pair
-      weNominated:     false,       // we (controlling) sent USE-CANDIDATE on this pair
+      weNominated:     false,       // our USE-CANDIDATE on it was answered
 
-      retransmits:     0,
-      transactionId:   null,
-      lastSent:        0,
-      encodedCheck:    null,
+      // ── Full ICE check state (libwebrtc Connection) ──
+      writeState:      'init',      // writable | unreliable | init | timeout
+      receiving:       false,       // something arrived on it in the last 2.5s
+      receivingChangedAt: 0,
+      lastReceivedAt:  0,           // response, request, or (selected) data
+      lastPingSent:    0,
+      lastResponseAt:  0,
+      pingsSent:       0,
+      unanswered:      0,           // checks sent since the last response ...
+      unansweredFirstAt: 0,         // ... the first of them
+      unansweredFifthAt: 0,         // ... and the fifth (TooManyFailures)
+      rttEstMs:        DEFAULT_RTT_MS,
+      rttSamples:      0,
+      pruned:          false,       // dominated by the selected pair: not checked any more
+      errorFailed:     false,       // an unrecoverable STUN error: never checked again
+      checkControlling: null,       // the role the last check claimed
 
       // ── Stats counters (W3C RTCIceCandidatePairStats) ───────────────────
-      // Populated by sendBindingCheck/sendConsentCheck/onCheckResponse and
-      // by handleBindingRequest. Zero-valued until first activity.
+      // Populated by sendPing/onPingResponse and by handleBindingRequest. Zero-valued until first activity.
       roundTripTime:      0,        // seconds, last measured (response - request)
       totalRoundTripTime: 0,        // seconds, sum of all measurements
       rttMeasurements:    0,        // count of successful response arrivals
@@ -1158,13 +1137,18 @@ function IceAgent(options) {
       responsesReceived:  0,        // responses to our checks
       requestsReceived:   0,        // peer's connectivity checks we got
       responsesSent:      0,        // our responses to peer's checks
-      consentRequestsSent: 0,       // consent keepalives we sent
+      consentRequestsSent: 0,       // checks on the working selected pair (keepalives)
       bytesSent:          0,        // STUN bytes sent on this pair
       bytesReceived:      0,        // STUN bytes received on this pair
       packetsSent:        0,        // STUN packets sent on this pair
       packetsReceived:    0,        // STUN packets received on this pair
       lastPacketSentTimestamp:     0,
       lastPacketReceivedTimestamp: 0,
+
+      // Lite selection (cascade 2.5): when the peer's last authenticated
+      // check arrived on this pair, and its last USE-CANDIDATE.
+      requestReceivedAt:  0,
+      nominatedAt:        0,
     };
   }
 
@@ -1250,8 +1234,8 @@ function IceAgent(options) {
             rejectUnauthorized: srv.rejectUnauthorized,
             ca:                 srv.ca,
             // Pass-through DTLS (lemon-tls) + WebSocket transport options.
-            // All optional: the Socket falls back to import('lemon-tls') and
-            // the global WebSocket respectively when these are absent.
+            // All optional: the Socket uses its own lemon-tls and the global
+            // WebSocket respectively when these are absent.
             connectDTLS:        srv.connectDTLS,
             lemonTls:           srv.lemonTls,
             alpnProtocols:      srv.alpnProtocols,
@@ -1483,6 +1467,19 @@ function IceAgent(options) {
           const port = (typeof a === 'object' && a.port) ? a.port : sockAddr.port;
           addHostFromBoundSocket(sock, { address: ip, port: port, family: family });
         }
+        // The same addresses over TCP, where a TCP carrier is given.
+        for (let i = 0; i < announced.length; i++) {
+          const a = announced[i];
+          const ip = typeof a === 'string' ? a : a.ip;
+          if (!ip) continue;
+          const family = ip.indexOf(':') >= 0 ? 'IPv6' : 'IPv4';
+          const tsock = family === 'IPv6' ? context.tcpSocket6 : context.tcpSocket;
+          if (!tsock) continue;
+          let tAddr;
+          try { tAddr = tsock.address(); } catch (_) { continue; }
+          const tport = (typeof a === 'object' && a.tcpPort) ? a.tcpPort : tAddr.port;
+          addTcpPassiveHost(tsock, { address: ip, port: tport, family: family });
+        }
       } else {
         // No announced addresses — use the bind addresses (legacy behavior).
         if (context.externalSocket) {
@@ -1501,6 +1498,16 @@ function IceAgent(options) {
             family:  addr.family || 'IPv6',
           });
         }
+        [context.tcpSocket, context.tcpSocket6].forEach(function(tsock) {
+          if (!tsock) return;
+          let tAddr;
+          try { tAddr = tsock.address(); } catch (_) { return; }
+          addTcpPassiveHost(tsock, {
+            address: tAddr.address,
+            port:    tAddr.port,
+            family:  tAddr.family || (tsock === context.tcpSocket6 ? 'IPv6' : 'IPv4'),
+          });
+        });
       }
       done();
       return;
@@ -1555,6 +1562,35 @@ function IceAgent(options) {
         if (pending === 0) done();
       });
     }
+  }
+
+  // A passive TCP host candidate (RFC 6544): "connect to me here". Its
+  // socket is the TCP carrier, so checks answered and media sent on a pair
+  // that uses it go back over the connection they came on. Not kept in
+  // context.sockets — the carrier is the caller's, never closed here.
+  //
+  // Priority (RFC 6544 §4.2): local preference = 2^13 * direction-pref +
+  // other-pref, passive = 4 → 40959, below a UDP host's 65535; a peer
+  // that can reach UDP picks it.
+  const TCP_PASSIVE_LOCAL_PREFERENCE = (4 << 13) + 8191;
+
+  function addTcpPassiveHost(tsock, addr) {
+    if (context.iceTransportPolicy === 'relay') return;
+    set_context({ add_local_candidate: {
+      foundation:     computeFoundation('host', addr.address, 'tcp', ''),
+      component:      COMPONENT_RTP,
+      protocol:       'tcp',
+      priority:       computeCandidatePriority('host', TCP_PASSIVE_LOCAL_PREFERENCE, COMPONENT_RTP),
+      ip:             addr.address,
+      port:           addr.port,
+      type:           'host',
+      relatedAddress: null,
+      relatedPort:    null,
+      tcpType:        'passive',
+      base:           { ip: addr.address, port: addr.port, family: addr.family },
+      socket:         tsock,
+      turnClient:     null,
+    } });
   }
 
   function addHostFromBoundSocket(sock, boundAddr) {
@@ -1899,8 +1935,8 @@ function IceAgent(options) {
           servername:         server.servername         || parsed.host,
           rejectUnauthorized: server.rejectUnauthorized,  // undefined → default (true)
           ca:                 server.ca || null,
-          // DTLS transport (lemon-tls) — injection optional; Socket falls back
-          // to import('lemon-tls') when these are absent.
+          // DTLS transport (lemon-tls) — injection optional; Socket uses its
+          // own lemon-tls when these are absent.
           connectDTLS:        server.connectDTLS || null,
           lemonTls:           server.lemonTls    || null,
           alpnProtocols:      server.alpnProtocols || null,
@@ -1999,6 +2035,12 @@ function IceAgent(options) {
     if (type === 'stun') {
       handleStunMessage(buf, rinfo, sock);
     } else {
+      // Full: data on the selected pair keeps it "receiving" (libwebrtc
+      // counts any packet, not only checks).
+      const sp = context.selectedPair;
+      if (sp && context.mode !== 'lite' && sp.remote.port === rinfo.port && sp.remote.ip === rinfo.address) {
+        sp.lastReceivedAt = Date.now();
+      }
       // DTLS / RTP / RTCP / channel-data — forward
       ev.emit('packet', buf, rinfo, type);
     }
@@ -2037,9 +2079,34 @@ function IceAgent(options) {
       const rinfo = { address: peerIp, port: peerPort, family: addressFamilyOf(peerIp) };
       handleStunMessage(buf, rinfo, null, turnSocket);
     } else {
+      const sp = context.selectedPair;
+      if (sp && context.mode !== 'lite' && sp.remote.port === peerPort && sp.remote.ip === peerIp) {
+        sp.lastReceivedAt = Date.now();
+      }
       // Lightweight rinfo without family computation (not needed for media demux).
       ev.emit('packet', buf, { address: peerIp, port: peerPort }, type);
     }
+  }
+
+  // Short-term keys (RFC 8489 §9.1.1) for our password and the peer's,
+  // computed once per password value rather than per STUN message. Keyed by
+  // the value: the passwords change by assignment in several places
+  // (set_context, restart()), and a changed value recomputes here.
+  var _localKeyPwd = null, _localKey = null;
+  var _remoteKeyPwd = null, _remoteKey = null;
+  function localKey() {
+    if (context.localPwd !== _localKeyPwd) {
+      _localKeyPwd = context.localPwd;
+      _localKey = _localKeyPwd ? wire.compute_short_term_key(_localKeyPwd) : null;
+    }
+    return _localKey;
+  }
+  function remoteKey() {
+    if (context.remotePwd !== _remoteKeyPwd) {
+      _remoteKeyPwd = context.remotePwd;
+      _remoteKey = _remoteKeyPwd ? wire.compute_short_term_key(_remoteKeyPwd) : null;
+    }
+    return _remoteKey;
   }
 
   function handleStunMessage(buf, rinfo, sock, turnSocket) {
@@ -2048,7 +2115,7 @@ function IceAgent(options) {
     // below, a disconnect investigation can now distinguish in one run:
     // never-arrived (no stun-rx) / arrived-but-unparseable (DECODE FAILED)
     // / parsed-but-dropped (validation 401s) / handled.
-    if (_diagRL('stunrx:' + rinfo.address + ':' + rinfo.port, 2000)) {
+    if (_ICE_DBG && _diagRL('stunrx:' + rinfo.address + ':' + rinfo.port, 2000)) {
       var _lsock = '?';
       try { if (sock) { var _la = sock.address(); _lsock = _la.address + ':' + _la.port; } } catch (e) {}
       console.log('[ice-diag] ' + _diagTs() + ' stun-rx from ' +
@@ -2057,7 +2124,7 @@ function IceAgent(options) {
     }
     const msg = wire.decode_message(buf);
     if (!msg) {
-      if (_diagRL('stundecfail:' + rinfo.address + ':' + rinfo.port, 2000)) {
+      if (_ICE_DBG && _diagRL('stundecfail:' + rinfo.address + ':' + rinfo.port, 2000)) {
         console.log('[ice-diag] ' + _diagTs() + ' stun-rx DECODE FAILED from ' +
                     rinfo.address + ':' + rinfo.port + ' len=' + buf.length +
                     ' head=' + buf.slice(0, 8).toString('hex'));
@@ -2069,15 +2136,14 @@ function IceAgent(options) {
     // 1. Pending transaction (our outgoing STUN req — connectivity check, gather, etc.)
     const pending = context.pendingTransactions[txHex];
     if (pending) {
-      if (_diagRL('stunresp:' + rinfo.address + ':' + rinfo.port, 5000)) {
+      if (_ICE_DBG && _diagRL('stunresp:' + rinfo.address + ':' + rinfo.port, 5000)) {
         console.log('[ice-diag] ' + _diagTs() + ' stun response consumed (kind=' +
                     pending.kind + ') from ' + rinfo.address + ':' + rinfo.port);
       }
       if (msg.cls === wire.CLASS.SUCCESS) {
         // For checks and consent: validate MESSAGE-INTEGRITY with remote password
         if ((pending.kind === 'check' || pending.kind === 'consent') && context.remotePwd) {
-          const validated = wire.validateStunMessage(buf, context.remotePwd);
-          if (!validated) return;   // silently drop bad-integrity response (RFC 8445 §7.2.5.1)
+          if (!wire.verifyStunIntegrity(buf, msg, remoteKey())) return;   // silently drop bad-integrity response (RFC 8445 §7.2.5.1)
         }
         if (pending.callback) pending.callback(msg, rinfo);
         return;
@@ -2093,8 +2159,7 @@ function IceAgent(options) {
                        && context.remotePwd
                        && (code === 401 || code === 438 || code === 487);
         if (requireMI) {
-          const validated = wire.validateStunMessage(buf, context.remotePwd);
-          if (!validated) return;   // silently drop spoof attempts
+          if (!wire.verifyStunIntegrity(buf, msg, remoteKey())) return;   // silently drop spoof attempts
         }
         if (pending.callback) pending.callback(msg, rinfo, new Error('STUN error response'));
         return;
@@ -2109,7 +2174,7 @@ function IceAgent(options) {
 
     // [ice-diag] Fallthrough — STUN we recognized but did not handle
     // (unknown transaction response, indication, non-binding method).
-    if (_diagRL('stunfall:' + rinfo.address + ':' + rinfo.port, 2000)) {
+    if (_ICE_DBG && _diagRL('stunfall:' + rinfo.address + ':' + rinfo.port, 2000)) {
       console.log('[ice-diag] ' + _diagTs() + ' stun UNHANDLED from ' +
                   rinfo.address + ':' + rinfo.port +
                   ' method=' + msg.method + ' cls=' + msg.cls +
@@ -2127,95 +2192,281 @@ function IceAgent(options) {
   // they perform I/O or schedule timers, and when events occur they feed
   // results BACK through set_context.
 
-  function initiateChecks() {
-    // Triggered by cascade 2.3 when state === 'checking' and no checkTimer.
-    // Unfreeze all pairs (simplified — RFC 8445 §6.1.2.6 specifies
-    // per-foundation unfreezing, but unfreeze-all is a safe superset).
-    for (let i = 0; i < context.checkList.length; i++) {
-      if (context.checkList[i].state === 'frozen') {
-        context.checkList[i].state = 'waiting';
-      }
-    }
-    context.checkTimer = setInterval(runCheckTick, CHECK_PACE_MS);
-    if (context.checkTimer.unref) context.checkTimer.unref();
-    // Run one immediately so the first check goes out without 50ms delay
-    runCheckTick();
+  /* ── Full ICE: the check scheduler (libwebrtc's P2PTransportChannel) ──
+   *
+   * One timer drives everything for the life of the session: which pair to
+   * check next, each pair's working state, the selected pair, pruning and
+   * the connection state. It wakes every 48ms while nothing works well
+   * (checking, or the selected pair not working/receiving) and every 250ms
+   * otherwise; each wake-up sends at most one check. */
+
+  function schedulePingTick(ms) {
+    if (context.closed || context.mode === 'lite') return;
+    if (context.pingTimer) clearTimeout(context.pingTimer);
+    context.pingDueAt = Date.now() + ms;
+    context.pingTimer = setTimeout(pingTick, ms);
+    if (context.pingTimer.unref) context.pingTimer.unref();
   }
 
-  function unfreezePairsAfterSuccess(succeeded) {
-    // After a pair completes, unfreeze all other pairs with the same
-    // local+remote foundation (RFC 8445 §7.2.5.3.3).
-    const fLocal = succeeded.local.foundation;
-    const fRemote = succeeded.remote.foundation;
+  // Something worth checking at once (a check arrived on a pair that does
+  // not work yet, a new pair, a role switch): bring the next wake-up
+  // forward — still paced at one check per 48ms.
+  function requestPingSoon() {
+    if (!context.pingTimer || context.closed) return;
+    const t = Date.now();
+    const due = Math.max(0, context.lastPingAt + PING_WEAK_MS - t);
+    if (context.pingDueAt - t > due) schedulePingTick(due);
+  }
+
+  function isActive(p)    { return p.writeState !== 'timeout' && !p.errorFailed; }
+  function readyToSend(p) { return p.writeState === 'writable' || p.writeState === 'unreliable'; }
+  function isWeakPair(p)  { return !(p.writeState === 'writable' && p.receiving); }
+  function channelWeak()  { const s = context.selectedPair; return !s || isWeakPair(s); }
+
+  // libwebrtc Connection::UpdateState.
+  function updatePairState(p, t) {
+    if (p.lastReceivedAt) {
+      const r = (t - p.lastReceivedAt) < RECEIVING_TIMEOUT_MS;
+      if (r !== p.receiving) { p.receiving = r; p.receivingChangedAt = t; }
+    }
+    if (p.writeState === 'writable') {
+      // TooManyFailures (5 checks, the 5th older than an RTT) AND
+      // TooLongWithoutResponse (5s).
+      if (p.unanswered >= UNWRITABLE_MIN_CHECKS &&
+          t > p.unansweredFifthAt + p.rttEstMs &&
+          t > p.unansweredFirstAt + UNWRITABLE_TIMEOUT_MS) {
+        p.writeState = 'unreliable';
+      }
+    }
+    if ((p.writeState === 'unreliable' || p.writeState === 'init') &&
+        p.unanswered > 0 && t > p.unansweredFirstAt + INACTIVE_TIMEOUT_MS) {
+      p.writeState = 'timeout';
+      p.state = 'failed';
+    }
+  }
+
+  // ── The comparator (libwebrtc BasicIceController) — > 0: a is better ──
+  const WRITE_RANK = { writable: 0, unreliable: 1, init: 2, timeout: 3 };
+  function compareStates(a, b, t) {
+    const aw = a.writeState === 'writable', bw = b.writeState === 'writable';
+    if (aw !== bw) return aw ? 1 : -1;
+    const ra = WRITE_RANK[a.writeState], rb = WRITE_RANK[b.writeState];
+    if (ra !== rb) return ra < rb ? 1 : -1;
+    // Receiving counts only once it has held for a second on both — a
+    // single late keepalive must not flip the selection back and forth.
+    if (a.receiving !== b.receiving) {
+      const th = t - RECEIVING_SWITCH_DELAY_MS;
+      if (a.receivingChangedAt <= th && b.receivingChangedAt <= th) return a.receiving ? 1 : -1;
+    }
+    return 0;
+  }
+  function compareCandidates(a, b) {
+    if (a.priority !== b.priority) return a.priority > b.priority ? 1 : -1;
+    if (a.pruned !== b.pruned) return a.pruned ? -1 : 1;
+    return 0;
+  }
+  function comparePairs(a, b, t) {
+    const c = compareStates(a, b, t);
+    if (c) return c;
+    // Controlled side: what the peer nominated outranks what it did not.
+    if (!context.controlling && a.peerNominated !== b.peerNominated) return a.peerNominated ? 1 : -1;
+    return compareCandidates(a, b);
+  }
+
+  // The pair to select now, or null to keep the current one
+  // (libwebrtc SortAndSwitchConnection / ShouldSwitchConnection).
+  //
+  // Both roles select among the pairs that work. Controlling: the choice is
+  // ours; the peer learns it from USE-CANDIDATE. Controlled: as libwebrtc,
+  // a working pair is selected before any nomination (media can start a
+  // round trip sooner), and the comparator ranks what the peer nominated
+  // above what it did not — so a nomination moves the selection to it.
+  function fullSelect(t) {
+    const sel = context.selectedPair;
+    let top = null;
     for (let i = 0; i < context.checkList.length; i++) {
       const p = context.checkList[i];
-      if (p.state !== 'frozen') continue;
-      if (p.local.foundation === fLocal && p.remote.foundation === fRemote) {
-        p.state = 'waiting';
-      }
+      if (!readyToSend(p)) continue;
+      if (!top) { top = p; continue; }
+      const c = comparePairs(p, top, t);
+      if (c > 0 || (c === 0 && p.rttEstMs < top.rttEstMs)) top = p;
+    }
+    if (!top || top === sel) return null;
+    if (!sel) return top;
+    const c = comparePairs(top, sel, t);
+    if (c > 0) return top;
+    if (c < 0) return null;
+    return (top.rttEstMs <= sel.rttEstMs - MIN_RTT_IMPROVEMENT_MS) ? top : null;
+  }
+
+  // A pair's network: the local interface it leaves from.
+  function networkOf(c) {
+    return (c.base && c.base.ip) || c.relatedAddress || c.ip;
+  }
+
+  // Once the selected pair works and receives, stop checking the pairs it
+  // dominates on the same network — equal or lower priority. Better pairs,
+  // and pairs on other networks (backups), keep being checked
+  // (libwebrtc PruneConnections; controlled side once nominated).
+  function fullPrune() {
+    const sel = context.selectedPair;
+    if (!sel || isWeakPair(sel)) return;
+    if (!context.controlling && !sel.nominated) return;
+    const net = networkOf(sel.local);
+    for (let i = 0; i < context.checkList.length; i++) {
+      const p = context.checkList[i];
+      if (p === sel || p.pruned) continue;
+      if (networkOf(p.local) !== net) continue;
+      if (compareCandidates(sel, p) < 0) continue;
+      p.pruned = true;
+      p.writeState = 'timeout';
     }
   }
 
-
-  /* ── Check scheduling tick ── */
-
-  function runCheckTick() {
-    if (context.closed) return;
-
-    // Prefer 'triggered' checks (pairs put into the triggered queue by an
-    // incoming Binding Request), then pick the highest-priority 'waiting' pair.
-    // RFC 8445 §6.1.4.
-    let next = null;
-    if (context.triggeredQueue && context.triggeredQueue.length > 0) {
-      next = context.triggeredQueue.shift();
-    } else {
-      const now = Date.now();
-      for (let i = 0; i < context.checkList.length; i++) {
-        const p = context.checkList[i];
-        if (p.state !== 'waiting') continue;
-        // Recoverable-error cooldown: the pair is active — which also
-        // keeps the check timer alive below — but its next attempt is
-        // not yet due (retry pacing for RFC 8445 §7.2.5.2.4 errors).
-        if (p.retryAfter && p.retryAfter > now) continue;
-        next = p;
-        break;
-      }
-    }
-
-    if (!next) {
-      // No pairs to check right now — check if we should stop the timer
-      const anyActive = context.checkList.some((p) =>
-        p.state === 'waiting' || p.state === 'in-progress' || p.state === 'frozen');
-      if (!anyActive) {
-        clearInterval(context.checkTimer);
-        context.checkTimer = null;
-        // All pairs terminated — if none succeeded, we fail.
-        // Nomination → 'connected' is Part 2b, so for now we stay in 'checking'
-        // when pairs succeed.
-        // Exception: an in-flight mDNS resolution can still create new
-        // pairs — hold off; finishMdnsResolve → maybeFailAfterMdns picks
-        // this up when the last one lands.
-        const anyValid = context.checkList.some((p) => p.valid);
-        if (!anyValid && context.mdns.pendingResolves === 0) {
-          set_context({ state: 'failed' });
-        }
-      }
-      return;
-    }
-
-    sendBindingCheck(next);
+  // The connection state from the pairs (libwebrtc ComputeIceTransportState):
+  //   failed        — no pair alive any more (all timed out / failed)
+  //   disconnected  — the selected pair stopped working, after it had worked
+  //   checking      — pairs alive, none working yet
+  //   connected     — the selected pair works
+  // 'failed' stays until a restart (restart() resets it): the router drops
+  // its fast-path routes on 'failed', and the SDP layer treats it as the
+  // cue to restart — a quiet recovery would reach neither.
+  function computeFullState(sel) {
+    if (context.mode === 'lite' || context.closed) return null;
+    if (context.state === 'failed' || context.state === 'closed') return null;
+    const list = context.checkList;
+    if (list.length === 0 || !context.remotePwd) return null;
+    let anyActive = false;
+    for (let i = 0; i < list.length; i++) if (isActive(list[i])) { anyActive = true; break; }
+    if (!anyActive) return context.mdns.pendingResolves > 0 ? null : 'failed';
+    // Restart in progress: the previous pair still carries media, and the
+    // state does not leave 'connected' for the new checks (RFC 8445 §9.3.2).
+    if (context._previousPair && !sel) return null;
+    if (sel && sel.writeState === 'writable') { context.hasBeenWritable = true; return 'connected'; }
+    if (context.hasBeenWritable) return 'disconnected';
+    return 'checking';
   }
 
+  function writableInterval(p, t) {
+    if (p.pingsSent < MIN_PINGS_AT_WEAK) return PING_WEAK_MS;
+    const missing = p.unanswered > 0 && (t - p.unansweredFirstAt) > 2 * p.rttEstMs;
+    const stable = p.rttSamples > RTT_RATIO + 1 && !missing;
+    return stable ? PING_STABLE_WRITABLE_MS : PING_UNSTABLE_WRITABLE_MS;
+  }
+  function pastWritableInterval(p, t) { return t >= p.lastPingSent + writableInterval(p, t); }
+
+  function isPingable(p, weak, t) {
+    if (p.errorFailed) return false;
+    // While nothing works well, every pair — dead or pruned ones included —
+    // is worth another try.
+    if (weak) return true;
+    if (p !== context.selectedPair && p.writeState === 'writable') {
+      // A working backup: checked slowly.
+      return p.rttSamples === 0 || t >= p.lastResponseAt + PING_BACKUP_MS;
+    }
+    return isActive(p);
+  }
+
+  // libwebrtc FindNextPingableConnection.
+  function nextPingPair(t, weak) {
+    const list = context.checkList;
+    const sel = context.selectedPair;
+    // 1. The selected pair's keepalive, when due.
+    if (sel && sel.writeState === 'writable' && pastWritableInterval(sel, t)) return sel;
+    // 2. Channel weak: the working pair checked longest ago.
+    if (weak) {
+      let w = null;
+      for (let i = 0; i < list.length; i++) {
+        const p = list[i];
+        if (p === sel || p.writeState !== 'writable' || !pastWritableInterval(p, t)) continue;
+        if (!w || p.lastPingSent < w.lastPingSent) w = p;
+      }
+      if (w) return w;
+    }
+    // 3. Triggered: a pair that does not work yet but the peer just checked.
+    let trig = null;
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (p.writeState === 'writable' || !isPingable(p, weak, t)) continue;
+      if (p.requestReceivedAt <= p.lastPingSent) continue;
+      if (!trig || p.requestReceivedAt < trig.requestReceivedAt) trig = p;
+    }
+    if (trig) return trig;
+    // 4. The rest: never-checked first, then checked longest ago; ties by
+    //    priority (the list is sorted by priority).
+    let best = null;
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (!isPingable(p, weak, t)) continue;
+      if (p.writeState === 'writable' && !pastWritableInterval(p, t)) continue;
+      if (!best || p.lastPingSent < best.lastPingSent) best = p;
+    }
+    return best;
+  }
+
+  function pingTick() {
+    context.pingTimer = null;
+    if (context.closed || context.mode === 'lite' || context.state === 'failed') return;
+    const t = Date.now();
+    const list = context.checkList;
+
+    for (let i = 0; i < list.length; i++) updatePairState(list[i], t);
+
+    // Forget check transactions nobody answered within 60s (once a second).
+    if (t - context.lastTxSweepAt >= 1000) {
+      context.lastTxSweepAt = t;
+      const keys = Object.keys(context.pendingTransactions);
+      for (let i = 0; i < keys.length; i++) {
+        const e = context.pendingTransactions[keys[i]];
+        if (e && e.kind === 'check' && t - e.sentAt > RESPONSE_TIMEOUT_MS) delete context.pendingTransactions[keys[i]];
+      }
+    }
+
+    // Selection and state: through set_context, so the cascades (2.5 / 2.6)
+    // and their events stay the one place that decides.
+    set_context({ pair_tick: true });
+    if (context.closed || context.state === 'failed') return;
+    fullPrune();
+
+    const weak = channelWeak();
+    if (context.remoteUfrag && context.remotePwd) {
+      const p = nextPingPair(t, weak);
+      if (p) sendPing(p, t);
+    }
+
+    let interval = weak ? PING_WEAK_MS : PING_STRONG_MS;
+    if (!weak) {
+      for (let i = 0; i < list.length; i++) {
+        if (isActive(list[i]) && list[i].pingsSent < MIN_PINGS_AT_WEAK) { interval = PING_WEAK_MS; break; }
+      }
+    }
+    schedulePingTick(Math.min(interval, CHECK_RECEIVING_MS));
+  }
+
+  // USE-CANDIDATE (controlling), libwebrtc's default "semi-aggressive"
+  // nomination: on every check of the selected pair and of any pair that
+  // would beat it — so moving to a better pair later is just nominating it.
+  // An ICE-lite peer follows our nomination alone: there, only on the
+  // selected pair once it works.
+  function useCandidateFor(pair) {
+    const sel = context.selectedPair;
+    if (context.remoteIceLite) return pair === sel && pair.writeState === 'writable';
+    if (pair === sel) return true;
+    return !sel || sel.writeState !== 'writable' || compareCandidates(sel, pair) < 0;
+  }
 
   /* ── Outgoing connectivity check ── */
 
-  function sendBindingCheck(pair) {
+  function sendPing(pair, t) {
     if (context.closed) return;
     if (!context.remoteUfrag || !context.remotePwd) return;
 
     const sock = getSocketForLocalCandidate(pair.local);
     if (!sock && !pair.local.turnClient) {
+      pair.errorFailed = true;
       pair.state = 'failed';
+      pair.writeState = 'timeout';
+      set_context({ pair_failed: pair });
       return;
     }
 
@@ -2231,268 +2482,154 @@ function IceAgent(options) {
       { type: wire.ATTR.USERNAME, value: username },
       { type: wire.ATTR.PRIORITY, value: prflxPriority },
     ];
-    if (context.controlling) {
+    const controlling = context.controlling;
+    if (controlling) {
       attrs.push({ type: wire.ATTR.ICE_CONTROLLING, value: context.tieBreaker });
     } else {
       attrs.push({ type: wire.ATTR.ICE_CONTROLLED, value: context.tieBreaker });
     }
-    // Part 2b: Regular nomination — controlling agent marks this pair as the
-    // chosen one by attaching USE-CANDIDATE. Only set for the dedicated
-    // nomination re-check (pair.weNominated flag was set by startNomination).
-    if (pair.weNominated) {
-      attrs.push({ type: wire.ATTR.USE_CANDIDATE, value: null });
-    }
+    const useCandidate = controlling && useCandidateFor(pair);
+    if (useCandidate) attrs.push({ type: wire.ATTR.USE_CANDIDATE, value: null });
 
-    const key = wire.compute_short_term_key(context.remotePwd);
     const encoded = wire.encode_message({
       method:      wire.METHOD.BINDING,
       cls:         wire.CLASS.REQUEST,
       attributes:  attrs,
-      key:         key,
+      key:         remoteKey(),
       fingerprint: true,
     });
 
     const txHex = txIdHex(encoded.transactionId);
-    pair.transactionId = encoded.transactionId;
-    pair.lastSent      = Date.now();
-    pair.state         = 'in-progress';
-    pair.retransmits   = 0;
-    pair.encodedCheck  = encoded.buf;   // saved for retransmits
+    const entry = {
+      kind:         'check',
+      pair:         pair,
+      sentAt:       t,
+      controlling:  controlling,   // the role this check claims (see handleRoleConflictFromResponse)
+      useCandidate: useCandidate,
+      callback: function(msg, rinfo, err) {
+        delete context.pendingTransactions[txHex];
+        onPingResponse(pair, entry, msg, rinfo, err);
+      },
+    };
+    context.pendingTransactions[txHex] = entry;
 
-    // Stats: count this binding request (before send — we want to count the
-    // attempt even if transmission fails). Retransmits are counted on their
-    // own path (scheduleRetransmit).
+    pair.checkControlling = controlling;
+    if (pair === context.selectedPair && pair.writeState === 'writable') pair.consentRequestsSent++;
+    pair.lastPingSent = t;
+    pair.pingsSent++;
+    if (pair.unanswered === 0) pair.unansweredFirstAt = t;
+    pair.unanswered++;
+    if (pair.unanswered === UNWRITABLE_MIN_CHECKS) pair.unansweredFifthAt = t;
+    if (pair.state === 'frozen' || pair.state === 'waiting') pair.state = 'in-progress';
+    context.lastPingAt = t;
+
+    // Stats
     pair.requestsSent++;
     pair.bytesSent        += encoded.buf.length;
     pair.packetsSent++;
-    pair.lastPacketSentTimestamp = pair.lastSent;
-
-    context.pendingTransactions[txHex] = {
-      kind:     'check',
-      pair:     pair,
-      callback: function(msg, rinfo, err) {
-        // Remove from pending on first response (callback is one-shot)
-        delete context.pendingTransactions[txHex];
-        if (pair.retransmitTimer) { clearTimeout(pair.retransmitTimer); pair.retransmitTimer = null; }
-        onCheckResponse(pair, msg, rinfo, err);
-      },
-    };
+    pair.lastPacketSentTimestamp = t;
 
     sendStunToRemote(pair.local, pair.remote, encoded.buf);
-    scheduleRetransmit(pair, txHex);
   }
 
-  function scheduleRetransmit(pair, txHex) {
-    const pending = context.pendingTransactions[txHex];
-    if (!pending) return;
-
-    // RFC 8445 §14.3 / RFC 5389 §7.2.1 — RTO doubles, max 7 retransmits.
-    // Simplification: RTO starts at STUN_INITIAL_RTO_UDP (500ms) and doubles.
-    const rto = STUN_INITIAL_RTO_UDP * Math.pow(2, pair.retransmits);
-
-    pair.retransmitTimer = setTimeout(function() {
-      if (context.closed) return;
-      if (!context.pendingTransactions[txHex]) return;   // already resolved
-
-      if (pair.retransmits >= STUN_RC) {
-        // All retransmits exhausted — final wait for one more RTO * RM, then fail.
-        delete context.pendingTransactions[txHex];
-        pair.retransmitTimer = null;
-        onCheckResponse(pair, null, null, new Error('Check timeout'));
-        return;
-      }
-
-      pair.retransmits++;
-      sendStunToRemote(pair.local, pair.remote, pair.encodedCheck);
-      scheduleRetransmit(pair, txHex);
-    }, rto);
-
-    if (pair.retransmitTimer.unref) pair.retransmitTimer.unref();
+  // A response to one of our checks — on time or late (up to 60s).
+  function markResponded(p, t, rttMs) {
+    const wasWritable = p.writeState === 'writable';
+    p.writeState     = 'writable';
+    p.state          = 'succeeded';
+    p.valid          = true;
+    p.unanswered     = 0;
+    p.lastResponseAt = t;
+    p.lastReceivedAt = t;
+    if (!p.receiving) { p.receiving = true; p.receivingChangedAt = t; }
+    if (rttMs != null) {
+      const r = Math.min(MAX_RTT_MS, Math.max(MIN_RTT_MS, rttMs));
+      p.rttEstMs = p.rttSamples === 0 ? r : (RTT_RATIO * p.rttEstMs + r) / (RTT_RATIO + 1);
+      p.rttSamples++;
+    }
+    return !wasWritable;
   }
 
-  function onCheckResponse(pair, msg, rinfo, err) {
+  function onPingResponse(pair, entry, msg, rinfo, err) {
     if (context.closed) return;
+    const t = Date.now();
 
     if (err) {
-      // STUN error responses — RFC 8445 §7.2.5.2.4: a pair is failed only
-      // on an *unrecoverable* [RFC5389] error. The recoverable set below
-      // mirrors Chrome's libwebrtc (p2p/base/connection.cc,
-      // OnConnectionRequestErrorResponse): 401 Unauthorized, 420 Unknown
-      // Attribute, and 500 Server Error are answered with a retry —
-      // "Recoverable error, retry" — because they are routinely transient.
-      // The canonical case: our connectivity checks legitimately race the
-      // peer's processing of our answer (trickle ICE), and until the peer
-      // learns our ufrag it rejects checks with 401 (RFC 5389 §10.1.2).
-      // Failing the pair on that race — as this code previously did for
-      // every non-487 code — killed otherwise-perfect connections within
-      // one RTT. pion/ice goes further and discards error responses
-      // entirely, retrying until its global timeout; we take libwebrtc's
-      // middle path. The retry is paced by returning the pair to
-      // 'waiting' after ~half the STUN RTO, and remains bounded by the
-      // agent's overall failure policy, so a peer that answers 401
-      // forever still converges to 'failed'.
-      //
-      // Anything else — including 400 — stays fatal, exactly as in
-      // libwebrtc ("killing connection"). Note: werift ≤0.15 rejects
-      // pre-answer checks with 400 where RFC 5389 §10.1.2 mandates 401;
-      // such peers fail against Chrome for the same reason.
-      if (msg) {
-        const ec = msg.getAttribute(wire.ATTR.ERROR_CODE);
-        if (ec && ec.code === 487) {
-          // 487 role conflict → switch role, re-queue check
-          handleRoleConflictFromResponse(pair);
-          return;
-        }
-        if (ec && (ec.code === 401 || ec.code === 420 || ec.code === 500)) {
-          // Return the pair to the scheduler immediately, with a cooldown
-          // stamp the tick loop honors. Doing this synchronously — rather
-          // than via a detached timer — keeps the pair in 'waiting' at all
-          // times, so runCheckTick's no-active-pairs branch can never tear
-          // down the check timer (and declare failure) in the window
-          // between the error response and the retry becoming due.
-          pair.state = 'waiting';
-          pair.retryAfter = Date.now() + 250;   // ~½ STUN RTO (RFC 5389 §7.2.1)
-          return;
-        }
-      }
+      // STUN error responses (libwebrtc Connection::OnConnectionRequestErrorResponse):
+      //   487  role conflict — take the other role; the next check claims it.
+      //   401 / 420 / 500 — recoverable (typically checks that raced the
+      //        peer learning our credentials); the next check is the retry.
+      //   anything else — the pair is dead for good.
+      const ec = msg ? msg.getAttribute(wire.ATTR.ERROR_CODE) : null;
+      const code = ec && ec.code;
+      if (code === 487) { handleRoleConflictFromResponse(pair, entry.controlling); return; }
+      if (!msg || code === 401 || code === 420 || code === 500) return;
+      pair.errorFailed = true;
       pair.state = 'failed';
+      pair.writeState = 'timeout';
       set_context({ pair_failed: pair });
       return;
     }
 
-    // Stats: record RTT, byte/packet counters for this response.
-    // RFC 7064 / RFC 8445 — RTT is (response arrival) - (request send).
-    const nowMs = Date.now();
-    if (pair.lastSent) {
-      const rttMs = nowMs - pair.lastSent;
-      pair.roundTripTime      = rttMs / 1000;           // seconds (spec format)
-      pair.totalRoundTripTime += rttMs / 1000;
-      pair.rttMeasurements++;
-    }
+    // Stats: RTT and counters (RFC 7064 / RFC 8445 — response arrival minus
+    // request send).
+    const rttMs = t - entry.sentAt;
+    pair.roundTripTime      = rttMs / 1000;           // seconds (spec format)
+    pair.totalRoundTripTime += rttMs / 1000;
+    pair.rttMeasurements++;
     pair.responsesReceived++;
     pair.packetsReceived++;
-    // Best-effort — msg.raw length, else approximate by the MI-truncated header.
     pair.bytesReceived += (msg && msg.raw && msg.raw.length) ? msg.raw.length : 20;
-    pair.lastPacketReceivedTimestamp = nowMs;
+    pair.lastPacketReceivedTimestamp = t;
 
     // Validate XOR-MAPPED-ADDRESS presence (RFC 8489)
     const mapped = msg.getAttribute(wire.ATTR.XOR_MAPPED_ADDRESS)
                 || msg.getAttribute(wire.ATTR.MAPPED_ADDRESS);
     if (!mapped) {
+      pair.errorFailed = true;
       pair.state = 'failed';
+      pair.writeState = 'timeout';
       set_context({ pair_failed: pair });
       return;
     }
-
     const mappedIp   = mapped.ip || mapped.address;
     const mappedPort = mapped.port;
 
     // ─ RFC 8445 §7.2.5.3 — "Constructing the Valid Pair" ─
-    //
-    // The valid pair is formed from:
-    //   - validLocal:  the local candidate whose transport address EQUALS
-    //                  the mapped address in the STUN response
-    //   - validRemote: pair.remote (the candidate we sent the check to)
-    //
-    // If the mapped address matches no known local candidate, it's a new
-    // peer-reflexive local candidate — we MUST create it first, THEN form
-    // a valid pair with (prflx, pair.remote) rather than marking the
-    // ORIGINAL pair valid. The original pair is still 'succeeded' (the
-    // check succeeded) but not necessarily 'valid'.
+    // The valid pair is (the local candidate whose address EQUALS the mapped
+    // address, pair.remote). A mapped address we do not know is a new
+    // peer-reflexive local candidate: create it, and the pair over it. Both
+    // pairs carry the same path (the same socket, the same remote), so both
+    // are marked working.
     let validLocal = pair.local;
     if (mappedIp !== pair.local.ip || mappedPort !== pair.local.port) {
-      // NAT mapped us differently — look up or create peer-reflexive local.
-      validLocal = findLocalCandidate(mappedIp, mappedPort)
+      validLocal = findLocalCandidate(mappedIp, mappedPort, pair.local.protocol || 'udp')
                 || addPeerReflexiveLocal(mappedIp, mappedPort, pair.local);
     }
-
-    // The ORIGINAL pair's check succeeded — mark state succeeded (so we
-    // don't re-check it) and unfreeze same-foundation pairs.
-    pair.state = 'succeeded';
-    unfreezePairsAfterSuccess(pair);
-
-    // Find or create the VALID pair — the one actually added to the valid list.
-    let validPair;
-    if (validLocal === pair.local) {
-      // Normal case — same address, original pair is valid.
-      validPair = pair;
-    } else {
-      // Peer-reflexive — form a new pair (or reuse if already exists).
-      validPair = findPair(validLocal, pair.remote);
-      if (!validPair) {
-        validPair = tryMakePair(validLocal, pair.remote);
-      }
-      if (!validPair) {
-        // Couldn't make pair (shouldn't happen) — fall back to original.
-        validPair = pair;
-      } else {
-        // The new prflx-based pair is succeeded by virtue of the check
-        // that just succeeded, per §7.2.5.3.3.
-        validPair.state = 'succeeded';
-      }
+    let validPair = pair;
+    if (validLocal !== pair.local) {
+      validPair = findPair(validLocal, pair.remote) || tryMakePair(validLocal, pair.remote) || pair;
     }
 
-    validPair.valid = true;
+    let changed = markResponded(pair, t, rttMs);
+    if (validPair !== pair) changed = markResponded(validPair, t, rttMs) || changed;
 
-    // Nomination inheritance from the triggering pair:
-    // RFC 8445 §7.2.5.3.4 — if the original check had USE-CANDIDATE (we
-    // nominated) OR the peer had nominated it earlier, those flags apply
-    // to the valid pair we just constructed.
-    if (pair.weNominated    && !validPair.weNominated)    validPair.weNominated    = true;
-    if (pair.peerNominated  && !validPair.peerNominated)  validPair.peerNominated  = true;
-    if (validPair.weNominated || validPair.peerNominated) {
+    // Nomination: our USE-CANDIDATE answered (controlling), or the peer's
+    // earlier USE-CANDIDATE on it (controlled) — RFC 8445 §7.2.5.3.4.
+    if (entry.useCandidate && !validPair.weNominated) { validPair.weNominated = true; changed = true; }
+    if (pair.peerNominated && !validPair.peerNominated) { validPair.peerNominated = true; changed = true; }
+    if ((validPair.weNominated || validPair.peerNominated) && !validPair.nominated) {
       validPair.nominated = true;
+      changed = true;
     }
 
-    // Notify set_context — cascades decide: add to validList, emit paircheck,
-    // schedule nomination timer (if needed), auto-select (if nominated), etc.
-    set_context({ pair_validated: validPair });
+    // Started working or newly nominated: decide now (cascades), rather than
+    // at the next tick. A keepalive answered changes nothing to decide.
+    if (changed) set_context({ pair_validated: validPair });
   }
 
 
-  /* ── Imperative helpers: nomination + consent (called from cascades) ── */
-  //
-  // These DO NOT decide state. They perform side effects (schedule timers,
-  // send STUN). When events arrive, they feed results BACK via set_context,
-  // which re-evaluates the cascades in Phase 2.
-
-  function initiateNominationTimer() {
-    // Triggered by cascade 2.4: controlling + first valid pair appeared.
-    // Wait NOMINATION_DELAY_MS so more pairs may become valid and we nominate
-    // the actual best (not just the first).
-    if (context.nominationTimer) return;
-    context.nominationTimer = setTimeout(fireNomination, NOMINATION_DELAY_MS);
-    if (context.nominationTimer.unref) context.nominationTimer.unref();
-  }
-
-  function fireNomination() {
-    context.nominationTimer = null;
-    if (context.closed) return;
-    if (!context.controlling) return;
-    if (context.selectedPair) return;   // someone else beat us to it
-
-    // Pick the highest-priority valid pair that we haven't already nominated.
-    const candidates = context.validList.filter((p) => !p.weNominated);
-    if (candidates.length === 0) {
-      // No candidate — reset flag so next validation retriggers timer.
-      set_context({ nominationStarted: false });
-      return;
-    }
-    let best = candidates[0];
-    for (let i = 1; i < candidates.length; i++) {
-      if (candidates[i].priority > best.priority) best = candidates[i];
-    }
-
-    // Mark and re-queue for another check carrying USE-CANDIDATE.
-    best.weNominated = true;
-    best.state = 'waiting';
-    if (context.triggeredQueue.indexOf(best) < 0) {
-      context.triggeredQueue.push(best);
-    }
-    // Nudge immediately so nomination doesn't wait for next Ta tick.
-    runCheckTick();
-  }
-
+  /* ── Lite: passive liveness ── */
 
   function initiateLiteLiveness() {
     // Triggered by cascade 2.8b: selectedPair set, lite, not already running.
@@ -2506,7 +2643,13 @@ function IceAgent(options) {
 
   function scheduleNextLiteLivenessTick() {
     if (context.closed) return;
-    context.liteLivenessTimer = setTimeout(liteLivenessTick, LITE_LIVENESS_TICK_MS);
+    // Wake at the next threshold when it comes before the regular tick, so
+    // 'disconnected' / 'failed' land when they say, not up to a tick late.
+    let ms = LITE_LIVENESS_TICK_MS;
+    const age = Date.now() - context.lastRequestReceivedAt;
+    const next = age < LITE_DISCONNECT_MS ? LITE_DISCONNECT_MS : (age < LITE_FAILED_MS ? LITE_FAILED_MS : Infinity);
+    if (next !== Infinity && next - age > 0 && next - age < ms) ms = next - age;
+    context.liteLivenessTimer = setTimeout(liteLivenessTick, ms);
     if (context.liteLivenessTimer.unref) context.liteLivenessTimer.unref();
   }
 
@@ -2520,7 +2663,7 @@ function IceAgent(options) {
       console.log('[ice-diag] ' + _diagTs() + ' lite-liveness age=' + age + 'ms state=' + context.state);
     }
 
-    if (age >= CONSENT_FAILED_MS) {
+    if (age >= LITE_FAILED_MS) {
       // Terminal — and liteLivenessActive stays TRUE deliberately, the
       // exact latch lesson from consentTick: clearing it would let 2.8b
       // start a fresh cycle, reseed the clock, and erase the very
@@ -2529,191 +2672,13 @@ function IceAgent(options) {
       set_context({ state: 'failed' });
       return;   // stop scheduling further
     }
-    if (age >= CONSENT_DISCONNECT_MS) {
+    if (age >= LITE_DISCONNECT_MS) {
       if (context.state === 'connected') set_context({ state: 'disconnected' });
     } else if (context.state === 'disconnected') {
       set_context({ state: 'connected' });   // recovery: a request arrived
     }
 
     scheduleNextLiteLivenessTick();
-  }
-
-  function initiateConsentFreshness() {
-    // Triggered by cascade 2.8: selectedPair set, not lite, not already running.
-    if (context.consentActive) return;
-    context.consentActive = true;
-    context.consentLastSuccessAt = Date.now();
-    scheduleNextConsentTick();
-  }
-
-  function scheduleNextConsentTick() {
-    if (context.closed) return;
-    const jitter = 1 + (Math.random() * 2 - 1) * CONSENT_RANDOMIZATION;
-    let ms = Math.floor(CONSENT_INTERVAL_MS * jitter);
-
-    // DON'T SLEEP PAST THE DEADLINE.
-    //
-    // The tick both sends a consent check and evaluates the age against the
-    // disconnect/failed thresholds. Scheduling purely on the interval means
-    // the evaluation lands wherever the interval happens to put it: measured
-    // ticks at 12.8s and 28.6s, with the next at ~44s — so a path that died
-    // at t=0 crossed the 30s threshold at 28.6s (not yet) and was not looked
-    // at again until 44s. Whether a dead peer was noticed at 30s or at 44s
-    // came down to jitter, which is why the same code reported disconnected
-    // on one run and connected on the next.
-    //
-    // Clamping the sleep so it never overshoots the next threshold keeps the
-    // send cadence at the RFC 7675 interval while making the DETECTION
-    // deadline mean what it says.
-    const age = Date.now() - context.consentLastSuccessAt;
-    const nextDeadline = (age < CONSENT_DISCONNECT_MS)
-      ? CONSENT_DISCONNECT_MS
-      : (age < CONSENT_FAILED_MS ? CONSENT_FAILED_MS : Infinity);
-    if (nextDeadline !== Infinity) {
-      const untilDeadline = nextDeadline - age;
-      if (untilDeadline > 0 && untilDeadline < ms) ms = untilDeadline;
-    }
-    context.consentTimer = setTimeout(consentTick, ms);
-    if (context.consentTimer.unref) context.consentTimer.unref();
-  }
-
-  function consentTick() {
-    context.consentTimer = null;
-    if (context.closed) return;                 // done for good
-
-    // NO SELECTED PAIR RIGHT NOW IS NOT THE END OF THE CYCLE.
-    //
-    // Returning here left no timer scheduled, and consentActive stays true —
-    // so cascade 2.8, which is the only thing that restarts the cycle, sees
-    // an already-active cycle and does nothing. Consent was dead for the rest
-    // of the connection's life.
-    //
-    // selectedPair is momentarily null while a pair is being replaced (an ICE
-    // restart, a better pair nominated), so this is not an exotic window: it
-    // is a normal part of a long call. Measured — a peer that vanished was
-    // detected after 31s on one run and never on the next, from the same
-    // code, which is the signature of a race rather than a wrong threshold.
-    //
-    // Reschedule instead and let the next tick decide; the age check below is
-    // the thing that ends the cycle, and it ends it deliberately by NOT
-    // rescheduling once 'failed' is reached.
-    if (!context.selectedPair) {
-      scheduleNextConsentTick();
-      return;
-    }
-
-    // Decide lifecycle transition based on last-success age.
-    const age = Date.now() - context.consentLastSuccessAt;
-
-    // [ice-diag] every tick: shows the cadence, the last-success age, and
-    // the exact 5-tuple our consent goes to. If the path silently died,
-    // age climbs here tick after tick while everything else looks normal.
-    if (_ICE_DBG) {
-      const _p = context.selectedPair;
-      console.log('[ice-diag] ' + _diagTs() + ' consent-tick age=' + age + 'ms → ' +
-                  (_p.remote && _p.remote.ip) + ':' + (_p.remote && _p.remote.port) +
-                  ' (from ' + (_p.local && _p.local.ip) + ':' + (_p.local && _p.local.port) + ')' +
-                  ' state=' + context.state);
-    }
-
-    if (age >= CONSENT_FAILED_MS) {
-      // Terminal. consentActive stays TRUE deliberately: clearing it here
-      // would let cascade 2.8 immediately start a fresh cycle against the
-      // same dead pair, which restarts the ticks and resets the age — the
-      // failure would not stay latched. The flag is cleared by teardown and
-      // by ICE restart, which are the only paths that can produce a pair
-      // worth checking again.
-      set_context({ state: 'failed' });
-      return;   // stop scheduling further
-    }
-    if (age >= CONSENT_DISCONNECT_MS) {
-      if (context.state === 'connected') set_context({ state: 'disconnected' });
-    } else if (context.state === 'disconnected') {
-      set_context({ state: 'connected' });   // recovery
-    }
-
-    // Send a new consent check; response updates consentLastSuccessAt via set_context.
-    sendConsentCheck(context.selectedPair);
-    scheduleNextConsentTick();
-  }
-
-  function sendConsentCheck(pair) {
-    if (context.closed) return;
-    if (!context.remoteUfrag || !context.remotePwd) return;
-
-    // Same format as a connectivity check, but:
-    //   - no USE-CANDIDATE (nomination already done)
-    //   - no state mutation on pair (pair is already selected)
-    //   - no retransmits (periodic cadence handles loss detection)
-    const username = context.remoteUfrag + ':' + context.localUfrag;
-    const prflxPriority = computeCandidatePriority('prflx', LOCAL_PREFERENCE_DEFAULT, pair.local.component);
-
-    const attrs = [
-      { type: wire.ATTR.USERNAME, value: username },
-      { type: wire.ATTR.PRIORITY, value: prflxPriority },
-    ];
-    if (context.controlling) attrs.push({ type: wire.ATTR.ICE_CONTROLLING, value: context.tieBreaker });
-    else                     attrs.push({ type: wire.ATTR.ICE_CONTROLLED,  value: context.tieBreaker });
-
-    const key = wire.compute_short_term_key(context.remotePwd);
-    const encoded = wire.encode_message({
-      method:      wire.METHOD.BINDING,
-      cls:         wire.CLASS.REQUEST,
-      attributes:  attrs,
-      key:         key,
-      fingerprint: true,
-    });
-
-    const txHex = txIdHex(encoded.transactionId);
-    const consentSentAt = Date.now();
-    const timer = setTimeout(function() {
-      const p = context.pendingTransactions[txHex];
-      if (!p) return;
-      delete context.pendingTransactions[txHex];
-      if (p.callback) p.callback(null, null, new Error('consent timeout'));
-    }, 10_000);
-    if (timer.unref) timer.unref();
-
-    // Stats — count the consent attempt on the selected pair.
-    pair.consentRequestsSent++;
-    pair.requestsSent++;
-    pair.bytesSent += encoded.buf.length;
-    pair.packetsSent++;
-    pair.lastPacketSentTimestamp = consentSentAt;
-
-    context.pendingTransactions[txHex] = {
-      kind: 'consent',
-      pair: pair,
-      timer: timer,
-      callback: function(msg, _rinfo, err) {
-        delete context.pendingTransactions[txHex];
-        if (timer) clearTimeout(timer);
-        if (err) {
-          // [ice-diag] a consent timeout is the smoking gun for a dead
-          // server→peer (request) or peer→server (response) leg.
-          if (_ICE_DBG) {
-            console.log('[ice-diag] ' + _diagTs() + ' consent TIMEOUT (no response in 10s)');
-          }
-          return;   // no response → leave lastSuccessAt stale
-        }
-        if (_diagRL('consent-ok', 4000)) {
-          console.log('[ice-diag] ' + _diagTs() + ' consent response OK');
-        }
-        // Stats: RTT from consent response + byte/packet counters.
-        const rttMs = Date.now() - consentSentAt;
-        pair.roundTripTime       = rttMs / 1000;
-        pair.totalRoundTripTime += rttMs / 1000;
-        pair.rttMeasurements++;
-        pair.responsesReceived++;
-        pair.packetsReceived++;
-        pair.bytesReceived += (msg && msg.raw && msg.raw.length) ? msg.raw.length : 20;
-        pair.lastPacketReceivedTimestamp = Date.now();
-        // Successful response → feed back through set_context so cascades re-run.
-        set_context({ consentLastSuccessAt: Date.now() });
-      },
-    };
-
-    sendStunToRemote(pair.local, pair.remote, encoded.buf);
   }
 
   function handleBindingRequest(buf, msg, rinfo, sock, turnSocket) {
@@ -2725,15 +2690,25 @@ function IceAgent(options) {
     // from the outside, and that ambiguity cost a full debugging session
     // (bidi disconnect hunt, Aug 2026). Never again.
     if (!context.localPwd) {
-      if (_diagRL('drop-nopwd:' + rinfo.address + ':' + rinfo.port, 2000)) {
+      if (_ICE_DBG && _diagRL('drop-nopwd:' + rinfo.address + ':' + rinfo.port, 2000)) {
         console.log('[ice-diag] ' + _diagTs() + ' DROP binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — context.localPwd is EMPTY');
       }
       return;
     }
-    const validated = wire.validateStunMessage(buf, context.localPwd);
-    if (!validated) {
-      if (_diagRL('drop-integrity:' + rinfo.address + ':' + rinfo.port, 2000)) {
+    // A check without MESSAGE-INTEGRITY is unauthenticated: 400, never a
+    // success (RFC 8445 §7.3, RFC 8489 §9.1.3). Accepting it would let anyone
+    // who saw the ufrag nominate their own address as the selected pair.
+    if (msg.integrity_offset === null) {
+      if (_ICE_DBG && _diagRL('drop-nomi:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        console.log('[ice-diag] ' + _diagTs() + ' 400 binding-req from ' +
+                    rinfo.address + ':' + rinfo.port + ' — no MESSAGE-INTEGRITY');
+      }
+      sendBindingError(msg, rinfo, sock, turnSocket, 400, 'Bad Request');
+      return;
+    }
+    if (!wire.verifyStunIntegrity(buf, msg, localKey())) {
+      if (_ICE_DBG && _diagRL('drop-integrity:' + rinfo.address + ':' + rinfo.port, 2000)) {
         console.log('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — MESSAGE-INTEGRITY failed ' +
                     '(their HMAC pwd != our context.localPwd — credential divergence?)');
@@ -2745,7 +2720,7 @@ function IceAgent(options) {
     // USERNAME must be "<our-ufrag>:<their-ufrag>"
     const usernameAttr = msg.getAttribute(wire.ATTR.USERNAME);
     if (typeof usernameAttr !== 'string' || usernameAttr.indexOf(':') < 0) {
-      if (_diagRL('drop-badusr:' + rinfo.address + ':' + rinfo.port, 2000)) {
+      if (_ICE_DBG && _diagRL('drop-badusr:' + rinfo.address + ':' + rinfo.port, 2000)) {
         console.log('[ice-diag] ' + _diagTs() + ' 400 binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — malformed USERNAME');
       }
@@ -2755,7 +2730,7 @@ function IceAgent(options) {
     const colonIdx = usernameAttr.indexOf(':');
     const usernameLocal = usernameAttr.substring(0, colonIdx);
     if (usernameLocal !== context.localUfrag) {
-      if (_diagRL('drop-ufrag:' + rinfo.address + ':' + rinfo.port, 2000)) {
+      if (_ICE_DBG && _diagRL('drop-ufrag:' + rinfo.address + ':' + rinfo.port, 2000)) {
         console.log('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — USERNAME local part "' +
                     usernameLocal + '" != context.localUfrag "' + context.localUfrag + '"');
@@ -2772,11 +2747,11 @@ function IceAgent(options) {
       // Both claim controlling
       if (compareTieBreakers(context.tieBreaker, icControlling.raw) >= 0) {
         // We win — tell them to switch (487)
-        if (_diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        if (_ICE_DBG && _diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
           console.log('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlling, we win) → ' +
                       rinfo.address + ':' + rinfo.port + ' — our role=controlling');
         }
-        sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict');
+        sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict', localKey());
         return;
       }
       // We lose — switch to controlled
@@ -2785,11 +2760,11 @@ function IceAgent(options) {
     } else if (!context.controlling && icControlled !== null) {
       // Both claim controlled
       if (compareTieBreakers(context.tieBreaker, icControlled.raw) >= 0) {
-        if (_diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        if (_ICE_DBG && _diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
           console.log('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlled, we win) → ' +
                       rinfo.address + ':' + rinfo.port + ' — our role=controlled');
         }
-        sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict');
+        sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict', localKey());
         return;
       }
       console.log('[ice-diag] ' + _diagTs() + ' role conflict: both controlled, we LOSE → switching to controlling');
@@ -2797,11 +2772,12 @@ function IceAgent(options) {
     }
 
     // Find or create remote candidate (peer-reflexive if new)
-    let remoteCand = findRemoteCandidate(rinfo.address, rinfo.port);
+    const inProtocol = rinfo.protocol === 'tcp' ? 'tcp' : 'udp';
+    let remoteCand = findRemoteCandidate(rinfo.address, rinfo.port, inProtocol);
     if (!remoteCand) {
       const priorityAttr = msg.getAttribute(wire.ATTR.PRIORITY);
       const prflxPriority = priorityAttr || computeCandidatePriority('prflx', LOCAL_PREFERENCE_DEFAULT, COMPONENT_RTP);
-      remoteCand = addPeerReflexiveRemote(rinfo.address, rinfo.port, prflxPriority);
+      remoteCand = addPeerReflexiveRemote(rinfo.address, rinfo.port, prflxPriority, inProtocol);
     }
 
     // Find or create pair
@@ -2817,6 +2793,7 @@ function IceAgent(options) {
       pair.packetsReceived++;
       pair.bytesReceived += buf.length;
       pair.lastPacketReceivedTimestamp = Date.now();
+      pair.requestReceivedAt = pair.lastPacketReceivedTimestamp;
     }
 
     // Lite-liveness evidence: an authenticated request from the peer is
@@ -2833,7 +2810,7 @@ function IceAgent(options) {
     // [ice-diag] Log request+response per source (max 1/2s per source):
     // proves whether the peer's checks/consent keep arriving and that we
     // keep answering — and to WHICH address the answer goes.
-    if (_diagRL('bindreq:' + rinfo.address + ':' + rinfo.port, 2000)) {
+    if (_ICE_DBG && _diagRL('bindreq:' + rinfo.address + ':' + rinfo.port, 2000)) {
       console.log('[ice-diag] ' + _diagTs() + ' binding-req from ' +
                   rinfo.address + ':' + rinfo.port +
                   ' → responding (pair=' + (pair ? 'known' : 'NONE') + ')');
@@ -2857,16 +2834,7 @@ function IceAgent(options) {
     // USE-CANDIDATE from controlled peers (RFC doesn't mandate rejection),
     // but in practice only the controlling peer should set it.
     const hasUseCandidate = (msg.getAttribute(wire.ATTR.USE_CANDIDATE) !== null);
-    if (hasUseCandidate) pair.peerNominated = true;
-
-    // RFC 8445 §7.3.1.4: Triggered check — queue a check from our side for
-    // this pair, unless it's already in-flight or already succeeded.
-    if (pair.state !== 'succeeded' && pair.state !== 'in-progress') {
-      pair.state = 'waiting';
-      if (context.triggeredQueue.indexOf(pair) < 0) {
-        context.triggeredQueue.push(pair);
-      }
-    }
+    if (hasUseCandidate) { pair.peerNominated = true; pair.nominatedAt = Date.now(); }
 
     if (context.mode === 'lite') {
       // Lite: we never initiate checks. An inbound Binding Request from a
@@ -2879,7 +2847,16 @@ function IceAgent(options) {
       return;
     }
 
-    // Full: if pair was previously valid (our outgoing check succeeded earlier)
+    // Full. The peer's check is evidence the path works toward us: the pair
+    // is receiving, and a pair that had timed out comes back to life
+    // (unless pruned or failed for good — libwebrtc does the same).
+    pair.lastReceivedAt = Date.now();
+    if (pair.writeState === 'timeout' && !pair.pruned && !pair.errorFailed) {
+      pair.writeState = 'init';
+      pair.state = 'in-progress';
+    }
+
+    // If pair was previously valid (our outgoing check succeeded earlier)
     // and peer just nominated it via USE-CANDIDATE, mark nominated — cascade
     // will pick up auto-selection.
     if (pair.valid && pair.peerNominated && !pair.nominated) {
@@ -2888,9 +2865,10 @@ function IceAgent(options) {
       return;
     }
 
-    // Otherwise: pair was enqueued for a triggered check; kick cascades so
-    // that (a) we transition to 'checking' if not yet there, (b) checkTimer
-    // starts if not already running, (c) the triggered check goes out ASAP.
+    // Triggered check (RFC 8445 §7.3.1.4): a pair that does not work yet but
+    // the peer just checked goes first (nextPingPair step 3) — and soon.
+    if (pair.writeState !== 'writable') requestPingSoon();
+    // Kick cascades: a new (peer-reflexive) pair may start the scheduler.
     set_context({ pair_triggered: pair });
   }
 
@@ -2898,7 +2876,7 @@ function IceAgent(options) {
   /* ── Outgoing Binding responses ── */
 
   function sendBindingSuccess(req, rinfo, sock, turnSocket) {
-    const key = wire.compute_short_term_key(context.localPwd);
+    const key = localKey();
     const encoded = wire.encode_message({
       method:        wire.METHOD.BINDING,
       cls:           wire.CLASS.SUCCESS,
@@ -2918,7 +2896,12 @@ function IceAgent(options) {
     sendStunRaw(sock, turnSocket, rinfo, encoded.buf);
   }
 
-  function sendBindingError(req, rinfo, sock, turnSocket, code, reason) {
+  // key: for an error to a request that WAS authenticated (487) — signed
+  // with our password like a success (RFC 8489 §9.1.3), and the peer requires
+  // it: an unsigned 487 is dropped as a possible spoof, so it never learns of
+  // the conflict and keeps retransmitting the same check. 400 / 401 answer a
+  // request that could not be authenticated, and go unsigned.
+  function sendBindingError(req, rinfo, sock, turnSocket, code, reason, key) {
     const encoded = wire.encode_message({
       method:        wire.METHOD.BINDING,
       cls:           wire.CLASS.ERROR,
@@ -2926,6 +2909,7 @@ function IceAgent(options) {
       attributes: [
         { type: wire.ATTR.ERROR_CODE, value: { code: code, reason: reason } },
       ],
+      key:           key || undefined,
       fingerprint: true,
     });
     sendStunRaw(sock, turnSocket, rinfo, encoded.buf);
@@ -2934,15 +2918,18 @@ function IceAgent(options) {
 
   /* ── Role conflict handling ── */
 
-  function handleRoleConflictFromResponse(pair) {
-    // We sent with our role, got 487 back — we lose, flip.
-    switchRole(!context.controlling);
-    // Requeue the check
-    pair.state = 'waiting';
-    if (!context.triggeredQueue) context.triggeredQueue = [];
-    if (context.triggeredQueue.indexOf(pair) < 0) {
-      context.triggeredQueue.push(pair);
-    }
+  function handleRoleConflictFromResponse(pair, sentRole) {
+    // 487: the role this check claimed conflicts — take the other one
+    // (RFC 8445 §7.2.5.1: sent ICE-CONTROLLING → controlled, sent
+    // ICE-CONTROLLED → controlling). By the role IN THE REQUEST, not a flip of
+    // the current one: the role may have been switched since it was sent (a
+    // request from the peer, §7.3.1.1), and a 487 to a retransmit of the old
+    // check would then flip it back — into the very conflict it resolved.
+    var sentControlling = (typeof sentRole === 'boolean') ? sentRole
+                        : (typeof pair.checkControlling === 'boolean') ? pair.checkControlling : context.controlling;
+    switchRole(!sentControlling);
+    // The next check claims the new role — send it soon.
+    requestPingSoon();
   }
 
   function switchRole(newControlling) {
@@ -3001,23 +2988,24 @@ function IceAgent(options) {
     return cand;
   }
 
-  function addPeerReflexiveRemote(ip, port, priority) {
+  function addPeerReflexiveRemote(ip, port, priority, protocol) {
+    protocol = protocol || 'udp';
     // Check if already known
     for (let i = 0; i < context.remoteCandidates.length; i++) {
       const c = context.remoteCandidates[i];
-      if (c.ip === ip && c.port === port) return c;
+      if (c.ip === ip && c.port === port && (c.protocol || 'udp') === protocol) return c;
     }
     const cand = {
-      foundation:     'prflx:' + ip + ':' + port,   // unknown; synthesize unique
+      foundation:     'prflx:' + protocol + ':' + ip + ':' + port,   // unknown; synthesize unique
       component:      COMPONENT_RTP,
-      protocol:       'udp',
+      protocol:       protocol,
       priority:       priority,
       ip:             ip,
       port:           port,
       type:           'prflx',
       relatedAddress: null,
       relatedPort:    null,
-      tcpType:        null,
+      tcpType:        protocol === 'tcp' ? 'active' : null,   // it connected to us
     };
     set_context({ add_remote_candidate: cand });
     return cand;
@@ -3157,12 +3145,9 @@ function IceAgent(options) {
 
   function teardown() {
     // Stop all timers
-    if (context.checkTimer)      { clearInterval(context.checkTimer);   context.checkTimer = null; }
-    if (context.consentTimer)      { clearInterval(context.consentTimer);     context.consentTimer = null; }
+    if (context.pingTimer)         { clearTimeout(context.pingTimer);         context.pingTimer = null; }
     if (context.liteLivenessTimer) { clearTimeout(context.liteLivenessTimer); context.liteLivenessTimer = null; }
     context.liteLivenessActive = false;
-    context.consentActive = false;
-    if (context.nominationTimer) { clearTimeout(context.nominationTimer); context.nominationTimer = null; }
 
     // mDNS: send goodbye for every name we registered, then drop our hold
     // on the shared instance (destroyed for real only when the last agent
@@ -3205,12 +3190,6 @@ function IceAgent(options) {
     }
     context.pendingTransactions = {};
 
-    // Cancel pair retransmits
-    for (let i = 0; i < context.checkList.length; i++) {
-      const p = context.checkList[i];
-      if (p.retransmitTimer) { clearTimeout(p.retransmitTimer); p.retransmitTimer = null; }
-    }
-
     // Close TURN permissions timers
     const permKeys = Object.keys(context.turnPermissions);
     for (let i = 0; i < permKeys.length; i++) {
@@ -3249,10 +3228,14 @@ function IceAgent(options) {
     if (context.closed) return;
 
     // Select the right socket based on the packet's source family, so that
-    // STUN responses go back via the same family they arrived on.
+    // STUN responses go back via the same family they arrived on — and, for
+    // a packet from a TCP connection (rinfo.protocol 'tcp'), the TCP carrier,
+    // so they go back over that connection.
     const isV6 = rinfo.family === 'IPv6';
-    const sock = isV6 ? context.externalSocket6 : context.externalSocket;
-    if (!sock) return;  // this family not configured
+    const sock = rinfo.protocol === 'tcp'
+      ? (isV6 ? context.tcpSocket6 : context.tcpSocket)
+      : (isV6 ? context.externalSocket6 : context.externalSocket);
+    if (!sock) return;  // this family / transport not configured
 
     onSocketMessage(msg, rinfo, sock);
   }
@@ -3465,24 +3448,13 @@ function IceAgent(options) {
       }
       context.pendingTransactions = {};
 
-      // Cancel any per-pair retransmit timers
-      for (let i = 0; i < context.checkList.length; i++) {
-        const p = context.checkList[i];
-        if (p.retransmitTimer) { clearTimeout(p.retransmitTimer); p.retransmitTimer = null; }
-      }
-
-      // Cancel check scheduler and nomination timer.
-      // Cancel consent timer too — the OLD session's consent check would
-      // fail MESSAGE-INTEGRITY against the new remotePwd (which is null
-      // until setRemoteParameters is called). The new selectedPair will
-      // start its own consent via cascade 2.8 when it's chosen.
-      if (context.checkTimer)      { clearInterval(context.checkTimer);   context.checkTimer = null; }
-      if (context.nominationTimer) { clearTimeout(context.nominationTimer); context.nominationTimer = null; }
-      if (context.consentTimer)      { clearTimeout(context.consentTimer);     context.consentTimer = null; }
+      // Stop the check scheduler — the old session's checks would fail
+      // MESSAGE-INTEGRITY against the new remotePwd (null until
+      // setRemoteParameters). Cascade 2.2 starts it again for the new pairs.
+      if (context.pingTimer)         { clearTimeout(context.pingTimer);         context.pingTimer = null; }
       if (context.liteLivenessTimer) { clearTimeout(context.liteLivenessTimer); context.liteLivenessTimer = null; }
       context.liteLivenessActive = false;
       context.lastRequestReceivedAt = 0;   // restart: new session, new clock (re-armed by 2.8b)
-      context.consentActive = false;   // the new selectedPair starts its own cycle
 
       /* ── Reset ICE check state ──
        * NOTE: sockets, turnClients, turnPermissions are intentionally
@@ -3497,10 +3469,8 @@ function IceAgent(options) {
 
       context.checkList         = [];
       context.validList         = [];
-      context.triggeredQueue    = [];
       context.remoteCandidates  = [];
       context.remoteCandidatesEnded = false;
-      context.nominationStarted = false;
       context._endOfCandidatesEmitted = false;
 
       // Local candidates are PRESERVED (their sockets carry _previousPair's
@@ -3542,6 +3512,9 @@ function IceAgent(options) {
       // we're 'connected' (old pair still works), LEAVE IT — the new
       // session will propagate to 'connected' naturally via maybeSelectPair.
       if (context.state === 'failed' || context.state === 'disconnected') {
+        // No working path carried over: the new session starts from scratch
+        // ('checking', not 'disconnected', while its pairs are checked).
+        context.hasBeenWritable = false;
         set_context({ state: 'new' });
       }
 

@@ -1,13 +1,61 @@
-
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
 import net from 'node:net';
-import tls from 'node:tls';
+import lemonTls from 'lemon-tls';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 
 import Session from './session.js';
 import * as wire from './wire.js';
+
+
+// ─── Relays this process owns, by the address the world sees them at ────
+//
+// Two clients relaying through the same server — the usual case when both
+// are behind NATs that need TURN, and the case every self-test has — means
+// relay A sending to relay B's address: this server's own external IP. Put on
+// the network, that datagram leaves for the router and must be turned around
+// there (NAT hairpinning). Behind a home router it mostly is not, for UDP: the
+// allocations succeed, the permissions are in place, and nothing arrives. A
+// WebRTC call between two such users simply never connects, with no error.
+//
+// So a datagram addressed to one of our own relays is handed to it directly —
+// through the same 'message' handler a network datagram takes, with the
+// sender's external relay address as its source. Permissions, hooks and
+// accounting apply exactly as they would.
+var localRelays = new Map();   // "ip:port" -> Socket context
+function relayKey(addr) { return addr ? addr.ip + ':' + addr.port : null; }
+
+// The addresses our relays are announced on (ip -> number of live relays). A
+// peer address that is one of them is this server itself — see the peer
+// policy exemption in Session (isOwnRelayIp).
+var localRelayIps = new Map();
+function addRelayIp(ip) { if (ip) localRelayIps.set(ip, (localRelayIps.get(ip) || 0) + 1); }
+function removeRelayIp(ip) {
+  var n = localRelayIps.get(ip);
+  if (!n) return;
+  if (n <= 1) localRelayIps.delete(ip); else localRelayIps.set(ip, n - 1);
+}
+function isOwnRelayIp(ip) { return localRelayIps.size > 0 && localRelayIps.has(ip); }
+
+// In-process deliveries (local relays, relay.local and its replies) are
+// asynchronous, as a datagram would be. Rather than one setImmediate and one
+// closure per datagram, they wait in one FIFO queue drained by a single
+// setImmediate — order is kept. Entries are flat: fn, a, b, c.
+var deliverQueue = [];
+var deliverScheduled = false;
+function deliverLater(fn, a, b, c) {
+  deliverQueue.push(fn, a, b, c);
+  if (!deliverScheduled) { deliverScheduled = true; setImmediate(drainDeliveries); }
+}
+function drainDeliveries() {
+  deliverScheduled = false;
+  var q = deliverQueue;
+  deliverQueue = [];
+  for (var i = 0; i < q.length; i += 4) {
+    try { q[i](q[i + 1], q[i + 2], q[i + 3]); } catch (e) { setImmediate(function() { throw e; }); }
+  }
+}
 
 
 // Zero-copy Uint8Array → Buffer conversion. Node's dgram.send() and
@@ -28,21 +76,17 @@ function toMsg(d) {
   return d;
 }
 
-// Resolve lemon-tls's connectDTLS: prefer an injected implementation
-// (options.connectDTLS), otherwise lazy-import 'lemon-tls'. Kept optional so
-// turn-server has no hard dependency for non-DTLS users. cb(err, connectDTLS).
+// Resolve connectDTLS: an injected implementation if one was passed
+// (options.connectDTLS / options.lemonTls), otherwise lemon-tls's.
+// cb(err, connectDTLS), always asynchronously.
 function resolveConnectDTLS(options, cb) {
   if (typeof options.connectDTLS === 'function') return cb(null, options.connectDTLS);
   if (options.lemonTls && typeof options.lemonTls.connectDTLS === 'function') {
     return cb(null, options.lemonTls.connectDTLS);
   }
-  import('lemon-tls').then(function(m) {
-    var fn = m.connectDTLS || (m.default && m.default.connectDTLS);
-    if (typeof fn !== 'function') return cb(new Error("lemon-tls has no connectDTLS export"));
-    cb(null, fn);
-  }).catch(function() {
-    cb(new Error("DTLS transport requires lemon-tls. Install it (npm i lemon-tls) " +
-      "or pass options.connectDTLS / options.lemonTls."));
+  queueMicrotask(function () {
+    if (typeof lemonTls.connectDTLS !== 'function') return cb(new Error("lemon-tls has no connectDTLS export"));
+    cb(null, lemonTls.connectDTLS);
   });
 }
 
@@ -77,6 +121,7 @@ function Socket(options) {
       // the same transport label the accept hook sees.
       transportType: options.transportType || null,
       hookTimeout: options.hookTimeout,
+      nonceKey: options.nonceKey || null,
       relayIp: options.relayIp || null,
       externalIp: options.externalIp || null,
       portRange: options.portRange || [49152, 65535],
@@ -86,6 +131,12 @@ function Socket(options) {
       checkOriginConsistency: options.checkOriginConsistency || false,
       allowLoopback: options.allowLoopback || false,
       allowMulticast: options.allowMulticast || false,
+      allowPrivatePeers: options.allowPrivatePeers || false,
+      isOwnRelayIp: isOwnRelayIp,
+      allowedPeers: options.allowedPeers || null,
+      deniedPeers: options.deniedPeers || null,
+      allowTcpRelay: options.allowTcpRelay || false,
+      maxTcpConnectionsPerAllocation: options.maxTcpConnectionsPerAllocation || 8,
       // RFC 8489 §7: skip FINGERPRINT over TLS/DTLS (wss = WebSocket over TLS)
       useFingerprint: options.useFingerprint !== undefined ? options.useFingerprint
         : (options.transportType !== 'tls' && options.transportType !== 'dtls'
@@ -263,7 +314,8 @@ function Socket(options) {
     } else {
       // TCP/TLS — RFC 8489 §7.2: send raw STUN, self-delimited by its own
       // header length. NO 2-byte tcp_frame() prefix (that was the bug).
-      context.transport.write(toBuffer(buf));
+      // ChannelData is padded to 4 on a stream (RFC 8656 §12.5).
+      context.transport.write(toBuffer(wire.pad_channel_data_for_stream(buf)));
     }
   }
 
@@ -277,38 +329,82 @@ function Socket(options) {
     alloc._confirmed = true;
 
     allocateRelayPort(alloc, function(err, relaySocket, address, reservationToken) {
+      // The relay port binds asynchronously. If the client went away (closed,
+      // TCP reset, idle reap) or the allocation was dropped while the bind was
+      // in flight, nobody owns this socket any more: close it and stop. It
+      // used to be adopted anyway — the port stayed bound for the life of the
+      // process, a localRelays entry pointed at a dead client, and 'allocate'
+      // was emitted after 'allocate:expired', so every quota counter above
+      // (per-IP, per-user, the application's own) stayed one too high.
+      var stale = context.destroyed || session.getAllocation() !== alloc;
       if (err) {
+        if (stale) return;
         if (alloc.reject) alloc.reject(err);
         else ev.emit('error', err);
+        return;
+      }
+      if (stale) {
+        try { relaySocket.close(); } catch (e) {}
+        return;
+      }
+
+      // Confirm the allocation with the real relay address — this sends the
+      // response to the client (including RESERVATION-TOKEN when port+1 was
+      // reserved via EVEN-PORT's R bit). It runs in a dgram bind callback,
+      // outside any try/catch of Session's: a throw here (an address that
+      // cannot be encoded, say) used to be an uncaught exception that took
+      // the whole process down. Now it fails this one allocation.
+      try {
+        if (alloc.confirm) {
+          alloc.confirm(address, reservationToken ? { reservationToken: reservationToken } : null);
+        }
+      } catch (e) {
+        try { relaySocket.close(); } catch (e2) {}
+        ev.emit('error', e);
+        try { session.dropAllocation(alloc); } catch (e3) {}
         return;
       }
 
       context.relaySocket = relaySocket;
       context.relayAddress = address;
+      localRelays.set(relayKey(address), context);
+      addRelayIp(address.ip);
 
-      // Confirm the allocation with the real relay address — this sends the
-      // response to the client (including RESERVATION-TOKEN when port+1 was
-      // reserved via EVEN-PORT's R bit).
-      if (alloc.confirm) {
-        alloc.confirm(address, reservationToken ? { reservationToken: reservationToken } : null);
-      }
-
+      // Counted from here on: 'allocate:expired' is emitted only for an
+      // allocation that was announced with 'allocate', so the two always pair.
+      alloc._announced = true;
       ev.emit('allocate', alloc);
     });
   });
 
   session.on('allocate:expired', function(alloc) {
     if (context.relaySocket) {
+      if (localRelays.get(relayKey(context.relayAddress)) === context) localRelays.delete(relayKey(context.relayAddress));
+      if (context.relayAddress) removeRelayIp(context.relayAddress.ip);
       try { context.relaySocket.close(); } catch (e) {}
       context.relaySocket = null;
       context.relayAddress = null;
+      context.localReplies = null;
     }
+    // An allocation that failed (508) or was dropped before its relay port
+    // was bound was never announced — and used to be "expired" anyway, which
+    // drove activeAllocations and the per-user/per-IP counts below zero.
+    if (!alloc || !alloc._announced) return;
+    alloc._announced = false;
     ev.emit('allocate:expired', alloc);
   });
 
   function allocateRelayPort(alloc, cb) {
-    var relay_ip = context.options.relayIp || '0.0.0.0';
-    var external_ip = context.options.externalIp || relay_ip;
+    // Read at each allocation (Server passes relayConfig()), so a
+    // setConfiguration({ relay }) — the public address discovered a moment
+    // after boot, say — reaches clients that connected before it. A copy taken
+    // when the client first appeared kept handing them the LAN address.
+    var live = typeof context.options.relayConfig === 'function' ? context.options.relayConfig() : null;
+    var opt_relay_ip = live ? live.relayIp : context.options.relayIp;
+    var opt_external_ip = live ? live.externalIp : context.options.externalIp;
+    var opt_port_range = live ? live.portRange : context.options.portRange;
+    var relay_ip = opt_relay_ip || '0.0.0.0';
+    var external_ip = opt_external_ip || relay_ip;
 
     // Resolve 0.0.0.0 to a reachable address
     if (external_ip === '0.0.0.0' || external_ip === '::') {
@@ -335,8 +431,8 @@ function Socket(options) {
         if (external_ip === '0.0.0.0') external_ip = '127.0.0.1';
       }
     }
-    var min_port = context.options.portRange ? context.options.portRange[0] : 49152;
-    var max_port = context.options.portRange ? context.options.portRange[1] : 65535;
+    var min_port = opt_port_range ? opt_port_range[0] : 49152;
+    var max_port = opt_port_range ? opt_port_range[1] : 65535;
 
     // relayCallback: override relay config per allocation (multi-IP, geo-routing)
     if (context.options.relayCallback) {
@@ -362,28 +458,39 @@ function Socket(options) {
 
     var family = (alloc.requestedFamily === wire.FAMILY.IPV6) ? 'udp6' : 'udp4';
 
+    // An IPv6 relay needs an IPv6 address to bind and to announce. With an
+    // IPv4 (or unspecified IPv4) relay address every bind failed, and after
+    // 100 attempts the client got 508 — RFC 6156 §4.2 says 440.
+    if (family === 'udp6' && !(net.isIPv6(relay_ip) && net.isIPv6(external_ip))) {
+      var e440 = new Error('Address family not supported (no IPv6 relay address)');
+      e440.stunCode = 440;
+      return cb(e440);
+    }
+
     // EVEN-PORT (RFC 5766 §14.6): presence requests an even port; the R bit
     // additionally reserves port+1 (claimed later via RESERVATION-TOKEN).
     var need_even = alloc.evenPort != null;
     var need_reserve = !!(alloc.evenPort && (alloc.evenPort === true || alloc.evenPort.reserve));
 
+    // Candidates: every port of the range (only even ones for EVEN-PORT, and
+    // with room for port+1 when it is reserved), walked from a random start.
+    // It drew 100 random ports instead — the top of the range was never one
+    // of them (max_port was excluded), and in a range mostly in use 100
+    // draws could all miss the few free ports: 508 with ports still free.
+    var first = need_even ? min_port + (min_port % 2) : min_port;
+    var last = need_reserve ? max_port - 1 : max_port;
+    var step = need_even ? 2 : 1;
+    var count = last >= first ? Math.floor((last - first) / step) + 1 : 0;
+    var start = Math.floor(Math.random() * count);
     var attempts = 0;
-    var max_attempts = 100;
+    var max_attempts = Math.min(count, 2000);
 
     function tryBind() {
       if (attempts >= max_attempts) {
         return cb(new Error('No available relay port in range'));
       }
+      var port = first + ((start + attempts) % count) * step;
       attempts++;
-
-      var port;
-      if (need_even) {
-        // Pick a random even port
-        port = min_port + Math.floor(Math.random() * ((max_port - min_port) / 2)) * 2;
-        if (port % 2 !== 0) port++;
-      } else {
-        port = min_port + Math.floor(Math.random() * (max_port - min_port));
-      }
 
       var sock = dgram.createSocket(family);
 
@@ -518,16 +625,15 @@ function Socket(options) {
     sock.on('message', function(data, rinfo) {
       if (context.destroyed) return;
 
-      var from = { ip: rinfo.address, port: rinfo.port };
-
       // Check permission
-      if (!session.hasPermission(from.ip)) return;
+      if (!session.hasPermission(rinfo.address)) return;
+      var from = null;   // { ip, port } — built only when something needs it
 
       // Hook: beforeData — peer → client direction. Short-circuit on
       // listenerCount FIRST so the info object isn't allocated per packet when
       // no hook is registered (this is the relay hot path).
       if (ev.listenerCount('beforeData') > 0 && !check_hook_sync('beforeData', {
-        peer: from,
+        peer: from = { ip: rinfo.address, port: rinfo.port },
         source: session.context.source,
         username: session.getAllocation() ? session.getAllocation().username : null,
         size: data.length,
@@ -539,20 +645,20 @@ function Socket(options) {
       session.context.packetsIn++;
 
       // Check if there's a channel binding for this peer
-      var channel = session.getChannelByPeer(from.ip, from.port);
+      var channel = session.getChannelByPeer(rinfo.address, rinfo.port);
       if (channel !== null) {
         // Send as ChannelData (more efficient). `data` is Buffer from dgram —
         // pass directly, wire.encode_channel_data works on both Buffer and Uint8Array.
         session.sendChannelData(channel, data);
       } else {
         // Send as Data indication
-        session.sendData(from, data);
+        session.sendData(from || (from = { ip: rinfo.address, port: rinfo.port }), data);
       }
 
       // Info event: onRelayed (peer → client, inbound). Guard allocation.
       if (ev.listenerCount('onRelayed') > 0) ev.emit('onRelayed', {
         direction: 'inbound',
-        peer: from,
+        peer: from || { ip: rinfo.address, port: rinfo.port },
         source: session.context.source,
         username: session.getAllocation() ? session.getAllocation().username : null,
         size: data.length,
@@ -570,15 +676,103 @@ function Socket(options) {
     });
   }
 
+  // Out of this client's relay to a peer: over the network, or — when the peer
+  // is another relay of this same process — straight into that relay (see
+  // localRelays at the top of the file).
+  //
+  // Then relay.local (Server option): the application may say a peer address
+  // is its own — a WebRTC router on this process's shared port, say. The
+  // datagram is handed to it in memory instead of the network, and what it
+  // answers comes back in through reply(), into the same 'message' handler a
+  // network datagram takes, from the peer's address: permissions, hooks and
+  // accounting apply exactly as they would.
+  // `cb`, when given, is the send-error callback to reuse (one per channel
+  // peer — see the 'data' handler); otherwise one is made for this send.
+  function sendFromRelay(peer, out, cb) {
+    var target = localRelays.size > 0 ? localRelays.get(peer.ip + ':' + peer.port) : undefined;
+    if (target && target !== context && target.relaySocket && !target.destroyed && context.relayAddress) {
+      var from = context.relayAddress;
+      var copy = Buffer.from(out);   // the caller's buffer is not ours to keep past this call
+      deliverLater(deliverToRelay, target, copy, {
+        address: from.ip, port: from.port, size: copy.length,
+        family: from.ip.indexOf(':') >= 0 ? 'IPv6' : 'IPv4',
+      });
+      return;
+    }
+    var local = context.options.relayLocal;
+    var deliver = local && context.relayAddress ? local(peer.ip, peer.port) : null;
+    if (deliver) {
+      var relayFrom = context.relayAddress;
+      var data = Buffer.from(out);   // the caller's buffer is not ours to keep past this call
+      deliverLater(deliverLocal, deliver, data, { from: { ip: relayFrom.ip, port: relayFrom.port }, back: replyFor(peer) });
+      return;
+    }
+    // A peer the policy blocks, allowed only because it is our own relay
+    // address (Session.is_blocked_peer): it is reached in memory above or not
+    // at all — never through the network, where that address could be some
+    // other service on this machine or its LAN.
+    if (session.isPolicyBlocked(peer.ip)) return;
+    // Nor back into this server's own listeners or relay ports through the
+    // network (see Server isSelfService) — a relay of ours was handled above.
+    if (context.options.isSelfService && context.options.isSelfService(peer.ip, peer.port)) return;
+    context.relaySocket.send(out, 0, out.length, peer.port, peer.ip, cb || function(err) {
+      if (err) reportRelaySendError(peer, err);
+    });
+  }
+
+  function deliverToRelay(target, buf, rinfo) {
+    if (!target.relaySocket || target.destroyed) return;
+    target.relaySocket.emit('message', buf, rinfo);
+  }
+
+  function deliverLocal(deliver, data, d) {
+    if (context.destroyed || !context.relaySocket) return;
+    deliver(data, d.from, d.back);
+  }
+
+  // Send-error callback per channel peer. A channel's peer object is the same
+  // on every datagram, so the callback is made once instead of per packet.
+  var sendErrCbs = new WeakMap();
+  function sendErrFor(peer) {
+    var cb = sendErrCbs.get(peer);
+    if (!cb) {
+      cb = function(err) { if (err) reportRelaySendError(peer, err); };
+      sendErrCbs.set(peer, cb);
+    }
+    return cb;
+  }
+
+  // reply(buf) for a peer reached through relay.local: its answer enters this
+  // relay as a datagram from that peer. false once the allocation is gone —
+  // the caller then forgets it. One per peer, kept while the relay lives.
+  function deliverReply(sock, copy, rinfo) {
+    if (context.destroyed || context.relaySocket !== sock) return;
+    sock.emit('message', copy, rinfo);
+  }
+
+  function replyFor(peer) {
+    var key = peer.ip + ':' + peer.port;
+    var sock = context.relaySocket;
+    var r = context.localReplies && context.localReplies.get(key);
+    if (r && r.sock === sock) return r.fn;
+    var family = peer.ip.indexOf(':') >= 0 ? 'IPv6' : 'IPv4';
+    var fn = function (buf) {
+      if (context.destroyed || context.relaySocket !== sock) return false;
+      var copy = Buffer.from(buf);
+      deliverLater(deliverReply, sock, copy, { address: peer.ip, port: peer.port, size: copy.length, family: family });
+      return true;
+    };
+    if (!context.localReplies) context.localReplies = new Map();
+    context.localReplies.set(key, { sock: sock, fn: fn });
+    return fn;
+  }
+
   // Session 'relay' event: client sent a Send indication → relay to peer
   session.on('relay', function(peer, data) {
     if (!context.relaySocket || context.destroyed) return;
 
     // HOT PATH: zero-copy Buffer view (was Buffer.from(data) which copied).
-    var out = toBuffer(data);
-    context.relaySocket.send(out, 0, out.length, peer.port, peer.ip, function(err) {
-      if (err) reportRelaySendError(peer, err);
-    });
+    sendFromRelay(peer, toBuffer(data));
 
     // Info event: onRelayed (client → peer, outbound, via Send indication)
     if (ev.listenerCount('onRelayed') > 0) ev.emit('onRelayed', {
@@ -597,10 +791,7 @@ function Socket(options) {
 
     // HOT PATH: zero-copy Buffer view. ChannelData is typically 30-50 pkt/sec
     // per active channel in media calls — saves a 1200-byte copy per RTP.
-    var out = toBuffer(data);
-    context.relaySocket.send(out, 0, out.length, peer.port, peer.ip, function(err) {
-      if (err) reportRelaySendError(peer, err);
-    });
+    sendFromRelay(peer, toBuffer(data), sendErrFor(peer));
 
     // Info event: onRelayed (client → peer, outbound, via ChannelData)
     if (ev.listenerCount('onRelayed') > 0) ev.emit('onRelayed', {
@@ -620,21 +811,51 @@ function Socket(options) {
   session.on('connect_peer', function(connectionId, peer, cb) {
     if (context.destroyed) { cb(new Error('Socket destroyed')); return; }
 
+    // cb answers the client's Connect request — exactly once. It used to be
+    // reachable three times: on connect, then again from 'error' or from the
+    // 10 s socket timeout, which stayed armed after the connection was up and
+    // killed every established peer connection after 10 s of quiet.
+    var answered = false;
+    function answer(err) {
+      if (answered) return;
+      answered = true;
+      cb(err || null);
+    }
+
     var conn = net.connect({ host: peer.ip, port: peer.port }, function() {
+      conn.setTimeout(0);                       // connect phase over
       context.tcpPeerConnections[connectionId] = conn;
-      cb(null);
+      // RFC 6062 §5.3: the client has 30 s to ConnectionBind it, or it goes.
+      conn._bindTimer = setTimeout(function() {
+        if (!conn._bound) { conn.destroy(); delete context.tcpPeerConnections[connectionId]; }
+      }, 30000);
+      if (conn._bindTimer.unref) conn._bindTimer.unref();
+      answer(null);
     });
+    // Nagle off: this connection carries a peer's stream, relayed as it
+    // arrives — a small write held for the previous one's ACK is a round
+    // trip added to the relay. The server's client-side sockets have it too.
+    conn.setNoDelay(true);
 
     conn.on('error', function(err) {
       delete context.tcpPeerConnections[connectionId];
-      cb(err);
+      answer(err);
     });
 
-    // Timeout for connection attempt
+    conn.on('close', function() {
+      if (conn._bindTimer) clearTimeout(conn._bindTimer);
+      delete context.tcpPeerConnections[connectionId];
+      // Free the slot in the session too, or maxTcpConnectionsPerAllocation
+      // would count connections long gone.
+      if (session.context && session.context.tcpConnections) delete session.context.tcpConnections[connectionId];
+      answer(new Error('Connection closed'));
+    });
+
+    // Timeout for the connection attempt only (cleared on connect above)
     conn.setTimeout(10000, function() {
       conn.destroy();
       delete context.tcpPeerConnections[connectionId];
-      cb(new Error('Connection timeout'));
+      answer(new Error('Connection timeout'));
     });
   });
 
@@ -642,6 +863,9 @@ function Socket(options) {
   session.on('connection_bind', function(connectionId, peer, cb) {
     var conn = context.tcpPeerConnections[connectionId];
     if (!conn) { cb(new Error('No connection for ID')); return; }
+    if (conn._bound) { cb(new Error('Connection already bound')); return; }
+    conn._bound = true;
+    if (conn._bindTimer) { clearTimeout(conn._bindTimer); conn._bindTimer = null; }
 
     // Data from peer → send to client. `data` is already a Buffer.
     conn.on('data', function(data) {
@@ -705,20 +929,30 @@ function Socket(options) {
         if (cb) cb();
         ev.emit('connect');
       });
+      // Nagle off, as on the server side: every STUN request and every
+      // ChannelData frame is a small write, and one held for the previous
+      // one's ACK waits a round trip.
+      context.transport.setNoDelay(true);
       // Capture connect-phase errors (ECONNREFUSED, etc.) before bindTransport
       // attaches the persistent handler. Detached above on successful connect.
       context.transport.on('error', _preErr);
 
     } else if (context.transportType === 'tls') {
-      context.transport = tls.connect({
+      context.transport = lemonTls.connect({
         host: context.serverHost,
         port: context.serverPort,
         servername: options.servername || context.serverHost,
         rejectUnauthorized: options.rejectUnauthorized !== false,
         ca: options.ca || undefined,
         SNICallback: options.SNICallback || undefined,
+        // Nagle off on the TCP socket underneath, from its creation (lemon-tls
+        // passes net options to net.connect, as node:tls does).
+        noDelay: true,
       }, function() {
         if (typeof context.transport.off === 'function') context.transport.off('error', _preErr);
+        // Again once connected, for a lemon-tls that does not pass noDelay on:
+        // the TLS socket hands it to the TCP socket it now has.
+        if (typeof context.transport.setNoDelay === 'function') context.transport.setNoDelay(true);
         bindTransport();
         if (cb) cb();
         ev.emit('connect');
@@ -859,8 +1093,12 @@ function Socket(options) {
     session.close();
 
     if (context.relaySocket) {
+      if (localRelays.get(relayKey(context.relayAddress)) === context) localRelays.delete(relayKey(context.relayAddress));
+      if (context.relayAddress) removeRelayIp(context.relayAddress.ip);
       try { context.relaySocket.close(); } catch (e) {}
       context.relaySocket = null;
+      context.relayAddress = null;
+      context.localReplies = null;
     }
 
     // Close reservation sockets — but ONLY when this Socket owns the map.

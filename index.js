@@ -144,6 +144,17 @@ function getPublicIP(server, options, cb) {
     cb(new Error('STUN timeout'));
   });
 
+  // The socket's own failures — the server's name not resolving (ENOTFOUND),
+  // the network unreachable — come as 'error'. With no listener, an
+  // EventEmitter throws on 'error': one DNS hiccup at startup took the whole
+  // process down, before the caller could fall back to another STUN server.
+  // They are one more way for this lookup to fail, and go to the callback.
+  socket.on('error', function(err) {
+    if (done) return; done = true;
+    try { socket.close(); } catch (e) {}
+    cb(err || new Error('STUN socket error'));
+  });
+
   socket.connect(function() { socket.binding(); });
 
   setTimeout(function() {
