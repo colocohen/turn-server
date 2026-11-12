@@ -5,6 +5,7 @@ import Socket from './src/socket.js';
 import { Server, createServer } from './src/server.js';
 import * as wire from './src/wire.js';
 import { IceAgent } from './src/ice_agent.js';
+import { DEFAULT_SOCKET_BUFFER_SIZE, checkedSocketBufferSize, udpSocketOptions } from './src/udp_buffers.js';
 import * as candidate from './src/ice_candidate.js';
 import * as iceMdns from './src/ice_mdns.js';
 import * as icePortmap from './src/ice_portmap.js';
@@ -79,6 +80,8 @@ function connect(uri, options, cb) {
     minVersion: options.minVersion || null,
     maxVersion: options.maxVersion || null,
     mtu: options.mtu || null,
+    // The UDP socket's buffers (src/udp_buffers.js): 4 MB by default; 0, the OS's.
+    socketBufferSize: options.socketBufferSize,
   });
 
   if (options.autoRefresh !== false) {
@@ -238,6 +241,10 @@ export {
   connect, getPublicIP, detectNAT, resolve,
   wire,
   IceAgent, candidate, iceMdns, icePortmap,
+  // UDP socket buffers, the rule this package uses (udp_buffers.js) — for
+  // a socket bound elsewhere that carries the same traffic (webrtc-server's
+  // WebRTCRouter).
+  DEFAULT_SOCKET_BUFFER_SIZE, checkedSocketBufferSize, udpSocketOptions,
 };
 
 export default {
@@ -245,4 +252,5 @@ export default {
   connect, getPublicIP, detectNAT, resolve,
   wire,
   IceAgent, candidate, iceMdns, icePortmap,
+  DEFAULT_SOCKET_BUFFER_SIZE, checkedSocketBufferSize, udpSocketOptions,
 };

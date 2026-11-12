@@ -375,6 +375,7 @@ agent.send(Buffer.from('hello'));
 | `iceTransportPolicy` | `'all'` | `'all'` (host + srflx + relay) or `'relay'` (only TURN) |
 | `includeLoopback` | `false` | Include `127.0.0.1` / `::1` in host candidates (testing only) |
 | `ipv6` | `true` | Gather IPv6 candidates |
+| `socketBufferSize` | `4194304` | Receive and send buffers of the UDP sockets the agent binds, in bytes (`0` or `false`: the OS default). See [UDP socket buffers](#udp-socket-buffers) — the kernel caps it at `net.core.rmem_max`. Not applied to `socket` / `socket6` |
 | `ufrag` / `pwd` | auto | Local credentials (auto-generated if omitted; 24-bit ufrag, 128-bit pwd) |
 | `socket` / `socket6` | — | Pre-bound UDP sockets shared with other protocols (server, usually with `mode: 'lite'`); the agent never closes them |
 | `announcedAddresses` | — | With `socket`: the addresses to announce instead of the bind address (`'1.2.3.4'` or `{ ip, port, tcpPort }`) |
@@ -581,6 +582,8 @@ A TURN relay sends whatever a client gives it to whatever address the client nam
 | `ipQuota` | `0` (off) | Allocations per client IP. |
 | `unallocatedTimeout` | `30000` | A client with no allocation is dropped after this much quiet, on every transport. With an allocation, the allocation's lifetime decides. |
 | `handshakeTimeout` | `10000` | TLS listener: handshake deadline. Connections still in their handshake count against `maxConnections`. |
+
+A UDP listener (`listen({ port, socketBufferSize })`) gets 4 MB socket buffers by default, as `IceAgent` does — every relayed client's media comes through it; `0` or `false` for the OS default. See [UDP socket buffers](#udp-socket-buffers).
 
 Addresses are judged by their bytes, not their spelling: `::ffff:127.0.0.1`, `::ffff:7f00:1`, `::127.0.0.1`, `64:ff9b::7f00:1` (NAT64) and `2002:7f00:1::` (6to4) are all loopback.
 A refused peer gets **403** on CreatePermission, ChannelBind and Connect, and a `peer:blocked` event (`{ peer, source, method }`).
@@ -957,6 +960,30 @@ Optimizations applied:
 - In-process deliveries (`relay.local`, relay-to-relay) share one FIFO queue drained by a single `setImmediate`
 - Permission/channel expiry checked against a 250ms coarse clock instead of `Date.now()` per packet
 
+### UDP socket buffers
+
+The sockets this package binds for traffic get 4 MB receive and send buffers
+(`0` or `false` for the OS default): `IceAgent`'s host sockets
+(`socketBufferSize`), the TURN server's UDP listener
+(`listen({ port, socketBufferSize })`), its relay sockets, one per allocation
+(`relay: { socketBufferSize }`, also through `setConfiguration`), and a
+client's transport (`connect(uri, { socketBufferSize })`). The OS default
+(208 KB on Linux) holds about 180 datagrams, and media or a data channel at
+full rate arrive in bursts it cannot hold: against Chromium, a 32 MB data
+channel transfer lost 300–1,600 datagrams in the kernel with it, none at
+4 MB. The rule is `src/udp_buffers.js`, exported from the package
+(`udpSocketOptions`, `checkedSocketBufferSize`) for sockets bound elsewhere
+that carry the same traffic — webrtc-server's `WebRTCRouter` uses it.
+
+**The kernel caps the size at `net.core.rmem_max` / `wmem_max`, silently**
+— often 208 KB on a stock server, which leaves the buffers where they were.
+On the server, raise it:
+
+```sh
+sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
+# kept across reboots:
+printf 'net.core.rmem_max=4194304\nnet.core.wmem_max=4194304\n' > /etc/sysctl.d/90-turn.conf
+```
 
 ## 🧪 Interoperability Testing
 
@@ -1008,6 +1035,7 @@ turn-server/
     ├── socket.js            - Transport: UDP/TCP/TLS client, relay socket, ChannelData routing
     ├── server.js            - Multi-endpoint listener, 5-tuple routing, convenience limits
     ├── ice_agent.js         - ICE agent (RFC 8445): gathering, checks, nomination, consent, restart
+    ├── udp_buffers.js       - UDP socket buffer sizes (ICE sockets, the UDP listener)
     └── ice_candidate.js     - Candidate primitives: priority, foundation, SDP parse/format (RFC 8839)
 ```
 

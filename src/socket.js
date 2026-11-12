@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 
 import Session from './session.js';
 import * as wire from './wire.js';
+import { checkedSocketBufferSize, udpSocketOptions } from './udp_buffers.js';
 
 
 // ─── Relays this process owns, by the address the world sees them at ────
@@ -104,6 +105,11 @@ function Socket(options) {
     options: options,
     isServer: !!options.isServer,
     destroyed: false,
+    // The buffers of the UDP sockets this Socket binds (udp_buffers.js): a
+    // client's transport to its TURN server, and — used on its own — the
+    // relay sockets (under a Server, its relay.socketBufferSize, read at each
+    // allocation).
+    socketBufferSize: checkedSocketBufferSize(options.socketBufferSize, 'socketBufferSize'),
 
     // Internal Session
     session: options.session || new Session({
@@ -403,6 +409,7 @@ function Socket(options) {
     var opt_relay_ip = live ? live.relayIp : context.options.relayIp;
     var opt_external_ip = live ? live.externalIp : context.options.externalIp;
     var opt_port_range = live ? live.portRange : context.options.portRange;
+    var buffer_size = live ? live.socketBufferSize : context.socketBufferSize;
     var relay_ip = opt_relay_ip || '0.0.0.0';
     var external_ip = opt_external_ip || relay_ip;
 
@@ -492,7 +499,7 @@ function Socket(options) {
       var port = first + ((start + attempts) % count) * step;
       attempts++;
 
-      var sock = dgram.createSocket(family);
+      var sock = dgram.createSocket(udpSocketOptions({ type: family }, buffer_size));
 
       // Bind-retry handler: fires when the port is busy. It MUST be detached
       // once the bind succeeds — otherwise a later runtime error on the relay
@@ -912,7 +919,7 @@ function Socket(options) {
 
     if (context.transportType === 'udp') {
       var family = context.serverHost && context.serverHost.indexOf(':') >= 0 ? 'udp6' : 'udp4';
-      context.transport = dgram.createSocket(family);
+      context.transport = dgram.createSocket(udpSocketOptions({ type: family }, context.socketBufferSize));
       context.transport.bind(0, function() {
         bindTransport();
         if (cb) cb();

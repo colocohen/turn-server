@@ -53,6 +53,7 @@ import {
   isResolvableMdnsCandidate,
 } from './ice_candidate.js';
 import * as iceMdns from './ice_mdns.js';
+import { checkedSocketBufferSize, udpSocketOptions } from './udp_buffers.js';
 import * as icePortmap from './ice_portmap.js';
 
 
@@ -308,6 +309,10 @@ function IceAgent(options) {
     includeLoopback:      !!options.includeLoopback,
     ipv6:                 options.ipv6 !== false,                // default true
     portRange:            options.portRange || [0, 0],           // [min, max]; 0 = any
+    // The buffers of the UDP sockets this agent binds (udp_buffers.js):
+    // 4 MB by default; 0 or false for the OS's. Not applied to a socket
+    // the caller hands in (options.socket / socket6) — that one is theirs.
+    socketBufferSize:     checkedSocketBufferSize(options.socketBufferSize, 'IceAgent: socketBufferSize'),
     components:           options.components || 1,
     tieBreaker:           crypto.randomBytes(8),
 
@@ -1678,7 +1683,7 @@ function IceAgent(options) {
   function bindUdpSocket(ip, family, cb) {
     try {
       const type = family === 'IPv6' ? 'udp6' : 'udp4';
-      const sock = dgram.createSocket({ type, reuseAddr: true });
+      const sock = dgram.createSocket(udpSocketOptions({ type, reuseAddr: true }, context.socketBufferSize));
 
       sock.on('message', function(buf, rinfo) {
         // HOT PATH: Node dgram delivers Buffer (a Uint8Array subclass).

@@ -1,4 +1,5 @@
 import dgram from 'node:dgram';
+import { checkedSocketBufferSize, udpSocketOptions } from './udp_buffers.js';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import os from 'node:os';
@@ -76,6 +77,9 @@ function Server(options) {
     relayIp: relay_config.ip || '0.0.0.0',
     externalIp: relay_config.externalIp || null,
     portRange: relay_config.portRange || [49152, 65535],
+    // Each allocation's relay socket: its buffers (udp_buffers.js), 4 MB by
+    // default — the peer's media for the client arrives there.
+    relaySocketBufferSize: checkedSocketBufferSize(relay_config.socketBufferSize, 'relay.socketBufferSize'),
     relayLocal: checkRelayLocal(relay_config.local, 'createServer'),
 
     // Auth config
@@ -336,7 +340,8 @@ function Server(options) {
   // The relay settings as they are now — read by each client Socket at every
   // allocation, so setConfiguration({ relay }) applies to clients that exist.
   function relayConfig() {
-    return { relayIp: context.relayIp, externalIp: context.externalIp, portRange: context.portRange };
+    return { relayIp: context.relayIp, externalIp: context.externalIp, portRange: context.portRange,
+             socketBufferSize: context.relaySocketBufferSize };
   }
 
   // Entries of a permissions/channels map that have not expired; expired
@@ -911,7 +916,10 @@ function Server(options) {
     // unpredictably. That failure mode is far worse than a loud EADDRINUSE,
     // so the default is false; pass { reuseAddr: true } per endpoint if you
     // genuinely need SO_REUSEADDR semantics.
-    var udp = dgram.createSocket({ type: family, reuseAddr: config.reuseAddr === true });
+    // Its buffers (udp_buffers.js): config.socketBufferSize, 4 MB by
+    // default — the relayed media of every client comes through it.
+    var udp = dgram.createSocket(udpSocketOptions({ type: family, reuseAddr: config.reuseAddr === true },
+                                                  checkedSocketBufferSize(config.socketBufferSize, 'listen[].socketBufferSize')));
 
     // Cached local address — udp.address() is a syscall. Safe to cache
     // after 'listening' fires, the address cannot change.
@@ -2141,6 +2149,8 @@ function Server(options) {
                 throw new TypeError('setConfiguration: relay.portRange must be [low, high] within 1–65535');
               }
               apply.push(['portRange', [rv[0], rv[1]]]);
+            } else if (rk === 'socketBufferSize') {
+              apply.push(['relaySocketBufferSize', checkedSocketBufferSize(rv, 'setConfiguration: relay.socketBufferSize')]);
             } else {
               throw new TypeError('setConfiguration: unknown option relay.' + rk);
             }
