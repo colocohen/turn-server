@@ -33,7 +33,7 @@
 //   extension-att-value = *VCHAR
 //   ice-char            = ALPHA / DIGIT / "+" / "/"
 
-import crypto from 'node:crypto';
+import { md5_sync } from 'cryptographic-primitives/md5.js';
 
 
 /* ========================= Type preferences ========================= */
@@ -116,7 +116,7 @@ function computePairPriority(controlling, localPriority, remotePriority) {
  */
 function computeFoundation(type, baseIp, protocol, stunServer) {
   const input = type + '|' + baseIp + '|' + (protocol || 'udp') + '|' + (stunServer || '');
-  return crypto.createHash('md5').update(input).digest('hex').slice(0, 8);
+  return Buffer.from(md5_sync(input)).toString('hex').slice(0, 8);
 }
 
 

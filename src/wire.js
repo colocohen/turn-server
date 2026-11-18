@@ -1,4 +1,13 @@
-import crypto from 'node:crypto';
+import { md5_sync } from 'cryptographic-primitives/md5.js';
+import { sha1_sync } from 'cryptographic-primitives/sha1.js';
+import { sha256_sync, sha384_sync, sha512_sync } from 'cryptographic-primitives/sha2.js';
+import { hmac_sync } from 'cryptographic-primitives/hmac.js';
+import { equal_sync } from 'cryptographic-primitives/ct.js';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+
+var HMAC_HASH = { sha1: sha1_sync, sha256: sha256_sync, sha384: sha384_sync, sha512: sha512_sync };
+
+function as_buffer(u8) { return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength); }
 
 /* ================================ Constants ================================ */
 
@@ -711,16 +720,16 @@ function saslprep(str) {
 }
 
 function compute_long_term_key(username, realm, password) {
-  return crypto.createHash('md5').update(
+  return as_buffer(md5_sync(
     saslprep(username) + ':' + saslprep(realm) + ':' + saslprep(password)
-  ).digest();
+  ));
 }
 
 // RFC 8489 — long-term key with SHA256
 function compute_long_term_key_sha256(username, realm, password) {
-  return crypto.createHash('sha256').update(
+  return as_buffer(sha256_sync(
     saslprep(username) + ':' + saslprep(realm) + ':' + saslprep(password)
-  ).digest();
+  ));
 }
 
 function compute_short_term_key(password) {
@@ -729,9 +738,7 @@ function compute_short_term_key(password) {
 
 // RFC 8489 §14.4 — USERHASH = SHA-256(username ":" realm)
 function compute_userhash(username, realm) {
-  return new Uint8Array(crypto.createHash('sha256').update(
-    saslprep(username) + ':' + saslprep(realm)
-  ).digest());
+  return sha256_sync(saslprep(username) + ':' + saslprep(realm));
 }
 
 // HMAC-SHA1 integrity (RFC 5389)
@@ -763,7 +770,7 @@ function compute_integrity_hmac(algo, digest_len, msg_buf, key, truncate_len) {
   var new_len = (msg_buf.length - HEADER_SIZE) + attr_total_bytes;
   msg_buf[2] = (new_len >>> 8) & 0xFF;
   msg_buf[3] = new_len & 0xFF;
-  var full_hmac = new Uint8Array(crypto.createHmac(algo, key).update(msg_buf).digest());
+  var full_hmac = hmac_sync(HMAC_HASH[algo], key, msg_buf);
   msg_buf[2] = b2; msg_buf[3] = b3;
   return hmac_len < digest_len ? full_hmac.slice(0, hmac_len) : full_hmac;
 }
@@ -803,7 +810,7 @@ function validate_integrity_by_length(raw_buf, integrity_offset, key) {
   else return false;
   var actual = raw_buf.slice(integrity_offset + 4, integrity_offset + 4 + hmac_len);
   if (expected.length !== actual.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+  return equal_sync(expected, actual);
 }
 
 // Alias: validate SHA-256 integrity explicitly.
@@ -822,7 +829,7 @@ function validate_integrity(raw_buf, integrity_offset, key) {
   var expected = compute_integrity(before, key);
   var actual = raw_buf.slice(integrity_offset + 4, integrity_offset + 4 + 20);
   if (expected.length !== actual.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+  return equal_sync(expected, actual);
 }
 
 var crc32_table = new Uint32Array(256);
@@ -902,7 +909,7 @@ function demux(buf) {
 }
 
 function generateTransactionId() {
-  return new Uint8Array(crypto.randomBytes(12));
+  return random_bytes_sync(12);
 }
 
 // Standalone STUN validation for ICE connectivity checks.
@@ -1028,7 +1035,7 @@ function stun_stream_frame_length(buf, off, avail) {
 function encode_message(options) {
   var method = options.method || METHOD.BINDING;
   var cls = options.cls || CLASS.REQUEST;
-  var tid = options.transactionId || new Uint8Array(crypto.randomBytes(12));
+  var tid = options.transactionId || random_bytes_sync(12);
   var key = options.key || null;
   var do_fingerprint = options.fingerprint !== false;
   var integrity_algo = options.integrity || 'sha1'; // 'sha1' | 'sha256'

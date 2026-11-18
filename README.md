@@ -14,13 +14,6 @@
   <img src="https://img.shields.io/github/license/colocohen/turn-server?color=brightgreen" alt="license">
 </p>
 
----
-
-> **⚠️ Project status: Active development.**
-> APIs may change before v1.0. Use at your own risk and please report issues!
-
----
-
 
 ## Table of Contents
 1. [What is STUN / TURN?](#-what-is-stun--turn)
@@ -80,6 +73,8 @@ npm install turn-server
 > - The optional WebSocket **server** auto-attach uses [`ws`](https://www.npmjs.com/package/ws) - an `optionalDependency`. The WebSocket **client** needs no dependency: it uses Node 22's built-in global `WebSocket`. You can also bring your own WebSocket server via `handleWebSocket()` (no `ws` needed).
 >
 > So UDP/TCP/TLS-only and BYO-WebSocket deployments carry no extra runtime cost.
+>
+> The hashes, HMACs (MESSAGE-INTEGRITY, nonces, TURN REST passwords) and random bytes come from [`cryptographic-primitives`](https://github.com/colocohen/cryptographic-primitives), the one required dependency.
 
 ### Server
 
@@ -886,7 +881,7 @@ resolve('turn:example.com', (err, parsed) => {
 | | **turn-server** | **node-turn** | **stun** (npm) | **coturn** |
 |---|:---:|:---:|:---:|:---:|
 | **Language** | Node.js | Node.js | Node.js | C |
-| **Dependencies** | **2** (pure JS) | 0 | 5+ | OpenSSL, DB |
+| **Dependencies** | **3** (pure JS) | 0 | 5+ | OpenSSL, DB |
 | **Embeddable** | ✅ library | ✅ | ✅ | ❌ daemon |
 | **ESM** | ✅ | ❌ CJS | ❌ CJS | N/A |
 | **Maintained** | ✅ | ❌ 5yr | ❌ 6yr | ✅ |
@@ -945,7 +940,7 @@ Benchmarked on a single core:
 | STUN decode | **218K msg/sec** | Full attribute parsing |
 | STUN encode (no auth) | **50K msg/sec** | Attribute encoding + CRC32 |
 | STUN encode (SHA1) | **36K msg/sec** | HMAC-SHA1 is the bottleneck |
-| HMAC-SHA1 | **314K/sec** | Node.js crypto (OpenSSL) limit |
+| HMAC-SHA1 | **314K/sec** | cryptographic-primitives, on Node's OpenSSL |
 
 The **data relay hot path** - which handles 99% of traffic - uses ChannelData (4-byte header, no STUN overhead, no HMAC). Control messages (allocate, refresh, permissions) use full STUN encoding with integrity, but these occur only a few times per minute.
 

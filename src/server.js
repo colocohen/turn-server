@@ -1,7 +1,7 @@
 import dgram from 'node:dgram';
 import { checkedSocketBufferSize, udpSocketOptions } from './udp_buffers.js';
 import net from 'node:net';
-import crypto from 'node:crypto';
+import { randomBuffer } from './random.js';
 import os from 'node:os';
 // lemon-tls is this library's TLS: for the TLS listener and for DTLS. One
 // implementation throughout — the same certificate contexts (an SNICallback
@@ -70,7 +70,7 @@ function Server(options) {
 
   var context = {
     // One nonce key for every client of this server (Session nonceKey).
-    nonceKey: crypto.randomBytes(16),
+    nonceKey: randomBuffer(16),
     software: options.software || null,
 
     // Relay config

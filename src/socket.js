@@ -1,4 +1,4 @@
-import crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 import dgram from 'node:dgram';
 import net from 'node:net';
 import lemonTls from 'lemon-tls';
@@ -542,7 +542,7 @@ function Socket(options) {
             // Store reservation token → reserved socket. RFC 5766 §14.9:
             // the server MUST hold the reservation for at least 30 seconds;
             // after that, release the port.
-            var token = new Uint8Array(crypto.randomBytes(8));
+            var token = random_bytes_sync(8);
             var tokenHex = Buffer.from(token).toString('hex');
             var ttl = setTimeout(function() {
               var entry = context.reservations[tokenHex];

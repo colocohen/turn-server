@@ -1,5 +1,15 @@
 
-import crypto from 'node:crypto';
+import { hmac_sync } from 'cryptographic-primitives/hmac.js';
+import { sha1_sync } from 'cryptographic-primitives/sha1.js';
+import { equal_sync } from 'cryptographic-primitives/ct.js';
+import { randomBuffer } from './random.js';
+
+function as_buffer(u8) { return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength); }
+
+// The nonce's MAC: HMAC-SHA1(key, timestamp + scope), 16 hex digits
+function nonce_mac(key, timestamp, scope) {
+  return as_buffer(hmac_sync(sha1_sync, key, timestamp + scope)).toString('hex').slice(0, 16);
+}
 import { EventEmitter } from 'node:events';
 
 import * as wire from './wire.js';
@@ -25,7 +35,7 @@ function coarseNow() {
 // truncated to 16 hex digits; scope binds it to the client's ip:port.
 export function makeNonce(key, scope) {
   var timestamp = Math.floor(Date.now() / 1000).toString(16);
-  var mac = crypto.createHmac('sha1', key).update(timestamp + scope).digest('hex').slice(0, 16);
+  var mac = nonce_mac(key, timestamp, scope);
   return timestamp + ':' + mac;
 }
 
@@ -193,7 +203,7 @@ function Session(options) {
   // A Server shares one key across its clients (options.nonceKey), so it can
   // issue a nonce to a new 5-tuple without creating a client for it (see
   // server.js stateless_challenge) and this Session still accepts it.
-  var _nonceKey = options.nonceKey || crypto.randomBytes(16);
+  var _nonceKey = options.nonceKey || randomBuffer(16);
 
   // Source-address binding: include source IP in HMAC so nonce can't be replayed from different 5-tuple
   function _nonce_scope() {
@@ -221,8 +231,9 @@ function Session(options) {
     var parts = nonce.split(':');
     var timestamp = parts[0];
     var mac = parts[1];
-    var expected_mac = crypto.createHmac('sha1', _nonceKey).update(timestamp + _nonce_scope()).digest('hex').slice(0, 16);
-    if (mac !== expected_mac) return false;
+    var expected_mac = nonce_mac(_nonceKey, timestamp, _nonce_scope());
+    if (typeof mac !== 'string' || mac.length !== expected_mac.length ||
+        !equal_sync(Buffer.from(mac), Buffer.from(expected_mac))) return false;
     var nonce_time = parseInt(timestamp, 16) * 1000;
     return (Date.now() - nonce_time) <= context.nonceExpiry;
   }
@@ -282,7 +293,7 @@ function Session(options) {
           return cb(null); // expired
         }
       }
-      var password = crypto.createHmac('sha1', context.secret).update(username).digest('base64');
+      var password = as_buffer(hmac_sync(sha1_sync, context.secret, username)).toString('base64');
       return cb(wire.compute_long_term_key(username, context.realm, password));
     }
 

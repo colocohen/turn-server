@@ -33,7 +33,7 @@
 // all state transitions reactively. External code may call set_context()
 // directly or use the convenience methods.
 
-import crypto from 'node:crypto';
+import { randomBuffer } from './random.js';
 import dgram from 'node:dgram';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
@@ -153,14 +153,14 @@ function randomUfrag() {
   // RFC 8445 §16.1 + RFC 5245 §15.1:
   //   ufrag ≥ 4 characters of ice-char = ALPHA / DIGIT / "+" / "/"
   // 3 random bytes → 4 base64 chars (with 2 '=' padding, which we strip).
-  return crypto.randomBytes(3).toString('base64').replace(/=/g, '');
+  return randomBuffer(3).toString('base64').replace(/=/g, '');
 }
 
 function randomPwd() {
   // RFC 8445 §16.1: password ≥ 128 bits of randomness = ≥ 22 ice-chars
   // 16 random bytes → 24 base64 chars (2 '=' padding); after stripping = 22 chars.
   // NOTE: ice-char includes '+' and '/', so we do NOT strip those.
-  return crypto.randomBytes(16).toString('base64').replace(/=/g, '');
+  return randomBuffer(16).toString('base64').replace(/=/g, '');
 }
 
 function txIdHex(txnId) {
@@ -314,7 +314,7 @@ function IceAgent(options) {
     // the caller hands in (options.socket / socket6) — that one is theirs.
     socketBufferSize:     checkedSocketBufferSize(options.socketBufferSize, 'IceAgent: socketBufferSize'),
     components:           options.components || 1,
-    tieBreaker:           crypto.randomBytes(8),
+    tieBreaker:           randomBuffer(8),
 
     // ── mDNS (draft-ietf-mmusic-mdns-ice-candidates) runtime state ──
     mdns: {

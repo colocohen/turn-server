@@ -46,7 +46,16 @@
 //   * Registration skips the RFC 6762 probe (§3.1.1 permits this for
 //     UUID names) so gathering pays ~0ms instead of ~750ms.
 
-import crypto from 'node:crypto';
+import { randomBuffer } from './random.js';
+
+// A random (version 4) UUID, RFC 9562 §5.4
+function randomUuid() {
+  var b = randomBuffer(16);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  var h = b.toString('hex');
+  return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+}
 import { isResolvableMdnsCandidate } from './ice_candidate.js';
 
 /* ====================== Shared instance state ====================== */
@@ -214,7 +223,7 @@ function acquire(options, cb) {
           return setImmediate(cb2, null, existing.name);
         }
 
-        var uuid = crypto.randomUUID();
+        var uuid = randomUuid();
 
         var entry = { name: uuid + '.local', handle: null, refs: 1 };
         registrations[ip] = entry;
