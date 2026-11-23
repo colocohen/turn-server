@@ -113,6 +113,14 @@ function _diagRL(key, ms) {
   return true;
 }
 function _diagTs() { return new Date().toISOString().slice(11, 23); }
+// Every [ice-diag] line goes through here. Several of them (socket
+// bound/closed, role/ufrag set via opts, ICE STATE, restart) used to call
+// console.log directly and printed on every connection without
+// WEBRTC_DEBUG. Callers that build expensive strings still check _ICE_DBG
+// first; this is the gate that cannot be forgotten.
+function _diagLog() {
+  if (_ICE_DBG) console.log.apply(console, arguments);
+}
 
 // Lite liveness (passive): a full-ICE peer checks its selected pair at least
 // every few seconds (Chrome 2.5s, RFC 7675 consent every 4-6s — Firefox), so
@@ -427,6 +435,7 @@ function IceAgent(options) {
     _gathering_srflx:     0,
     _gathering_relay:     0,
     _endOfCandidatesEmitted: false,
+    _reopenAfterFailed: false,     // a remote candidate arrived after 'failed' (cascade 2.0)
     _reEmitOnGather:      false,   // set by restart(): re-announce kept candidates
     _gather_timers:       new Set(),
   };
@@ -479,7 +488,7 @@ function IceAgent(options) {
     if ('controlling' in opts) {
       if (opts.controlling !== context.controlling) {
         if (context.controlling !== !!opts.controlling) {
-          console.log('[ice-diag] ' + _diagTs() + ' ROLE SET via opts: ' +
+          _diagLog('[ice-diag] ' + _diagTs() + ' ROLE SET via opts: ' +
                       context.controlling + ' → ' + !!opts.controlling);
         }
         context.controlling = !!opts.controlling;
@@ -504,7 +513,7 @@ function IceAgent(options) {
 
     if ('localUfrag' in opts) {
       if (opts.localUfrag !== context.localUfrag && opts.localUfrag) {
-        console.log('[ice-diag] ' + _diagTs() + ' localUfrag set via opts: ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' localUfrag set via opts: ' +
                     context.localUfrag + ' → ' + opts.localUfrag);
         context.localUfrag = opts.localUfrag;
         has_changed = true;
@@ -566,7 +575,7 @@ function IceAgent(options) {
         // [ice-diag] agent-side state transitions with precise timestamps —
         // lets us line up the server's view against the browser's timeline.
         if (_ICE_DBG) {
-          console.log('[ice-diag] ' + _diagTs() + ' ICE STATE ' + prev + ' → ' + context.state);
+          _diagLog('[ice-diag] ' + _diagTs() + ' ICE STATE ' + prev + ' → ' + context.state);
         }
         ev.emit('statechange', context.state, prev);
       }
@@ -625,7 +634,18 @@ function IceAgent(options) {
       } else if (cand && !findRemoteCandidate(cand.ip, cand.port)) {
         context.remoteCandidates.push(cand);
         has_changed = true;
+        const pairsBefore = context.checkList.length;
         formPairsForNewRemote(cand);
+        // A candidate trickled in after 'failed' (RFC 8838 §8: the peer had
+        // not signalled end-of-candidates, so the check list was never
+        // complete). 'failed' used to latch until a restart, so a path that
+        // arrived a little late could never be used. Reopen the session
+        // for the new pairs, as Chrome does (failed → checking); cascade
+        // 2.0 does it, once per set_context pass.
+        if (context.state === 'failed' && context.mode !== 'lite' &&
+            context.checkList.length > pairsBefore) {
+          context._reopenAfterFailed = true;
+        }
       } else if (cand) {
         // A SIGNALLED CANDIDATE OUTRANKS A DISCOVERED ONE.
         //
@@ -757,6 +777,19 @@ function IceAgent(options) {
         for (let i = 0; i < batch.length; i++) ev.emit('candidate', maskCandidateForSignaling(batch[i]));
       }
       ev.emit('candidate', null);
+    }
+
+
+    /* 2.0 — Full ICE: a remote candidate arrived after 'failed' and formed
+     *  new pairs (see add_remote_candidate). Leave 'failed' so the scheduler
+     *  (2.2) starts again; the recursive pass applies the state first. A
+     *  path that once worked reports 'disconnected', like computeFullState. */
+    if (context._reopenAfterFailed) {
+      context._reopenAfterFailed = false;
+      if (context.state === 'failed' && !context.closed) {
+        set_context({ state: context.hasBeenWritable ? 'disconnected' : 'checking' });
+        return;
+      }
     }
 
 
@@ -1694,17 +1727,17 @@ function IceAgent(options) {
       sock.on('error', function(err) {
         try {
           var _ea = sock.address();
-          console.log('[ice-diag] ' + _diagTs() + ' SOCKET ERROR on ' +
+          _diagLog('[ice-diag] ' + _diagTs() + ' SOCKET ERROR on ' +
                       _ea.address + ':' + _ea.port + ' — ' + (err && err.message));
         } catch (e) {
-          console.log('[ice-diag] ' + _diagTs() + ' SOCKET ERROR (unbound) — ' + (err && err.message));
+          _diagLog('[ice-diag] ' + _diagTs() + ' SOCKET ERROR (unbound) — ' + (err && err.message));
         }
         ev.emit('error', err);
       });
 
       sock.on('close', function() {
         // Bound identity is unreadable post-close; capture at bind below.
-        console.log('[ice-diag] ' + _diagTs() + ' SOCKET CLOSED ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' SOCKET CLOSED ' +
                     (sock.__diagBound || '(identity unknown)'));
       });
 
@@ -1716,7 +1749,7 @@ function IceAgent(options) {
         let bound;
         try { bound = sock.address(); } catch (e) { cb(null, null); return; }
         sock.__diagBound = bound.address + ':' + bound.port;
-        console.log('[ice-diag] ' + _diagTs() + ' SOCKET BOUND ' + sock.__diagBound);
+        _diagLog('[ice-diag] ' + _diagTs() + ' SOCKET BOUND ' + sock.__diagBound);
         cb(sock, { address: bound.address, port: bound.port, family });
       });
 
@@ -2123,14 +2156,14 @@ function IceAgent(options) {
     if (_ICE_DBG && _diagRL('stunrx:' + rinfo.address + ':' + rinfo.port, 2000)) {
       var _lsock = '?';
       try { if (sock) { var _la = sock.address(); _lsock = _la.address + ':' + _la.port; } } catch (e) {}
-      console.log('[ice-diag] ' + _diagTs() + ' stun-rx from ' +
+      _diagLog('[ice-diag] ' + _diagTs() + ' stun-rx from ' +
                   rinfo.address + ':' + rinfo.port + ' → local ' + _lsock +
                   ' len=' + buf.length);
     }
     const msg = wire.decode_message(buf);
     if (!msg) {
       if (_ICE_DBG && _diagRL('stundecfail:' + rinfo.address + ':' + rinfo.port, 2000)) {
-        console.log('[ice-diag] ' + _diagTs() + ' stun-rx DECODE FAILED from ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' stun-rx DECODE FAILED from ' +
                     rinfo.address + ':' + rinfo.port + ' len=' + buf.length +
                     ' head=' + buf.slice(0, 8).toString('hex'));
       }
@@ -2142,7 +2175,7 @@ function IceAgent(options) {
     const pending = context.pendingTransactions[txHex];
     if (pending) {
       if (_ICE_DBG && _diagRL('stunresp:' + rinfo.address + ':' + rinfo.port, 5000)) {
-        console.log('[ice-diag] ' + _diagTs() + ' stun response consumed (kind=' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' stun response consumed (kind=' +
                     pending.kind + ') from ' + rinfo.address + ':' + rinfo.port);
       }
       if (msg.cls === wire.CLASS.SUCCESS) {
@@ -2180,7 +2213,7 @@ function IceAgent(options) {
     // [ice-diag] Fallthrough — STUN we recognized but did not handle
     // (unknown transaction response, indication, non-binding method).
     if (_ICE_DBG && _diagRL('stunfall:' + rinfo.address + ':' + rinfo.port, 2000)) {
-      console.log('[ice-diag] ' + _diagTs() + ' stun UNHANDLED from ' +
+      _diagLog('[ice-diag] ' + _diagTs() + ' stun UNHANDLED from ' +
                   rinfo.address + ':' + rinfo.port +
                   ' method=' + msg.method + ' cls=' + msg.cls +
                   ' (pendingTx=' + (context.pendingTransactions[txHex] ? 'yes' : 'no') + ')');
@@ -2665,7 +2698,7 @@ function IceAgent(options) {
     const age = Date.now() - context.lastRequestReceivedAt;
 
     if (_ICE_DBG) {
-      console.log('[ice-diag] ' + _diagTs() + ' lite-liveness age=' + age + 'ms state=' + context.state);
+      _diagLog('[ice-diag] ' + _diagTs() + ' lite-liveness age=' + age + 'ms state=' + context.state);
     }
 
     if (age >= LITE_FAILED_MS) {
@@ -2696,7 +2729,7 @@ function IceAgent(options) {
     // (bidi disconnect hunt, Aug 2026). Never again.
     if (!context.localPwd) {
       if (_ICE_DBG && _diagRL('drop-nopwd:' + rinfo.address + ':' + rinfo.port, 2000)) {
-        console.log('[ice-diag] ' + _diagTs() + ' DROP binding-req from ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' DROP binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — context.localPwd is EMPTY');
       }
       return;
@@ -2706,7 +2739,7 @@ function IceAgent(options) {
     // who saw the ufrag nominate their own address as the selected pair.
     if (msg.integrity_offset === null) {
       if (_ICE_DBG && _diagRL('drop-nomi:' + rinfo.address + ':' + rinfo.port, 2000)) {
-        console.log('[ice-diag] ' + _diagTs() + ' 400 binding-req from ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' 400 binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — no MESSAGE-INTEGRITY');
       }
       sendBindingError(msg, rinfo, sock, turnSocket, 400, 'Bad Request');
@@ -2714,7 +2747,7 @@ function IceAgent(options) {
     }
     if (!wire.verifyStunIntegrity(buf, msg, localKey())) {
       if (_ICE_DBG && _diagRL('drop-integrity:' + rinfo.address + ':' + rinfo.port, 2000)) {
-        console.log('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — MESSAGE-INTEGRITY failed ' +
                     '(their HMAC pwd != our context.localPwd — credential divergence?)');
       }
@@ -2726,7 +2759,7 @@ function IceAgent(options) {
     const usernameAttr = msg.getAttribute(wire.ATTR.USERNAME);
     if (typeof usernameAttr !== 'string' || usernameAttr.indexOf(':') < 0) {
       if (_ICE_DBG && _diagRL('drop-badusr:' + rinfo.address + ':' + rinfo.port, 2000)) {
-        console.log('[ice-diag] ' + _diagTs() + ' 400 binding-req from ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' 400 binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — malformed USERNAME');
       }
       sendBindingError(msg, rinfo, sock, turnSocket, 400, 'Bad Request');
@@ -2736,7 +2769,7 @@ function IceAgent(options) {
     const usernameLocal = usernameAttr.substring(0, colonIdx);
     if (usernameLocal !== context.localUfrag) {
       if (_ICE_DBG && _diagRL('drop-ufrag:' + rinfo.address + ':' + rinfo.port, 2000)) {
-        console.log('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
+        _diagLog('[ice-diag] ' + _diagTs() + ' 401 binding-req from ' +
                     rinfo.address + ':' + rinfo.port + ' — USERNAME local part "' +
                     usernameLocal + '" != context.localUfrag "' + context.localUfrag + '"');
       }
@@ -2753,26 +2786,26 @@ function IceAgent(options) {
       if (compareTieBreakers(context.tieBreaker, icControlling.raw) >= 0) {
         // We win — tell them to switch (487)
         if (_ICE_DBG && _diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
-          console.log('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlling, we win) → ' +
+          _diagLog('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlling, we win) → ' +
                       rinfo.address + ':' + rinfo.port + ' — our role=controlling');
         }
         sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict', localKey());
         return;
       }
       // We lose — switch to controlled
-      console.log('[ice-diag] ' + _diagTs() + ' role conflict: both controlling, we LOSE → switching to controlled');
+      _diagLog('[ice-diag] ' + _diagTs() + ' role conflict: both controlling, we LOSE → switching to controlled');
       switchRole(false);
     } else if (!context.controlling && icControlled !== null) {
       // Both claim controlled
       if (compareTieBreakers(context.tieBreaker, icControlled.raw) >= 0) {
         if (_ICE_DBG && _diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
-          console.log('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlled, we win) → ' +
+          _diagLog('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlled, we win) → ' +
                       rinfo.address + ':' + rinfo.port + ' — our role=controlled');
         }
         sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict', localKey());
         return;
       }
-      console.log('[ice-diag] ' + _diagTs() + ' role conflict: both controlled, we LOSE → switching to controlling');
+      _diagLog('[ice-diag] ' + _diagTs() + ' role conflict: both controlled, we LOSE → switching to controlling');
       switchRole(true);
     }
 
@@ -2816,7 +2849,7 @@ function IceAgent(options) {
     // proves whether the peer's checks/consent keep arriving and that we
     // keep answering — and to WHICH address the answer goes.
     if (_ICE_DBG && _diagRL('bindreq:' + rinfo.address + ':' + rinfo.port, 2000)) {
-      console.log('[ice-diag] ' + _diagTs() + ' binding-req from ' +
+      _diagLog('[ice-diag] ' + _diagTs() + ' binding-req from ' +
                   rinfo.address + ':' + rinfo.port +
                   ' → responding (pair=' + (pair ? 'known' : 'NONE') + ')');
     }
@@ -3407,6 +3440,14 @@ function IceAgent(options) {
     send: function(buf) {
       const pair = context.selectedPair || context._previousPair;
       if (!pair) return false;
+      // RFC 7675 §5.1: once consent has expired, stop sending application
+      // data (our own checks still go out — they use sendViaPair directly,
+      // and an answer to one restores the pair). Before, RTP, RTCP and DTLS
+      // kept flowing at full rate after 'failed' to a peer that had stopped
+      // answering. 'timeout' is the pair-level verdict (unanswered for
+      // INACTIVE_TIMEOUT_MS); 'failed' the agent-level one, which in lite
+      // mode is the passive liveness expiry.
+      if (context.state === 'failed' || pair.writeState === 'timeout') return false;
       return sendViaPair(pair, buf);
     },
 
@@ -3497,7 +3538,7 @@ function IceAgent(options) {
 
       // Apply new local creds atomically via direct mutation — these feed
       // Binding Request USERNAME/MESSAGE-INTEGRITY for the new session.
-      console.log('[ice-diag] ' + _diagTs() + ' RESTART: local creds rotated ' +
+      _diagLog('[ice-diag] ' + _diagTs() + ' RESTART: local creds rotated ' +
                   context.localUfrag + ' → ' + ufrag + ' (remote creds dropped, awaiting new)');
       context.localUfrag = ufrag;
       context.localPwd   = pwd;
@@ -3525,6 +3566,108 @@ function IceAgent(options) {
 
       ev.emit('restart', { ufrag, pwd });
       return { ufrag, pwd };
+    },
+
+    /** The peer moved to a new transport under the same ICE credentials:
+     *  start checking from scratch against that transport's candidates,
+     *  keeping our credentials, local candidates and sockets.
+     *
+     *  For the SDP layer when WebRTC's BUNDLE tag changed: Chrome brings up
+     *  a new ICE transport (new sockets) for the new tag, which knows only
+     *  the candidates of the new tag's m-section, and closes the old one —
+     *  once IT has applied the answer, so it can still answer for a while.
+     *  Not an ICE restart (RFC 8445 §9): nothing is signalled.
+     *
+     *  Before this the selected pair kept pointing at the peer's old
+     *  sockets: it looked working until consent ran out, the scheduler
+     *  stayed at its slow connected pace and the new pairs waited 2.5-7s
+     *  to be checked and selected, while the new DTLS handshake went to the
+     *  closed port. Re-checking the existing pairs is not enough either:
+     *  while the peer's old transport still answers (we answered its offer
+     *  and it has not applied our answer yet), its pair works again at
+     *  once, gets selected and nominated, and the pairs to the new
+     *  transport are pruned as dominated — the handshake stuck on the old
+     *  path for good.
+     *
+     *  remoteCandidates — the new transport's candidates (its m-section's,
+     *  trickled ones included). The pairs and remote candidates of the old
+     *  transport are dropped; its peer-reflexive ones come back from the
+     *  peer's checks. Omitted: the current candidates are kept and their
+     *  pairs re-checked (a peer that keeps its sockets).
+     *
+     *  Like a fresh transport: no selected pair (send() returns false until
+     *  one is chosen), every pair unchecked — full ICE checks at the fast
+     *  pace at once, triggered checks first; lite waits for the peer's next
+     *  nomination — and the state 'checking'.
+     *
+     *  Events: 'statechange' ('checking', then 'connected'), and
+     *  'selectedpair' when a pair is chosen. */
+    recheck: function(remoteCandidates) {
+      if (context.closed) return;
+
+      // In-flight checks belong to the old pairs; their responses would
+      // mark a pair working without a fresh round trip.
+      const txKeys = Object.keys(context.pendingTransactions);
+      for (let i = 0; i < txKeys.length; i++) {
+        const t = context.pendingTransactions[txKeys[i]];
+        if (!t || t.kind !== 'check') continue;
+        if (t.timer) clearTimeout(t.timer);
+        delete context.pendingTransactions[txKeys[i]];
+      }
+
+      const lite = context.mode === 'lite';
+      const replace = Array.isArray(remoteCandidates);
+      if (replace) {
+        context.checkList        = [];
+        context.remoteCandidates = [];
+        context.remoteCandidatesEnded = false;
+      } else {
+        for (let i = 0; i < context.checkList.length; i++) {
+          const p = context.checkList[i];
+          p.state             = lite ? 'frozen' : 'waiting';
+          p.valid             = false;
+          p.nominated         = false;
+          p.peerNominated     = false;
+          p.weNominated       = false;
+          p.writeState        = 'init';
+          p.receiving         = false;
+          p.receivingChangedAt = 0;
+          p.lastReceivedAt    = 0;
+          p.lastPingSent      = 0;
+          p.lastResponseAt    = 0;
+          p.pingsSent         = 0;
+          p.unanswered        = 0;
+          p.unansweredFirstAt = 0;
+          p.unansweredFifthAt = 0;
+          p.rttSamples        = 0;
+          p.pruned            = false;
+          p.errorFailed       = false;
+          p.requestReceivedAt = 0;
+          p.nominatedAt       = 0;
+        }
+      }
+      context.validList       = [];
+      context.selectedPair    = null;
+      context._previousPair   = null;
+      context.hasBeenWritable = false;
+      // Lite liveness: stopped as restart() does, with a new clock. Its tick
+      // returns without rescheduling while no pair is selected, and with
+      // liteLivenessActive still set 2.8b would never start it again — the
+      // new path would go unwatched. 2.8b starts it on the next selection.
+      if (context.liteLivenessTimer) { clearTimeout(context.liteLivenessTimer); context.liteLivenessTimer = null; }
+      context.liteLivenessActive = false;
+      context.lastRequestReceivedAt = 0;
+
+      _diagLog('[ice-diag] ' + _diagTs() + ' RECHECK: ' +
+               (replace ? remoteCandidates.length + ' remote candidates of the new transport'
+                        : context.checkList.length + ' pairs back to unchecked'));
+      if (context.state !== 'new' && context.state !== 'checking') {
+        set_context({ state: 'checking' });
+      }
+      if (replace) {
+        for (let i = 0; i < remoteCandidates.length; i++) api.addRemoteCandidate(remoteCandidates[i]);
+      }
+      if (!lite && context.checkList.length > 0) schedulePingTick(0);
     },
 
     /** Close everything. Sockets, timers, transactions. Terminal.
