@@ -3,6 +3,7 @@ import dgram from 'node:dgram';
 import net from 'node:net';
 import lemonTls from 'lemon-tls';
 import os from 'node:os';
+import util from 'node:util';
 import { EventEmitter } from 'node:events';
 
 import Session from './session.js';
@@ -38,6 +39,139 @@ function removeRelayIp(ip) {
   if (n <= 1) localRelayIps.delete(ip); else localRelayIps.set(ip, n - 1);
 }
 function isOwnRelayIp(ip) { return localRelayIps.size > 0 && localRelayIps.has(ip); }
+
+
+// ─── RFC 6062 TCP relay ─────────────────────────────────────────────────
+//
+// Peer data connections by CONNECTION-ID, process-wide. The ConnectionBind
+// that claims one arrives on a NEW connection from the client — another
+// Socket, another Session — so the id must be found from there.
+// id -> { id, peer, sock, state: 'connecting' | 'pending' | 'bound',
+//         owner (the allocation's Socket context), username, realm, timer }
+var tcpRelayConns = new Map();
+function newConnectionId() {
+  var id;
+  do { id = Buffer.from(random_bytes_sync(4)).readUInt32BE(0); } while (id === 0 || tcpRelayConns.has(id));
+  return id;
+}
+
+// TCP relay ports this process listens on. The listeners are opened with
+// SO_REUSEPORT (see connectFromRelay), which would also let a second
+// listener of ours join the same port; they are kept apart by this set.
+var tcpRelayPorts = new Set();
+
+// The relayed address is the local end of the connections the server opens
+// to peers (RFC 6062 §5.2), while it also listens there (§5.3). Linux binds
+// a second socket to a listening port only when both have SO_REUSEPORT, and
+// Node sets it on a listener (reusePort) but not on a connecting socket. So
+// the connecting socket is made from Node's own TCP handle, bound with the
+// reuse-port flag, then connected and wrapped in a net.Socket.
+// null when this runtime has no such handle (not Node, or a Node that
+// removed it): connections then leave from the relay IP and a port of the
+// system's choosing — a warning says so, once.
+var UV_TCP_REUSEPORT = 2;
+var _tcpWrap;
+function tcpWrapBinding() {
+  if (_tcpWrap !== undefined) return _tcpWrap;
+  _tcpWrap = null;
+  try {
+    var b = process.binding('tcp_wrap');
+    if (b && typeof b.TCP === 'function' && typeof b.TCPConnectWrap === 'function' && b.constants) _tcpWrap = b;
+  } catch (e) {}
+  return _tcpWrap;
+}
+var _warnedEphemeral = false;
+function warnEphemeral(why) {
+  if (_warnedEphemeral) return;
+  _warnedEphemeral = true;
+  try {
+    process.emitWarning('TURN TCP relay: connections to peers leave from an ephemeral port, not the relayed ' +
+      'address (RFC 6062 §5.2): ' + why, 'TurnTcpRelayWarning');
+  } catch (e) {}
+}
+
+function sysError(status, syscall) {
+  var name = 'UNKNOWN';
+  try { name = util.getSystemErrorName(status); } catch (e) {}
+  var err = new Error(syscall + ' ' + name);
+  err.code = name; err.errno = status; err.syscall = syscall;
+  return err;
+}
+
+// Open a TCP connection to `peer` from `local` ({ ip, port, reusePort }).
+// cb(err) or cb(null, socket) — the socket handed over paused: what the peer
+// sends waits in the kernel, its receive window shrinking, until somebody
+// reads (RFC 6062 §5.2: buffer, and let the window show it).
+function connectFromRelay(local, peer, timeoutMs, cb) {
+  var done = false;
+  var timer = null;
+  function finish(err, sock) {
+    if (done) return;
+    done = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    cb(err, sock);
+  }
+
+  var tw = local.reusePort ? tcpWrapBinding() : null;
+  if (!tw) {
+    warnEphemeral(local.reusePort ? 'no TCP handle in this runtime' : 'the relay listener has no SO_REUSEPORT');
+    var opts = { host: peer.ip, port: peer.port, noDelay: true };
+    if (local.ip && local.ip !== '0.0.0.0' && local.ip !== '::') opts.localAddress = local.ip;
+    var c = net.connect(opts);
+    c.pause();
+    c.on('connect', function() { c.removeListener('error', onErr); finish(null, c); });
+    function onErr(err) { c.destroy(); finish(err); }
+    c.on('error', onErr);
+    timer = setTimeout(function() { c.destroy(); finish(Object.assign(new Error('connect timeout'), { code: 'ETIMEDOUT' })); }, timeoutMs);
+    if (timer.unref) timer.unref();
+    return;
+  }
+
+  var v6 = net.isIPv6(peer.ip);
+  var h = new tw.TCP(tw.constants.SOCKET);
+  var rc = v6 ? h.bind6(local.ip, local.port, UV_TCP_REUSEPORT) : h.bind(local.ip, local.port, UV_TCP_REUSEPORT);
+  if (rc) { try { h.close(); } catch (e) {} return finish(sysError(rc, 'bind')); }
+
+  var req = new tw.TCPConnectWrap();
+  req.oncomplete = function(status) {
+    if (done) return;                      // timed out; the handle is closed
+    if (status < 0) { try { h.close(); } catch (e) {} return finish(sysError(status, 'connect')); }
+    var sock;
+    try {
+      sock = new net.Socket({ handle: h, readable: true, writable: true, pauseOnCreate: true });
+    } catch (e) { try { h.close(); } catch (e2) {} return finish(e); }
+    sock.setNoDelay(true);
+    finish(null, sock);
+  };
+  req.address = peer.ip;
+  req.port = peer.port;
+  req.localAddress = local.ip;
+  req.localPort = local.port;
+  var crc = v6 ? h.connect6(req, peer.ip, peer.port) : h.connect(req, peer.ip, peer.port);
+  if (crc) { try { h.close(); } catch (e) {} return finish(sysError(crc, 'connect')); }
+  timer = setTimeout(function() {
+    try { h.close(); } catch (e) {}
+    finish(Object.assign(new Error('connect timeout'), { code: 'ETIMEDOUT' }));
+  }, timeoutMs);
+  if (timer.unref) timer.unref();
+}
+
+// An IPv4 peer on a dual-stack listener shows up as ::ffff:a.b.c.d.
+function unmapIp(ip) {
+  return typeof ip === 'string' && ip.indexOf('::ffff:') === 0 && net.isIPv4(ip.slice(7)) ? ip.slice(7) : ip;
+}
+
+function stunError(code, message) {
+  var e = new Error(message || ('STUN ' + code));
+  e.stunCode = code;
+  return e;
+}
+
+// RFC 6062 timers: the time a peer data connection waits for its
+// ConnectionBind (§5.2, §5.3), and how long a Connect may take — "at least
+// 30 seconds" (§5.2); it was 10.
+var TCP_BIND_TIMEOUT = 30000;
+var TCP_CONNECT_TIMEOUT = 30000;
 
 // In-process deliveries (local relays, relay.local and its replies) are
 // asynchronous, as a datagram would be. Rather than one setImmediate and one
@@ -139,6 +273,15 @@ function Socket(options) {
       allowMulticast: options.allowMulticast || false,
       allowPrivatePeers: options.allowPrivatePeers || false,
       isOwnRelayIp: isOwnRelayIp,
+      // The nonce scope of the control connection that owns a pending
+      // RFC 6062 connection id (see Session valid_control_nonce).
+      connectionNonceScope: function(id) {
+        var e = tcpRelayConns.get(id);
+        if (!e || e.state !== 'pending' || e.owner.destroyed) return null;
+        var src = e.owner.session.context.source;
+        return src ? src.ip + ':' + src.port : null;
+      },
+      isSelfServiceIp: typeof options.isSelfServiceIp === 'function' ? options.isSelfServiceIp : null,
       allowedPeers: options.allowedPeers || null,
       deniedPeers: options.deniedPeers || null,
       allowTcpRelay: options.allowTcpRelay || false,
@@ -175,7 +318,8 @@ function Socket(options) {
     ownsReservations: !options.reservations,
 
     // Server-side: TCP relay connections (RFC 6062)
-    tcpPeerConnections: {},  // connectionId → net.Socket
+    tcpPeerConnections: {},  // connectionId → entry (see tcpRelayConns)
+    relayIsTcp: false,       // the allocation is RFC 6062 TCP: relaySocket is a net.Server
 
     // Server-side: secondary address for NAT detection (RFC 5780)
     secondaryAddress: options.secondaryAddress || null,
@@ -250,12 +394,15 @@ function Socket(options) {
       var _tcpChunks = [];
       var _tcpLen = 0;
 
-      context.transport.on('data', function(chunk) {
+      function onStreamData(chunk) {
         if (context.destroyed) return;
         _tcpChunks.push(chunk);
         _tcpLen += chunk.length;
         parseTcpFrames();
-      });
+      }
+      function onStreamError(err) { ev.emit('error', err); }
+      function onStreamClose() { ev.emit('close'); }
+      context.transport.on('data', onStreamData);
 
       function compactBuffer() {
         if (_tcpChunks.length > 1) {
@@ -275,11 +422,34 @@ function Socket(options) {
           _tcpLen -= msgLen;
           // HOT PATH: frame is a Buffer — pass directly, no wrapping.
           session.message(frame);
+          // That was a ConnectionBind success (RFC 6062 §4.3): from here on
+          // the connection carries the peer's bytes, not STUN.
+          if (context.detaching) { finishDetach(); return; }
         }
       }
 
-      context.transport.on('error', function(err) { ev.emit('error', err); });
-      context.transport.on('close', function() { ev.emit('close'); });
+      // Hand the transport over as a raw stream: our listeners off, paused,
+      // with the bytes already read past the response put back in front.
+      // This Socket is done with it — close() will not touch it.
+      function finishDetach() {
+        var done = context.detaching;
+        context.detaching = null;
+        var t = context.transport;
+        var rest = _tcpLen > 0 ? compactBuffer().slice(0, _tcpLen) : null;
+        _tcpChunks = []; _tcpLen = 0;
+        t.removeListener('data', onStreamData);
+        t.removeListener('error', onStreamError);
+        t.removeListener('close', onStreamClose);
+        t.pause();
+        if (rest && rest.length) t.unshift(rest);
+        context.transport = null;
+        context.destroyed = true;
+        session.close();
+        done(t);
+      }
+
+      context.transport.on('error', onStreamError);
+      context.transport.on('close', onStreamClose);
     }
   }
 
@@ -373,7 +543,10 @@ function Socket(options) {
 
       context.relaySocket = relaySocket;
       context.relayAddress = address;
-      localRelays.set(relayKey(address), context);
+      context.relayIsTcp = alloc.transport === wire.TRANSPORT.TCP;
+      // In-process hand-over is for UDP datagrams; a TCP relay is reached
+      // through its listener.
+      if (!context.relayIsTcp) localRelays.set(relayKey(address), context);
       addRelayIp(address.ip);
 
       // Counted from here on: 'allocate:expired' is emitted only for an
@@ -384,11 +557,14 @@ function Socket(options) {
   });
 
   session.on('allocate:expired', function(alloc) {
+    // RFC 6062 §5.5: the allocation's data connections go with it.
+    closeTcpRelayConnections();
     if (context.relaySocket) {
       if (localRelays.get(relayKey(context.relayAddress)) === context) localRelays.delete(relayKey(context.relayAddress));
       if (context.relayAddress) removeRelayIp(context.relayAddress.ip);
       try { context.relaySocket.close(); } catch (e) {}
       context.relaySocket = null;
+      context.relayIsTcp = false;
       context.relayAddress = null;
       context.localReplies = null;
     }
@@ -473,6 +649,10 @@ function Socket(options) {
       e440.stunCode = 440;
       return cb(e440);
     }
+
+    // RFC 6062 §5.1: a TCP allocation gets a TCP relayed address, listening.
+    // It used to get a UDP port like any other.
+    if (alloc.transport === wire.TRANSPORT.TCP) return allocateTcpRelay(relay_ip, external_ip, min_port, max_port, cb);
 
     // EVEN-PORT (RFC 5766 §14.6): presence requests an even port; the R bit
     // additionally reserves port+1 (claimed later via RESERVATION-TOKEN).
@@ -582,6 +762,65 @@ function Socket(options) {
 
     tryBind();
     } // end doAllocate
+  }
+
+
+  // A TCP relayed address: a listener on a free port of the range.
+  //
+  // It listens with SO_REUSEPORT, so that the connections opened to peers can
+  // use the same address (connectFromRelay). That option would also let the
+  // listen succeed on a port some other socket with it already holds — a
+  // relay of another server process run by the same user — and then the two
+  // share incoming connections. So each port is first taken with a plain
+  // listen, which fails on any socket already there, and only then reopened
+  // with the option. Inside this process tcpRelayPorts keeps them apart.
+  function allocateTcpRelay(relay_ip, external_ip, min_port, max_port, cb) {
+    var count = max_port >= min_port ? max_port - min_port + 1 : 0;
+    var start = Math.floor(Math.random() * count);
+    var attempts = 0;
+    var max_attempts = Math.min(count, 2000);
+
+    function tryPort() {
+      if (attempts >= max_attempts) return cb(new Error('No available relay port in range'));
+      var port = min_port + ((start + attempts) % count);
+      attempts++;
+      if (tcpRelayPorts.has(port)) return tryPort();
+
+      var probe = net.createServer();
+      probe.once('error', function() { tryPort(); });
+      probe.listen({ host: relay_ip, port: port, exclusive: true }, function() {
+        probe.close(function() { listenOn(port, true); });
+      });
+    }
+
+    function listenOn(port, reusePort) {
+      if (tcpRelayPorts.has(port)) return tryPort();   // taken by one of ours meanwhile
+      var srv = net.createServer({ pauseOnConnect: true, noDelay: true });
+      srv.once('error', function(err) {
+        try { srv.close(); } catch (e) {}
+        // A platform without SO_REUSEPORT: listen without it. Connections to
+        // peers then cannot share the port (see connectFromRelay).
+        if (reusePort && err && (err.code === 'ENOTSUP' || err.code === 'EOPNOTSUPP' || err.code === 'EINVAL' ||
+                                 err.code === 'ERR_INVALID_ARG_VALUE' || err.code === 'ERR_INVALID_ARG_TYPE')) {
+          return listenOn(port, false);
+        }
+        tryPort();
+      });
+      var lopts = { host: relay_ip, port: port, exclusive: true };
+      if (reusePort) lopts.reusePort = true;
+      try { srv.listen(lopts); } catch (e) { if (reusePort) return listenOn(port, false); return tryPort(); }
+      srv.once('listening', function() {
+        srv.removeAllListeners('error');
+        tcpRelayPorts.add(port);
+        srv.on('close', function() { tcpRelayPorts.delete(port); });
+        srv.on('error', function(err) { ev.emit('error', err); });
+        srv.on('connection', onIncomingPeer);
+        srv._relayLocal = { ip: relay_ip, port: port, reusePort: reusePort };
+        cb(null, srv, { ip: external_ip, port: port });
+      });
+    }
+
+    tryPort();
   }
 
 
@@ -696,6 +935,7 @@ function Socket(options) {
   // `cb`, when given, is the send-error callback to reuse (one per channel
   // peer — see the 'data' handler); otherwise one is made for this send.
   function sendFromRelay(peer, out, cb) {
+    if (context.relayIsTcp) return;   // a TCP allocation relays over its data connections
     var target = localRelays.size > 0 ? localRelays.get(peer.ip + ':' + peer.port) : undefined;
     if (target && target !== context && target.relaySocket && !target.destroyed && context.relayAddress) {
       var from = context.relayAddress;
@@ -814,77 +1054,140 @@ function Socket(options) {
 
   /* ====================== Server-side: TCP relay (RFC 6062) ====================== */
 
-  // Session emits 'connect_peer' when client sends CONNECT request
-  session.on('connect_peer', function(connectionId, peer, cb) {
-    if (context.destroyed) { cb(new Error('Socket destroyed')); return; }
+  // Peer data connections of this Socket's allocation (any state).
+  function tcpConnCount() {
+    var n = 0;
+    for (var k in context.tcpPeerConnections) n++;
+    return n;
+  }
 
-    // cb answers the client's Connect request — exactly once. It used to be
-    // reachable three times: on connect, then again from 'error' or from the
-    // 10 s socket timeout, which stayed armed after the connection was up and
-    // killed every established peer connection after 10 s of quiet.
-    var answered = false;
-    function answer(err) {
-      if (answered) return;
-      answered = true;
-      cb(err || null);
+  function tcpMaxConns() {
+    return context.options.maxTcpConnectionsPerAllocation || 8;
+  }
+
+  // A peer data connection of this allocation, registered under a new
+  // CONNECTION-ID. sock is null while an outgoing connection is still being
+  // made (state 'connecting') — it already counts for 446 and the limit.
+  function registerTcpConn(peer, sock, state) {
+    var alloc = session.getAllocation();
+    var entry = {
+      id: newConnectionId(),
+      peer: peer,
+      sock: null,
+      state: state,
+      owner: context,
+      username: alloc ? alloc.username : null,
+      realm: session.context.realm || null,
+      timer: null,
+      dead: false,
+    };
+    tcpRelayConns.set(entry.id, entry);
+    context.tcpPeerConnections[entry.id] = entry;
+    if (sock) attachTcpSock(entry, sock);
+    return entry;
+  }
+
+  function unregisterTcpConn(entry) {
+    entry.dead = true;
+    if (entry.timer) { clearTimeout(entry.timer); entry.timer = null; }
+    if (tcpRelayConns.get(entry.id) === entry) tcpRelayConns.delete(entry.id);
+    if (context.tcpPeerConnections[entry.id] === entry) delete context.tcpPeerConnections[entry.id];
+  }
+
+  // The connection is up: it waits, unread, for its ConnectionBind — 30 s,
+  // then it is closed (RFC 6062 §5.2, §5.3).
+  function attachTcpSock(entry, sock) {
+    entry.sock = sock;
+    entry.state = 'pending';
+    sock.on('error', function() {});   // closes; 'close' below cleans up
+    sock.on('close', function() { unregisterTcpConn(entry); });
+    entry.timer = setTimeout(function() {
+      entry.timer = null;
+      if (entry.state !== 'bound') sock.destroy();
+    }, TCP_BIND_TIMEOUT);
+    if (entry.timer.unref) entry.timer.unref();
+  }
+
+  function closeTcpRelayConnections() {
+    for (var k in context.tcpPeerConnections) {
+      var entry = context.tcpPeerConnections[k];
+      unregisterTcpConn(entry);
+      if (entry.sock) { try { entry.sock.destroy(); } catch (e) {} }
     }
+    context.tcpPeerConnections = {};
+  }
 
-    var conn = net.connect({ host: peer.ip, port: peer.port }, function() {
-      conn.setTimeout(0);                       // connect phase over
-      context.tcpPeerConnections[connectionId] = conn;
-      // RFC 6062 §5.3: the client has 30 s to ConnectionBind it, or it goes.
-      conn._bindTimer = setTimeout(function() {
-        if (!conn._bound) { conn.destroy(); delete context.tcpPeerConnections[connectionId]; }
-      }, 30000);
-      if (conn._bindTimer.unref) conn._bindTimer.unref();
-      answer(null);
-    });
-    // Nagle off: this connection carries a peer's stream, relayed as it
-    // arrives — a small write held for the previous one's ACK is a round
-    // trip added to the relay. The server's client-side sockets have it too.
-    conn.setNoDelay(true);
+  // RFC 6062 §5.3: a peer connected to the relayed address. Accepted paused
+  // (pauseOnConnect) — what it sends waits in the kernel until the client
+  // binds the connection. Closed at once without a permission for the peer.
+  function onIncomingPeer(sock) {
+    sock.on('error', function() {});
+    var peer = { ip: unmapIp(sock.remoteAddress), port: sock.remotePort };
+    if (context.destroyed || !context.relayIsTcp || !session.getAllocation() || !peer.ip || !(peer.port > 0)) {
+      sock.destroy(); return;
+    }
+    if (!session.hasPermission(peer.ip)) { sock.destroy(); return; }
+    // The per-allocation limit (local policy): nothing is sent to the client.
+    if (tcpConnCount() >= tcpMaxConns()) { sock.destroy(); return; }
+    sock.setNoDelay(true);
+    var entry = registerTcpConn(peer, sock, 'pending');
+    try { session.connectionAttempt(peer, entry.id); }
+    catch (e) { unregisterTcpConn(entry); sock.destroy(); ev.emit('error', e); }
+  }
 
-    conn.on('error', function(err) {
-      delete context.tcpPeerConnections[connectionId];
-      answer(err);
-    });
+  // RFC 6062 §5.2 — the Connect checks that need the connections; Session
+  // made the rest. cb(err with stunCode) or cb(null, connectionId).
+  //
+  // It connected with net.connect from any local port — not from the relayed
+  // address, which the peer was told about and may only accept connections
+  // from — and with a 10 s timeout where the RFC asks at least 30.
+  session.on('connect_peer', function(peer, cb) {
+    if (context.destroyed || !context.relayIsTcp || !context.relaySocket) { cb(stunError(447)); return; }
 
-    conn.on('close', function() {
-      if (conn._bindTimer) clearTimeout(conn._bindTimer);
-      delete context.tcpPeerConnections[connectionId];
-      // Free the slot in the session too, or maxTcpConnectionsPerAllocation
-      // would count connections long gone.
-      if (session.context && session.context.tcpConnections) delete session.context.tcpConnections[connectionId];
-      answer(new Error('Connection closed'));
-    });
+    // One connection per peer address, connecting, pending or bound.
+    for (var k in context.tcpPeerConnections) {
+      var e = context.tcpPeerConnections[k];
+      if (e.peer.ip === peer.ip && e.peer.port === peer.port) { cb(stunError(446)); return; }
+    }
+    if (tcpConnCount() >= tcpMaxConns()) { cb(stunError(403)); return; }
+    // Nor into this server's own listeners or relay ports (Server isSelfService).
+    if (context.options.isSelfService && context.options.isSelfService(peer.ip, peer.port)) { cb(stunError(403)); return; }
 
-    // Timeout for the connection attempt only (cleared on connect above)
-    conn.setTimeout(10000, function() {
-      conn.destroy();
-      delete context.tcpPeerConnections[connectionId];
-      answer(new Error('Connection timeout'));
+    var entry = registerTcpConn(peer, null, 'connecting');
+    connectFromRelay(context.relaySocket._relayLocal, peer, TCP_CONNECT_TIMEOUT, function(err, sock) {
+      if (entry.dead || context.destroyed) {   // the allocation went meanwhile
+        if (sock) sock.destroy();
+        return;
+      }
+      if (err) {
+        unregisterTcpConn(entry);
+        cb(stunError(447, err.message));
+        return;
+      }
+      attachTcpSock(entry, sock);
+      cb(null, entry.id);
     });
   });
 
-  // Session emits 'connection_bind' when client sends CONNECTION-BIND
-  session.on('connection_bind', function(connectionId, peer, cb) {
-    var conn = context.tcpPeerConnections[connectionId];
-    if (!conn) { cb(new Error('No connection for ID')); return; }
-    if (conn._bound) { cb(new Error('Connection already bound')); return; }
-    conn._bound = true;
-    if (conn._bindTimer) { clearTimeout(conn._bindTimer); conn._bindTimer = null; }
+  // RFC 6062 §5.4, on the Socket of the NEW connection the ConnectionBind
+  // came on. The id is looked up process-wide. On success the Server (the
+  // 'dataConnection' listener) turns this connection into a raw pipe to the
+  // peer; without one there is nothing to pipe through, and it is refused.
+  session.on('connection_bind', function(connectionId, info, cb) {
+    var entry = tcpRelayConns.get(connectionId);
+    if (!entry || entry.state !== 'pending' || !entry.sock || entry.owner.destroyed) { cb(stunError(400)); return; }
+    // RFC 6062 §4.3: the same credentials as the control connection
+    // (RFC 8656 441 Wrong Credentials).
+    if ((info.username || null) !== (entry.username || null) || (info.realm || null) !== (entry.realm || null)) {
+      cb(stunError(441)); return;
+    }
+    if (ev.listenerCount('dataConnection') === 0) { cb(stunError(400)); return; }
 
-    // Data from peer → send to client. `data` is already a Buffer.
-    conn.on('data', function(data) {
-      if (context.destroyed) return;
-      session.sendData(peer, data);
+    entry.state = 'bound';
+    if (entry.timer) { clearTimeout(entry.timer); entry.timer = null; }
+    cb(null, function() {
+      ev.emit('dataConnection', entry.sock, entry.peer);
     });
-
-    conn.on('close', function() {
-      delete context.tcpPeerConnections[connectionId];
-    });
-
-    cb(null);
   });
 
 
@@ -1067,7 +1370,7 @@ function Socket(options) {
   session.on('error_response', function(msg, err) { ev.emit('error_response', msg, err); });
 
   // Forward specific method events
-  var method_names = ['binding', 'allocate', 'refresh', 'create_permission', 'channel_bind'];
+  var method_names = ['binding', 'allocate', 'refresh', 'create_permission', 'channel_bind', 'connect', 'connection_bind'];
   for (var mn = 0; mn < method_names.length; mn++) {
     (function(name) {
       session.on(name + ':success', function(msg) { ev.emit(name + ':success', msg); });
@@ -1082,6 +1385,13 @@ function Socket(options) {
     }
   });
 
+  // Client-side: RFC 6062 §4.4 — a peer connected to our TCP relayed address.
+  // Accept it with acceptConnection(connectionId, cb); left alone, the server
+  // closes it after 30 s.
+  session.on('connection_attempt', function(peer, connectionId) {
+    if (!context.isServer) ev.emit('connectionAttempt', peer, connectionId);
+  });
+
   // Client-side: forward ICMP error notifications from the server
   // (RFC 8656 §11.5 — Data indication with XOR-PEER-ADDRESS + ICMP).
   session.on('icmp', function(peer, icmp) {
@@ -1089,6 +1399,116 @@ function Socket(options) {
       ev.emit('icmp', peer, icmp);
     }
   });
+
+
+  /* ====================== Client-side: TCP relay (RFC 6062) ====================== */
+
+  // Peers whose Connect failed with 447, and when: the client MUST wait at
+  // least 10 s before trying the same peer again (§4.3). And peers with a
+  // Connect in flight — two for the same peer MUST NOT be outstanding.
+  var _connectFailedAt = {};
+  var _connectInFlight = {};
+  var CONNECT_RETRY_WAIT = 10000;
+
+  function peerKeyOf(p) { return p.ip + ':' + p.port; }
+
+  // §4.3: Connect on the control connection; with its CONNECTION-ID, a new
+  // connection to the server binds it (openDataConnection).
+  function connectPeer(peer, cb) {
+    cb = cb || function() {};
+    if (context.isServer) return cb(new Error('connectPeer is client-side'));
+    var p = typeof peer === 'string' ? { ip: peer, port: 0 } : peer;
+    var key = peerKeyOf(p);
+    if (_connectInFlight[key]) return cb(stunError(446, 'a Connect to this peer is in progress'));
+    var failed = _connectFailedAt[key];
+    if (failed && Date.now() - failed < CONNECT_RETRY_WAIT) {
+      return cb(stunError(447, 'Connect to this peer failed less than 10 s ago (RFC 6062 §4.3)'));
+    }
+
+    var tid = null;
+    _connectInFlight[key] = true;
+    function cleanup() {
+      delete _connectInFlight[key];
+      session.off('connect:success', onOk);
+      session.off('connect:error', onErr);
+      session.off('timeout', onTimeout);
+    }
+    function mine(msg) { return tid && msg && msg.transactionId && Buffer.compare(Buffer.from(msg.transactionId), Buffer.from(tid)) === 0; }
+    function onOk(msg) {
+      if (!mine(msg)) return;
+      cleanup();
+      var id = msg.getAttribute(wire.ATTR.CONNECTION_ID);
+      if (id === null) return cb(new Error('Connect success without CONNECTION-ID'));
+      openDataConnection(id, function(err, stream, info) {
+        if (err) return cb(err);
+        cb(null, stream, { connectionId: id, peer: p });
+      });
+    }
+    function onErr(msg, err) {
+      if (!mine(msg)) return;
+      cleanup();
+      var code = err && err.code;
+      if (code === 447) _connectFailedAt[key] = Date.now();
+      cb(stunError(code || 500, 'Connect failed: ' + (code || '?') + (err && err.reason ? ' ' + err.reason : '')));
+    }
+    function onTimeout() { cleanup(); cb(new Error('Connect timed out')); }
+    session.on('connect:success', onOk);
+    session.on('connect:error', onErr);
+    session.on('timeout', onTimeout);
+    session.connect(p, function(e, t) { tid = t; });
+  }
+
+  // §4.3/§4.4: a new connection to the same server address, from another
+  // local port, authenticated with the same credentials, carrying only a
+  // ConnectionBind. On its success the connection is the data connection.
+  function openDataConnection(connectionId, cb) {
+    cb = cb || function() {};
+    if (context.isServer) return cb(new Error('acceptConnection is client-side'));
+    if (context.transportType !== 'tcp' && context.transportType !== 'tls') {
+      return cb(new Error('RFC 6062 data connections need a TCP or TLS transport'));
+    }
+    var dopts = {};
+    for (var k in options) dopts[k] = options[k];
+    dopts.transport = null; dopts.session = null; dopts.send = null;
+    dopts.server = context.serverHost; dopts.port = context.serverPort;
+    dopts.transportType = context.transportType;
+    // The credentials as the control connection uses them now (a realm or
+    // password set later with set_context included).
+    var sc = session.context;
+    if (sc.username) dopts.username = sc.username;
+    if (sc.password) dopts.password = sc.password;
+    if (sc.authMech) dopts.authMech = sc.authMech;
+
+    var d = new Socket(dopts);
+    var ds = d.getSession();
+    // The first ConnectionBind goes out authenticated, with the realm and
+    // nonce the control connection holds — as coturn's own client does.
+    // Unauthenticated, it drew a 401 from coturn, which then closes the
+    // connection (a data connection gets one try): our retry never ran.
+    // A server that wants a fresh nonce answers 438, and the session retries.
+    if (sc.realm) ds.context.realm = sc.realm;
+    if (sc.nonce) ds.context.nonce = sc.nonce;
+    if (sc.passwordAlgorithm) ds.context.passwordAlgorithm = sc.passwordAlgorithm;
+    var settled = false;
+    function fin(err, stream) {
+      if (settled) return;
+      settled = true;
+      if (err) { try { d.close(); } catch (e) {} return cb(err); }
+      cb(null, stream, { connectionId: connectionId });
+    }
+    d.on('error', function(err) { fin(err); });
+    d.on('close', function() { fin(new Error('data connection closed before ConnectionBind succeeded')); });
+    ds.on('connection_bind:success', function() {
+      // Detached right after this event, inside the frame loop (finishDetach).
+      d._detach(function(stream) { fin(null, stream); });
+    });
+    ds.on('connection_bind:error', function(msg, err) {
+      var code = err && err.code;
+      fin(stunError(code || 500, 'ConnectionBind failed: ' + (code || '?') + (err && err.reason ? ' ' + err.reason : '')));
+    });
+    ds.on('timeout', function() { fin(new Error('ConnectionBind timed out')); });
+    d.connect(function() { ds.connectionBind(connectionId); });
+  }
 
 
   /* ====================== close / destroy ====================== */
@@ -1104,6 +1524,7 @@ function Socket(options) {
       if (context.relayAddress) removeRelayIp(context.relayAddress.ip);
       try { context.relaySocket.close(); } catch (e) {}
       context.relaySocket = null;
+      context.relayIsTcp = false;
       context.relayAddress = null;
       context.localReplies = null;
     }
@@ -1122,12 +1543,9 @@ function Socket(options) {
       }
     }
 
-    // Close TCP relay peer connections
-    var ckeys = Object.keys(context.tcpPeerConnections);
-    for (var j = 0; j < ckeys.length; j++) {
-      try { context.tcpPeerConnections[ckeys[j]].destroy(); } catch (e) {}
-    }
-    context.tcpPeerConnections = {};
+    // Close TCP relay peer connections (RFC 6062 §5.5 — closing them closes
+    // their client data connections too, see Server).
+    closeTcpRelayConnections();
 
     if (!context.isServer && context.transport) {
       if (context.transportType === 'udp') {
@@ -1159,6 +1577,10 @@ function Socket(options) {
 
     /** Connect to TURN server (client-side) */
     connect: connect,
+
+    // Internal (openDataConnection): hand the TCP/TLS transport over as a raw
+    // stream once the response being processed has been taken.
+    _detach: function(fn) { context.detaching = fn; },
 
     /** Get the internal Session */
     getSession: function() { return session; },
@@ -1192,9 +1614,17 @@ function Socket(options) {
     /** Send data to a peer via ChannelData (must have channel binding) */
     sendChannel: function(channel, data) { session.sendChannelData(channel, data); },
 
-    // RFC 6062 — TCP relay (client-side)
-    connectPeer: function(peer, cb) { session.connect(peer, cb); },
-    connectionBind: function(connectionId, cb) { session.connectionBind(connectionId, cb); },
+    // RFC 6062 — TCP relay (client-side). Both answer cb(err) or
+    // cb(null, stream, info): stream is a duplex byte stream to the peer
+    // (a net.Socket, or the TLS socket over TLS), handed over paused — read
+    // it with on('data') + resume(), or pipe() it.
+    //
+    // They used to send the bare requests: Connect and ConnectionBind on the
+    // control connection, the second refused by any server following the RFC
+    // (and the data was expected as Data indications, which never come).
+    connectPeer: connectPeer,
+    acceptConnection: openDataConnection,
+    connectionBind: openDataConnection,
   };
 
   for (var k in api) {

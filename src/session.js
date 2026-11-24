@@ -103,6 +103,9 @@ function Session(options) {
     // fn(ip) → true when ip is an address this server's own relays are
     // announced on (Socket layer). See is_blocked_peer.
     isOwnRelayIp: typeof options.isOwnRelayIp === 'function' ? options.isOwnRelayIp : null,
+    // fn(ip) → true when the relay will never send to any port of ip (the
+    // server's own addresses, Server isSelfServiceIp).
+    isSelfServiceIp: typeof options.isSelfServiceIp === 'function' ? options.isSelfServiceIp : null,
     allowedPeers: options.allowedPeers || null,     // CIDR list, wins over everything but reserved
     deniedPeers: options.deniedPeers || null,       // CIDR list
     // RFC 6062 TCP relay. Off by default: browsers never ask for it, and an
@@ -125,10 +128,6 @@ function Session(options) {
 
     // allocation state (one per session / 5-tuple)
     allocation: null,
-
-    // TCP relay connections (RFC 6062)
-    tcpConnections: {},
-    nextConnectionId: 1,
 
     lastTransactionId: null,
     lastResponse: null,
@@ -226,16 +225,33 @@ function Session(options) {
     return (Date.now() - context.nonceCreatedAt) > context.nonceExpiry / 2;
   }
 
-  function validate_nonce(nonce) {
+  function validate_nonce(nonce, scope) {
     if (!nonce || nonce.indexOf(':') < 0) return false;
     var parts = nonce.split(':');
     var timestamp = parts[0];
     var mac = parts[1];
-    var expected_mac = nonce_mac(_nonceKey, timestamp, _nonce_scope());
+    var expected_mac = nonce_mac(_nonceKey, timestamp, scope != null ? scope : _nonce_scope());
     if (typeof mac !== 'string' || mac.length !== expected_mac.length ||
         !equal_sync(Buffer.from(mac), Buffer.from(expected_mac))) return false;
     var nonce_time = parseInt(timestamp, 16) * 1000;
     return (Date.now() - nonce_time) <= context.nonceExpiry;
+  }
+
+  // RFC 6062 §4.3: a ConnectionBind comes on a new connection, authenticated
+  // "with the same method and credentials as for the control connection".
+  // Clients send the nonce they hold — the control connection's (coturn's
+  // turnutils_uclient, pion) — and coturn checks the request against the
+  // control connection's session. Our nonces are bound to the connection they
+  // were issued on, so it got 438, which uclient does not recover from.
+  // Accepted here: the nonce of the allocation that owns the connection id
+  // (options.connectionNonceScope, from the Socket layer). The credentials
+  // are checked as always, and 441 if they are not the allocation's.
+  function valid_control_nonce(msg, nonce) {
+    if (msg.method !== wire.METHOD.CONNECTION_BIND || typeof options.connectionNonceScope !== 'function') return false;
+    var id = msg.getAttribute(wire.ATTR.CONNECTION_ID);
+    if (id === null) return false;
+    var scope = options.connectionNonceScope(id);
+    return scope != null && validate_nonce(nonce, scope);
   }
 
   // Normalize the 'authenticate' hook callback so BOTH styles work, called
@@ -517,14 +533,18 @@ function Session(options) {
   // bytes, so ::ffff:127.0.0.1, ::ffff:7f00:1 and 127.1 spelled any other way
   // are all loopback (CVE-2020-26262, and its IPv4-mapped bypass).
   function is_blocked_peer(ip) {
-    if (!peerPolicy.isBlocked(ip)) return false;
     // A relay of this same server is never "another network": two browsers
     // relaying through us reach each other at our announced relay address.
     // When that address is one the policy blocks — a LAN address before the
     // public one was known, a router WAN inside CGNAT 100.64/10 — every
     // relay-to-relay CreatePermission got 403. The Socket layer delivers
     // such traffic to our own relays only, in memory (see socket.js).
-    return !(context.isOwnRelayIp && context.isOwnRelayIp(ip));
+    if (context.isOwnRelayIp && context.isOwnRelayIp(ip)) return false;
+    if (peerPolicy.isBlocked(ip)) return true;
+    // The server's own addresses: the Socket layer drops every send to them,
+    // so a permission must be refused (403), not granted and then silently
+    // black-holed as it was.
+    return !!(context.isSelfServiceIp && context.isSelfServiceIp(ip));
   }
 
   // The policy alone, without the own-relay exemption.
@@ -736,17 +756,12 @@ function Session(options) {
       context.useFingerprint = msg.fingerprint_offset !== null;
     }
 
-    // RFC 5389 §7.3.1 — unknown comprehension-required attrs → 420
-    if (msg.cls === wire.CLASS.REQUEST) {
-      var unknown = check_unknown_comprehension(msg);
-      if (unknown.length > 0) {
-        send_error(msg, 420, [
-          { type: wire.ATTR.ERROR_CODE, value: { code: 420 } },
-          { type: wire.ATTR.UNKNOWN_ATTRIBUTES, value: unknown },
-        ], null);
-        return;
-      }
-    }
+    // Unknown comprehension-required attributes in a REQUEST are answered
+    // with 420 only after authentication (reject_unknown, called from the
+    // binding path and route_server_request): RFC 8489 §6.3 / RFC 5389 §7.3
+    // put the authentication checks first. Answering 420 here, before them,
+    // let an unauthenticated client probe which attributes the server knows,
+    // and answered 420 where coturn (and the RFC) answer 401.
 
     // RFC 5389 §7.3.2 — indications with unknown comprehension-required → silent discard
     if (msg.cls === wire.CLASS.INDICATION) {
@@ -775,7 +790,7 @@ function Session(options) {
     if (msg.method === wire.METHOD.BINDING && msg.cls === wire.CLASS.REQUEST) {
       if (context.secureStun && context.authMech !== 'none') {
         authenticate_and_handle(msg, raw);
-      } else {
+      } else if (!reject_unknown(msg, null)) {
         handle_binding(msg);
       }
       return;
@@ -929,7 +944,7 @@ function Session(options) {
       return;
     }
 
-    if (!validate_nonce(msg_nonce)) {
+    if (!validate_nonce(msg_nonce) && !valid_control_nonce(msg, msg_nonce)) {
       send_stale_nonce(msg);
       return;
     }
@@ -991,7 +1006,20 @@ function Session(options) {
     });
   }
 
+  // 420 for a request carrying unknown comprehension-required attributes
+  // (RFC 8489 §6.3.1.1). True when it answered.
+  function reject_unknown(msg, key) {
+    var unknown = check_unknown_comprehension(msg);
+    if (unknown.length === 0) return false;
+    send_error(msg, 420, [
+      { type: wire.ATTR.ERROR_CODE, value: { code: 420 } },
+      { type: wire.ATTR.UNKNOWN_ATTRIBUTES, value: unknown },
+    ], key);
+    return true;
+  }
+
   function route_server_request(msg, key) {
+    if (reject_unknown(msg, key)) return;
     // Hook: authorize — called after auth, before executing any method
     var username = msg.getAttribute(wire.ATTR.USERNAME);
     check_hook('authorize', {
@@ -1098,9 +1126,23 @@ function Session(options) {
       send_error(msg, 442, null, key); return;   // Unsupported Transport Protocol
     }
 
-    // RESERVATION-TOKEN and EVEN-PORT together is invalid
     var reservation_token = msg.getAttribute(wire.ATTR.RESERVATION_TOKEN);
     var even_port = msg.getAttribute(wire.ATTR.EVEN_PORT);
+
+    // RFC 6062 §5.1. A TCP allocation used to be accepted over any transport
+    // (UDP, DTLS, WebSocket) and with any attribute — and got a UDP relay
+    // port. Now: the control connection must be TCP or TLS (2), and
+    // DONT-FRAGMENT, EVEN-PORT and RESERVATION-TOKEN are 400 with TCP (3) —
+    // checked before the DONT-FRAGMENT 420 below, which is for UDP.
+    if (transport === wire.TRANSPORT.TCP) {
+      if (!is_stream_transport()) { send_error(msg, 400, null, key); return; }
+      if (reservation_token !== null || even_port !== null ||
+          msg.getAttribute(wire.ATTR.DONT_FRAGMENT) !== null) {
+        send_error(msg, 400, null, key); return;
+      }
+    }
+
+    // RESERVATION-TOKEN and EVEN-PORT together is invalid
     if (reservation_token !== null && even_port !== null) {
       send_error(msg, 400, null, key);
       return;
@@ -1353,6 +1395,9 @@ function Session(options) {
     var peer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
 
     if (channel_number === null || peer === null) { send_error(msg, 400, null, key); return; }
+    // A TCP allocation (RFC 6062) relays over data connections; it has no
+    // UDP relay to carry ChannelData from.
+    if (context.allocation.transport === wire.TRANSPORT.TCP) { send_error(msg, 400, null, key); return; }
     if (peer.family !== relay_family()) { send_error(msg, 443, null, key); return; }   // RFC 8656 §11.2
     // RFC 8656 §12 narrowed the usable channel range to 0x4000–0x4FFF (RFC 5766
     // allowed up to 0x7FFF); 0x5000–0xFFFF is reserved for RFC 7983 demux.
@@ -1384,6 +1429,8 @@ function Session(options) {
 
   function handle_send_indication(msg) {
     if (context.allocation === null) return;
+    // Nor Send indications on a TCP allocation (see handle_channel_bind).
+    if (context.allocation.transport === wire.TRANSPORT.TCP) return;
     var peer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
     var data = msg.getAttribute(wire.ATTR.DATA);
     if (peer === null || data === null) return;
@@ -1406,37 +1453,40 @@ function Session(options) {
 
   /* ====================== TCP relay — RFC 6062 ====================== */
 
+  // The client reached us over TCP or TLS (RFC 6062 §5.1, §5.4). A stream
+  // handed in through handleTcpConnection / handleSecureConnection counts;
+  // WebSocket does not — its messages are framed, never a raw byte stream.
+  function is_stream_transport() {
+    return context.transportType === 'tcp' || context.transportType === 'tls';
+  }
+
+  // RFC 6062 §5.2. The checks that need nothing but this session are made
+  // here; the Socket layer owns the connections, so it answers 446 (one
+  // connection per peer, pending or active), 403 for its per-allocation
+  // limit, and 447 when the connection fails or times out.
+  //
+  // What it did before: it required a permission for the peer (403 without
+  // one) — the RFC requires none for Connect, only for an incoming
+  // connection (§5.3); it answered the per-allocation limit with 508, where
+  // a local-policy refusal is 403; and after the success it also sent a
+  // ConnectionAttempt indication, which is only for incoming connections —
+  // a client following the RFC would open a second data connection for it.
   function handle_connect(msg, key) {
-    // Must have allocation with TCP transport
     if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
-    // RFC 6062 §5.2: Connect is only for a TCP allocation.
-    if (!context.allowTcpRelay || context.allocation.transport !== wire.TRANSPORT.TCP) {
+    // Connect is only for a TCP allocation.
+    if (context.allocation.transport !== wire.TRANSPORT.TCP) {
       send_error(msg, 400, null, key); return;
     }
 
     var peer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
-    if (peer === null) { send_error(msg, 400, null, key); return; }
+    if (peer === null || !(peer.port > 0)) { send_error(msg, 400, null, key); return; }
+    if (peer.family !== relay_family()) { send_error(msg, 443, null, key); return; }
 
-    if (is_blocked_peer(peer.ip)) { send_error(msg, 403, null, key); return; }
-
-    // Must have permission for this peer
-    if (!has_permission(peer.ip)) {
+    if (is_blocked_peer(peer.ip)) {
+      ev.emit('peer:blocked', { peer: peer, source: context.source, method: 'Connect' });
       send_error(msg, 403, null, key);
       return;
-    }
-
-    // Check if connection to this peer already exists
-    var conn_keys = Object.keys(context.tcpConnections);
-    if (conn_keys.length >= context.maxTcpConnectionsPerAllocation) {
-      send_error(msg, 508, null, key); return;   // Insufficient Capacity
-    }
-    for (var i = 0; i < conn_keys.length; i++) {
-      var existing = context.tcpConnections[conn_keys[i]];
-      if (existing.peer.ip === peer.ip && existing.peer.port === peer.port) {
-        send_error(msg, 446, null, key); // Connection Already Exists
-        return;
-      }
     }
 
     // Hook: beforeConnect
@@ -1450,54 +1500,50 @@ function Session(options) {
       // The allocation can expire while an async hook is pending.
       if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
-      // Assign connection ID
-      var connectionId = context.nextConnectionId++;
-
-      context.tcpConnections[connectionId] = {
-        peer: peer,
-        state: 'pending',
-      };
-
-      // Emit 'connect_peer' — Socket layer opens the actual TCP connection
-      ev.emit('connect_peer', connectionId, peer, function(err) {
-        if (err) {
-          delete context.tcpConnections[connectionId];
-          send_error(msg, 447, null, key); // Connection Timeout or Failure
-          return;
-        }
-
-        context.tcpConnections[connectionId].state = 'established';
-
+      // The Socket layer opens the connection from the relayed address:
+      // cb(err) with err.stunCode, or cb(null, connectionId). No Socket layer
+      // (a bare Session): nothing can connect.
+      if (ev.listenerCount('connect_peer') === 0) { send_error(msg, 447, null, key); return; }
+      var alloc = context.allocation;
+      ev.emit('connect_peer', peer, function(err, connectionId) {
+        if (context.allocation !== alloc) return;   // gone meanwhile; the Socket closed the connection
+        if (err) { send_error(msg, err.stunCode || 447, null, key); return; }
         send_success(msg, [
           { type: wire.ATTR.CONNECTION_ID, value: connectionId },
         ], key);
-
-        // Send ConnectionAttempt indication to client
-        send_indication(wire.METHOD.CONNECTION_ATTEMPT, [
-          { type: wire.ATTR.XOR_PEER_ADDRESS, value: peer },
-          { type: wire.ATTR.CONNECTION_ID, value: connectionId },
-        ]);
       });
     });
   }
 
+  // RFC 6062 §5.4. Arrives on a NEW connection, never the control one: this
+  // session is the would-be client data connection, and the connection id
+  // belongs to some other session's allocation. It used to be looked up in
+  // this session's own table — empty on a new connection, so every
+  // ConnectionBind sent as the RFC says got 400.
   function handle_connection_bind(msg, key) {
+    if (!is_stream_transport()) { send_error(msg, 400, null, key); return; }
+
     var connectionId = msg.getAttribute(wire.ATTR.CONNECTION_ID);
     if (connectionId === null) { send_error(msg, 400, null, key); return; }
 
-    var conn = context.tcpConnections[connectionId];
-    if (!conn || conn.state !== 'established') {
-      send_error(msg, 400, null, key);
-      return;
-    }
+    // A control connection cannot also become a data connection: its
+    // allocation would lose the connection its Refresh must come on.
+    if (context.allocation !== null) { send_error(msg, 400, null, key); return; }
 
-    // Emit 'connection_bind' — Socket layer binds this TCP stream to the peer connection
-    ev.emit('connection_bind', connectionId, conn.peer, function(err) {
-      if (err) {
-        send_error(msg, 400, null, key);
-        return;
-      }
+    if (ev.listenerCount('connection_bind') === 0) { send_error(msg, 400, null, key); return; }
+    // cb(err) with err.stunCode — 400 for an id that is not a pending
+    // connection, 441 for credentials other than the allocation's — or
+    // cb(null, done): the success is sent, then done() makes this connection
+    // a raw pipe; it must come after the response, which is the last STUN
+    // message on this connection.
+    ev.emit('connection_bind', connectionId, {
+      username: msg.getAttribute(wire.ATTR.USERNAME),
+      realm: context.realm,
+      source: context.source,
+    }, function(err, done) {
+      if (err) { send_error(msg, err.stunCode || 400, null, key); return; }
       send_success(msg, [], key);
+      if (done) done();
     });
   }
 
@@ -1540,8 +1586,12 @@ function Session(options) {
   var _pendingTransactionId = null; // 12-byte Uint8Array
 
   function process_client_message(msg) {
-    // RFC 8489 §6.3.3: client MUST verify transactionId matches pending request
-    if (_pendingTransactionId !== null && msg.transactionId) {
+    // RFC 8489 §6.3.3: client MUST verify transactionId matches pending request.
+    // Responses only: an indication (a Data indication, a ConnectionAttempt)
+    // has a transaction id of its own, and was dropped whenever it came in
+    // while a request was outstanding — a Refresh in flight lost relayed data.
+    if (_pendingTransactionId !== null && msg.transactionId &&
+        (msg.cls === wire.CLASS.SUCCESS || msg.cls === wire.CLASS.ERROR)) {
       var match = true;
       for (var ti = 0; ti < 12; ti++) {
         if (msg.transactionId[ti] !== _pendingTransactionId[ti]) { match = false; break; }
@@ -1614,6 +1664,14 @@ function Session(options) {
       stop_retransmission();
       ev.emit('error_response', msg, err);
       ev.emit((wire.METHOD_NAME[msg.method] || 'unknown') + ':error', msg, err);
+      return;
+    }
+
+    // RFC 6062 §4.4: a peer connected to our TCP relayed address.
+    if (msg.method === wire.METHOD.CONNECTION_ATTEMPT && msg.cls === wire.CLASS.INDICATION) {
+      var cpeer = msg.getAttribute(wire.ATTR.XOR_PEER_ADDRESS);
+      var cid = msg.getAttribute(wire.ATTR.CONNECTION_ID);
+      if (cpeer && cid !== null) ev.emit('connection_attempt', cpeer, cid);
       return;
     }
 
@@ -2025,6 +2083,14 @@ function Session(options) {
 
     /** Send 300 Try Alternate to redirect client */
     redirect: function(msg, alternateServer) { send_redirect(msg, alternateServer); },
+
+    /** RFC 6062 §5.3: tell the client a peer connected to its TCP relay */
+    connectionAttempt: function(peer, connectionId) {
+      send_indication(wire.METHOD.CONNECTION_ATTEMPT, [
+        { type: wire.ATTR.XOR_PEER_ADDRESS, value: peer },
+        { type: wire.ATTR.CONNECTION_ID, value: connectionId },
+      ]);
+    },
 
     /** Check if a peer IP is blocked by security policy */
     isBlockedPeer: function(ip) { return is_blocked_peer(ip); },

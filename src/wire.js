@@ -713,10 +713,24 @@ attrs[ATTR.PASSWORD_ALGORITHMS] = {
 // NFKC normalization only. Control characters are NOT rejected here — the
 // normalized string is passed through unchanged, and credentials containing
 // them will simply fail integrity validation against a compliant peer.
+// SASLprep (RFC 4013), the preparation RFC 5389 §15.4 applies to the
+// username, realm and password of a long-term key. It was only NFKC: the two
+// mapping steps that come before it were missing, so a password with a soft
+// hyphen or a no-break space gave a different key than coturn's or any other
+// implementation's (RFC 5769 §2.4's own vector failed), and the credential
+// never authenticated. The steps, in RFC 4013 §2 order:
+//   1. B.1 "commonly mapped to nothing" (soft hyphen, zero-width joiners,
+//      variation selectors, BOM …) → removed;
+//   2. C.1.2 non-ASCII spaces → U+0020;
+//   3. NFKC.
+// Prohibited-output and bidi checks (§2.3–2.4) are not applied: refusing a
+// credential the operator configured would turn a key mismatch into a
+// server that cannot authenticate anyone with it.
+var SASL_MAP_TO_NOTHING = /[\u00AD\u034F\u1806\u180B-\u180D\u200B-\u200D\u2060\uFE00-\uFE0F\uFEFF]/g;
+var SASL_NON_ASCII_SPACE = /[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g;
 function saslprep(str) {
   if (typeof str !== 'string') return str;
-  // NFKC normalization (Node.js supports this natively)
-  return str.normalize('NFKC');
+  return str.replace(SASL_MAP_TO_NOTHING, '').replace(SASL_NON_ASCII_SPACE, ' ').normalize('NFKC');
 }
 
 function compute_long_term_key(username, realm, password) {

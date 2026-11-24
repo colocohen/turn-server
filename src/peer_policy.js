@@ -241,4 +241,18 @@ function createPeerPolicy(options) {
   return { isBlocked: isBlocked, classify: classify };
 }
 
-export { createPeerPolicy, compile_ranges as compilePeerRanges };
+/**
+ * Did the administrator name this peer explicitly? True for an address in
+ * allowedPeers, and for a loopback address under allowLoopback. The server's
+ * own-address rule (Server isSelfService) yields to these: they are a decision
+ * about exactly this address, where the own-address rule is a default.
+ */
+function isExplicitlyAllowed(ip, options, compiledAllowed) {
+  var p = parse(ip);
+  if (!p) return false;
+  if (compiledAllowed && in_ranges(p, compiledAllowed)) return true;
+  var cls = p.v === 4 ? class_v4(p.b) : class_v6(p.b);
+  return cls === 'loopback' && !!options.allowLoopback;
+}
+
+export { createPeerPolicy, compile_ranges as compilePeerRanges, isExplicitlyAllowed };

@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events';
 import Socket from './socket.js';
 import { makeNonce } from './session.js';
 import * as wire from './wire.js';
-import { compilePeerRanges } from './peer_policy.js';
+import { compilePeerRanges, isExplicitlyAllowed } from './peer_policy.js';
 
 
 // Resolve createDTLSServer: an injected implementation if one was passed,
@@ -328,13 +328,49 @@ function Server(options) {
     }
     return _ifaceIps;
   }
+  function isOwnAddress(ip) {
+    return ip === context.externalIp || (context.relayIp && ip === context.relayIp) || !!own_ips()[ip];
+  }
+
+  // allowedPeers compiled once per configuration (it can change live).
+  var _explicitRanges = null, _explicitFrom;
+  function explicitlyAllowed(ip) {
+    if (_explicitFrom !== context.allowedPeers) {
+      _explicitFrom = context.allowedPeers;
+      _explicitRanges = context.allowedPeers ? compilePeerRanges(context.allowedPeers) : null;
+    }
+    return isExplicitlyAllowed(ip, context, _explicitRanges);
+  }
+
+  function isListenerPort(port) {
+    for (var i = 0; i < context.listeners.length; i++) {
+      try {
+        var a = context.listeners[i].socket.address();
+        if (a && a.port === port) return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+
   function isSelfService(ip, port) {
-    if (!ip) return false;
+    if (!ip || !isOwnAddress(ip)) return false;
+    // A peer the administrator allowed by name (allowedPeers, or loopback
+    // under allowLoopback) is reachable, except for this server's own
+    // listeners. Before, every address of this machine was refused here,
+    // loopback included, so allowLoopback could never take effect: the
+    // policy let 127.0.0.1 through and this rule silently dropped it.
+    if (explicitlyAllowed(ip)) return isListenerPort(port);
     // Any port: behind a home router the announced address is the router,
     // and whatever else it forwards (SSH, HTTP, a NAS) would be one relay away
     // and reached from inside. Peers that share this machine's address are
     // reached by their host or private candidates, not through our relay.
-    return ip === context.externalIp || (context.relayIp && ip === context.relayIp) || !!own_ips()[ip];
+    return true;
+  }
+
+  // The same rule for an address alone (a permission names no port): true
+  // when no port of it may be reached.
+  function isSelfServiceIp(ip) {
+    return !!ip && isOwnAddress(ip) && !explicitlyAllowed(ip);
   }
 
   // The relay settings as they are now — read by each client Socket at every
@@ -379,6 +415,7 @@ function Server(options) {
       relayConfig: relayConfig,
       nonceKey: context.nonceKey,
       isSelfService: isSelfService,
+      isSelfServiceIp: isSelfServiceIp,
       // Read at each send, so setConfiguration reaches allocations already open.
       relayLocal: relayLocal,
       relayCallback: context.relayCallback,
@@ -609,6 +646,17 @@ function Server(options) {
   // The same for a stream connection (TCP, TLS, WebSocket): closed after
   // unallocatedTimeout of quiet with no allocation. It had no timeout at all —
   // a connection that never sent a byte held its slot forever.
+  // Close one side of an RFC 6062 data connection pair. After an error at
+  // once; otherwise end() — what is queued is written, then FIN — with a
+  // deadline for a far end that never closes its side.
+  function close_stream(sock, now) {
+    if (!sock || sock.destroyed) return;
+    if (now) { try { sock.destroy(); } catch (e) {} return; }
+    try { sock.end(); } catch (e) {}
+    var t = setTimeout(function() { try { sock.destroy(); } catch (e) {} }, 5000);
+    if (t.unref) t.unref();
+  }
+
   function setup_stream_idle(conn, client) {
     var limit = context.unallocatedTimeout || context.idleTimeout;
     if (!limit) return function() {};
@@ -616,7 +664,7 @@ function Server(options) {
     var timer = null;
     function check() {
       timer = null;
-      if (conn.destroyed) return;
+      if (conn.destroyed || conn._turnDataConnection) return;
       var quiet = Date.now() - last;
       if (has_allocation(client) || quiet < limit) {
         timer = setTimeout(check, has_allocation(client) ? limit : limit - quiet);
@@ -1094,8 +1142,38 @@ function Server(options) {
 
     var touch = setup_stream_idle(conn, client);
 
+    // RFC 6062 §5.4: after a successful ConnectionBind this connection is a
+    // client data connection — no more STUN on it, only the bytes of one TCP
+    // connection to a peer, as they are, both ways. It used to stay a STUN
+    // connection: the peer's bytes came back as Data indications on the
+    // control connection, and what the client sent here was parsed as STUN
+    // and closed as bad framing.
+    var dataPeer = null;
+    client.on('dataConnection', function(peerSock) {
+      dataPeer = peerSock;
+      conn._turnDataConnection = true;   // the idle reaper leaves it alone
+      // Bytes the client sent after its ConnectionBind (not before the
+      // response, per RFC — but a pipe must not lose them either).
+      if (tcp_buf.length) { var rest = tcp_buf; tcp_buf = Buffer.alloc(0); peerSock.write(rest); }
+      // Peer → client, with what the peer sent before the bind (held in the
+      // kernel until now). pipe() resumes it and ends conn at the peer's FIN.
+      peerSock.pipe(conn);
+      peerSock.on('drain', function() { conn.resume(); });
+      peerSock.on('end', function() { /* pipe() ended conn */ });
+      // §5.5: either side closing closes the other — gently, so what is
+      // still queued is written first; an error closes at once.
+      peerSock.on('close', function(hadError) { close_stream(conn, hadError); });
+      conn.on('close', function(hadError) { close_stream(peerSock, hadError); });
+      conn.on('end', function() { try { peerSock.end(); } catch (e) {} });
+    });
+
     conn.on('data', function(chunk) {
       touch();
+      if (dataPeer) {
+        // Client → peer, with backpressure: a slow peer stops our reading.
+        if (!dataPeer.write(chunk)) conn.pause();
+        return;
+      }
       tcp_buf = tcp_buf.length ? Buffer.concat([tcp_buf, chunk]) : chunk;
 
       // RFC 8489 §6.2.2: STUN over TCP is self-delimiting (no length prefix).
@@ -1113,6 +1191,7 @@ function Server(options) {
         // HOT PATH: frame is a Buffer. wire handles both Buffer and
         // Uint8Array safely (see r_bytes/validate_integrity in wire.js).
         client.feed(frame);
+        if (dataPeer) return;   // that was the ConnectionBind: the rest went to the peer
       }
     });
 
@@ -1615,21 +1694,58 @@ function Server(options) {
 
   /* ====================== start / stop ====================== */
 
+  /* A datagram listener answers from the address it is bound to. Bound to the
+   * wildcard, the kernel picks each reply's source by route, and on a host
+   * with more than one address that is not always the address the client
+   * sent to. A client discards a response from an address it did not send
+   * to: Chrome, whose sockets are bound to an interface address, sent to
+   * 127.0.0.1, got the 401 back from the interface address, and never
+   * allocated a relay at all (TCP and TLS were unaffected: a connected
+   * stream replies from the address it was accepted on).
+   * So a wildcard UDP/DTLS endpoint becomes one socket per local address,
+   * which is what coturn does when no listening-ip is given. '::' covers
+   * both families. Not split: an explicit address, port 0 (each socket
+   * would get a different port), or { perAddress: false }. Addresses that
+   * appear after listen() are not picked up — listen again, or bind
+   * explicitly. */
+  function datagram_addresses(config) {
+    var address = config.address || '0.0.0.0';
+    if (config.perAddress === false || config.port === 0) return [address];
+    var any6 = address === '::';
+    if (address !== '0.0.0.0' && !any6) return [address];
+    var out = [];
+    var ifs = os.networkInterfaces();
+    for (var name in ifs) {
+      for (var i = 0; i < ifs[name].length; i++) {
+        var x = ifs[name][i];
+        var v4 = x.family === 'IPv4' || x.family === 4;
+        if (!v4 && !any6) continue;
+        // Link-local IPv6 needs a scope id to bind and is no use to a TURN
+        // client off the link.
+        if (!v4 && /^fe80:/i.test(x.address)) continue;
+        if (out.indexOf(x.address) < 0) out.push(x.address);
+      }
+    }
+    return out.length ? out : [address];
+  }
+
   function startConfigs(configs) {
     for (var i = 0; i < configs.length; i++) {
       var lc = configs[i];
       var transport = (lc.transport || 'udp').toLowerCase();
 
-      if (transport === 'udp') {
-        start_udp(lc);
+      if (transport === 'udp' || transport === 'dtls') {
+        var addrs = datagram_addresses(lc);
+        for (var a = 0; a < addrs.length; a++) {
+          var one = addrs.length > 1 ? Object.assign({}, lc, { address: addrs[a] }) : lc;
+          if (transport === 'udp') start_udp(one); else start_dtls(one);
+        }
       } else if (transport === 'tcp') {
         start_tcp(lc);
       } else if (transport === 'tls') {
         start_tls(lc);
       } else if (transport === 'ws' || transport === 'wss') {
         start_ws(lc);
-      } else if (transport === 'dtls') {
-        start_dtls(lc);
       } else {
         ev.emit('error', new Error('Unknown transport: ' + transport));
       }
