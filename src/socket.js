@@ -11,6 +11,28 @@ import * as wire from './wire.js';
 import { checkedSocketBufferSize, udpSocketOptions } from './udp_buffers.js';
 
 
+// quico's WebSocket, the ws / wss client transport: an optional dependency,
+// imported when a WebSocket client first connects. A failed import is not
+// kept, so installing it later works.
+var quicoWs = null, quicoWsLoading = null;
+function loadQuicoWebSocket(cb) {
+  if (quicoWs) return queueMicrotask(function() { cb(null, quicoWs); });
+  if (!quicoWsLoading) {
+    quicoWsLoading = import('quico').then(
+      function(m) { quicoWs = m.WebSocket || (m.default && m.default.WebSocket); quicoWsLoading = null; return quicoWs; },
+      function(err) { quicoWsLoading = null; throw err; }
+    );
+  }
+  quicoWsLoading.then(
+    function(WS) { cb(null, WS); },
+    function() {
+      cb(new Error("WebSocket transport (ws / wss) requires the 'quico' package, an optional dependency " +
+                   "of turn-server: install it, or pass a WebSocket constructor as options.WebSocket."));
+    }
+  );
+}
+
+
 // ─── Relays this process owns, by the address the world sees them at ────
 //
 // Two clients relaying through the same server — the usual case when both
@@ -194,8 +216,8 @@ function drainDeliveries() {
 
 
 // Zero-copy Uint8Array → Buffer conversion. Node's dgram.send() and
-// stream.write() accept Uint8Array since Node 18, but internally some
-// paths are optimized for Buffer. Buffer.from(u.buffer, ...) creates a
+// stream.write() accept a Uint8Array, but internally some paths are
+// optimized for Buffer. Buffer.from(u.buffer, ...) creates a
 // Buffer *view* over the same memory — no copy.
 function toBuffer(u) {
   if (Buffer.isBuffer(u)) return u;
@@ -375,8 +397,8 @@ function Socket(options) {
     } else if (context.transportType === 'ws' || context.transportType === 'wss') {
       // WebSocket — the WS protocol already delimits messages, so each
       // incoming message is exactly one STUN/ChannelData frame. No stream
-      // framing of our own. Works with the global WebSocket (Node >= 22),
-      // the browser WebSocket, or any injected `options.WebSocket`.
+      // framing of our own. quico's WebSocket, or an injected
+      // `options.WebSocket` of the same (WHATWG) shape.
       context.transport.binaryType = 'arraybuffer';
       context.transport.onmessage = function(event) {
         if (context.destroyed) return;
@@ -1295,51 +1317,59 @@ function Socket(options) {
       context.transport.on('error', _preErr);
 
     } else if (context.transportType === 'ws' || context.transportType === 'wss') {
-      // WebSocket client. Zero-dep by default via the global WebSocket
-      // (Node >= 22 / browsers). For older Node or custom transports, inject
-      // an implementation through options.WebSocket.
-      var WS = options.WebSocket
-        || (typeof WebSocket !== 'undefined' ? WebSocket : null)
-        || (typeof globalThis !== 'undefined' ? globalThis.WebSocket : null);
-      if (!WS) {
-        ev.emit('error', new Error(
-          'WebSocket transport requires a global WebSocket (Node >= 22) ' +
-          'or options.WebSocket (e.g. the "ws" package).'));
-        return;
-      }
-
+      // WebSocket client: quico's WebSocket (the browser's interface, over
+      // quico's HTTP/1.1 client; wss:// over lemon-tls, verified as 'tls' is).
+      // quico is an optional dependency, imported here when first needed.
+      // options.WebSocket: another constructor of the same shape —
+      // new WebSocket(url, protocols, options) — e.g. a fake in a test.
       var scheme = (context.transportType === 'wss') ? 'wss' : 'ws';
       var path = options.wsPath || '/';
       var hostPart = (context.serverHost && context.serverHost.indexOf(':') >= 0)
         ? '[' + context.serverHost + ']' : context.serverHost;
       var url = options.wsUrl || (scheme + '://' + hostPart + ':' + context.serverPort + path);
 
-      var wsOpts;
+      // wss://'s certificate check, as 'tls' has it: against ca (the system's
+      // roots without one) and the server's name, not skipped unless
+      // rejectUnauthorized is false.
+      var wsOpts = null;
       if (context.transportType === 'wss') {
-        // 'ws' package honours these; the global/browser WebSocket ignores extra args.
         wsOpts = {
           rejectUnauthorized: options.rejectUnauthorized !== false,
-          ca: options.ca || undefined,
           servername: options.servername || context.serverHost,
         };
+        if (options.ca) wsOpts.ca = options.ca;
       }
 
-      try {
-        context.transport = wsOpts ? new WS(url, wsOpts) : new WS(url);
-      } catch (e) {
-        ev.emit('error', e);
-        return;
-      }
-      context.transport.binaryType = 'arraybuffer';
+      var openWs = function(WS) {
+        if (context.destroyed) return;   // closed while quico was loading
+        try {
+          context.transport = wsOpts ? new WS(url, [], wsOpts) : new WS(url);
+        } catch (e) {
+          ev.emit('error', e);
+          return;
+        }
+        context.transport.binaryType = 'arraybuffer';
 
-      var _opened = false;
-      context.transport.onopen = function() {
-        if (_opened) return; _opened = true;
-        bindTransport();
-        if (cb) cb();
-        ev.emit('connect');
+        var _opened = false;
+        context.transport.onopen = function() {
+          if (_opened) return; _opened = true;
+          bindTransport();
+          if (cb) cb();
+          ev.emit('connect');
+        };
+        // Before the open: a refused connection or a failed handshake is an
+        // 'error' (bindTransport sets the lasting onmessage/onerror/onclose).
+        context.transport.onerror = function(e) {
+          if (_opened) return;
+          ev.emit('error', e && e.error ? e.error : new Error('WebSocket error'));
+        };
       };
-      // bindTransport sets onmessage/onerror/onclose; onopen above is enough here.
+
+      if (typeof options.WebSocket === 'function') openWs(options.WebSocket);
+      else loadQuicoWebSocket(function(err, WS) {
+        if (err) { ev.emit('error', err); return; }
+        openWs(WS);
+      });
 
     } else if (context.transportType === 'dtls') {
       // DTLS client via lemon-tls connectDTLS (datagram transport over UDP).

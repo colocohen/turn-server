@@ -1,7 +1,6 @@
 import dgram from 'node:dgram';
 import { checkedSocketBufferSize, udpSocketOptions } from './udp_buffers.js';
 import net from 'node:net';
-import https from 'node:https';
 import { randomBuffer } from './random.js';
 import os from 'node:os';
 // lemon-tls is this library's TLS: for the TLS listener and for DTLS. One
@@ -46,6 +45,21 @@ function loadPem(v) {
   if (Buffer.isBuffer(v)) return v;
   if (typeof v === 'string' && v.indexOf('-----') < 0) return fs.readFileSync(v);
   return v;
+}
+
+// quico, the ws / wss transport's WebSocket stack (its HTTP/1.1 server and
+// WebSocketServer): an optional dependency, imported when a ws or wss
+// listener of our own starts. A failed import is not kept, so installing it
+// later works without a restart.
+var quicoLoading = null;
+function loadQuico() {
+  if (!quicoLoading) {
+    quicoLoading = import('quico').then(
+      function(m) { return (m && typeof m.createServer === 'function') ? m : m.default; },
+      function(err) { quicoLoading = null; throw err; }
+    );
+  }
+  return quicoLoading;
 }
 
 // Resolve the DTLSSession constructor (for shared-socket DTLS, where
@@ -951,15 +965,10 @@ function Server(options) {
     }
 
     if (client._idleTimer) {
-      // Refresh idle timer without re-allocating the timer object.
-      // timer.refresh() is available since Node 10 — re-arms the existing
-      // handle, saving a syscall pair per packet.
-      if (typeof client._idleTimer.refresh === 'function') {
-        client._idleTimer.refresh();
-      } else {
-        clearTimeout(client._idleTimer);
-        client._idleTimer = setup_idle_timeout(client._idleKey);
-      }
+      // Refresh idle timer without re-allocating the timer object:
+      // timer.refresh() re-arms the existing handle, saving a syscall pair
+      // per packet.
+      client._idleTimer.refresh();
     }
 
     // HOT PATH: msg is Buffer. wire's r_bytes and validate_integrity now
@@ -1418,8 +1427,9 @@ function Server(options) {
 
   /* ====================== WebSocket transport ====================== */
 
-  // handleWebSocket: accept a WebSocket connection from any WS library (ws, uWebSockets, etc.)
-  // The developer brings their own WebSocket server, we handle TURN inside.
+  // handleWebSocket: accept a WebSocket connection from a WebSocket server of
+  // the caller's — quico's WebSocketServer, or any whose sockets have
+  // on('message' | 'error' | 'close'), send(), close() and readyState.
   // Usage: wsServer.on('connection', function(ws, req) { server.handleWebSocket(ws, req); });
   function handleWebSocket(ws, req) {
     if (context.destroyed) { try { ws.close(); } catch(e) {} return; }
@@ -1434,11 +1444,13 @@ function Server(options) {
     var src = { ip: '0.0.0.0', port: 0 };
 
     // Try to extract source from req (HTTP upgrade request) or ws
+    // (an IPv4 client on a dual-stack socket as the IPv4 address it used, as
+    // for a stream connection)
     if (req && req.socket) {
-      src.ip = req.socket.remoteAddress || '0.0.0.0';
+      src.ip = unmapIPv4(req.socket.remoteAddress) || '0.0.0.0';
       src.port = req.socket.remotePort || 0;
     } else if (ws._socket) {
-      src.ip = ws._socket.remoteAddress || '0.0.0.0';
+      src.ip = unmapIPv4(ws._socket.remoteAddress) || '0.0.0.0';
       src.port = ws._socket.remotePort || 0;
     }
 
@@ -1455,8 +1467,8 @@ function Server(options) {
 
     ws.on('message', function(msg) {
       if (context.destroyed) return;
-      // HOT PATH: msg is usually a Buffer from ws; if it's ArrayBuffer
-      // (browser-style), wrap once — no way to avoid here.
+      // HOT PATH: msg is a Buffer from quico's on('message'); an ArrayBuffer
+      // (a WHATWG-style socket) is wrapped once — no way to avoid here.
       var data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : msg;
       if (ws_client === null) {
         if (ws_pending !== null && ws_pending.length < WS_PENDING_MAX) ws_pending.push(data);
@@ -1478,8 +1490,8 @@ function Server(options) {
     var client = create_client_socket(src, function(buf) {
       try {
         if (ws.readyState === 1) { // OPEN
-          // HOT PATH: zero-copy Buffer view. ws library accepts both
-          // Buffer and Uint8Array, but Buffer is the optimized path.
+          // HOT PATH: zero-copy Buffer view (quico's send takes a Buffer as
+          // one binary message).
           var out = wire.to_buffer(buf);
           ws.send(out);
         }
@@ -1505,146 +1517,224 @@ function Server(options) {
   }
 
 
-  /* ====================== WebSocket listener (optional auto-attach) ====================== */
+  /* ====================== WebSocket listener (ws / wss) ====================== */
 
-  // start_ws bridges a WebSocket server into the TURN engine. turn-server does
-  // not require a WS library for the common cases; resolution order is:
+  // start_ws bridges a WebSocket server into the TURN engine. The WebSocket
+  // stack is quico's — its HTTP/1.1 server and its WebSocketServer — with TLS
+  // for 'wss' from lemon-tls through quico, as for 'tls'. Either:
   //
-  //   (a) a running WS server instance via `wsServer`
-  //       (anything that emits 'connection' with (ws, req)), or
-  //   (b) a WS server *constructor* via `WebSocketServer`
-  //       (e.g. the `ws` package's `WebSocketServer`), instantiated on
-  //       { port, host, path } (or { server } to attach to an http(s).Server), or
-  //   (c) a lazy import('ws') fallback (install `ws`), or
-  //   (d) a clear, actionable error.
+  //   (a) `wsServer`: a running quico WebSocketServer of the caller's (an app
+  //       that shares its own quico server with TURN), or anything else that
+  //       emits 'connection' with (ws, req) and has close(); or
+  //   (b) a listener of our own: quico.createServer (HTTP/1.1 only: no HTTP/2,
+  //       no HTTP/3) with a WebSocketServer on it, on { port, address, path };
+  //       cleartext for 'ws', TLS with the endpoint's cert / key (or
+  //       createServer({ tls })'s, or an SNICallback) for 'wss' — never a
+  //       cleartext fallback.
   //
-  // For Express/Fastify/HTTP apps, prefer calling server.handleWebSocket(ws, req)
-  // yourself from your own upgrade handler — see the README.
+  // For any other WebSocket server, call server.handleWebSocket(ws, req)
+  // yourself from its connection handler — see the README.
   function start_ws(config) {
-    if (config.wsServer) { wireWsServer(config, config.wsServer); return; }
+    var transport = String(config.transport || 'ws').toLowerCase();
 
-    if (config.WebSocketServer) {
-      var inst = instantiateWsServer(config, config.WebSocketServer);
-      if (inst) wireWsServer(config, inst);
+    // Removed: an injected WebSocketServer constructor and an HTTP(S)
+    // server to attach it to (server). Said so, rather than silently opening
+    // a port of our own instead.
+    if (config.WebSocketServer || config.server) {
+      ev.emit('error', annotate_ws(new Error(transport + " transport: 'WebSocketServer' and 'server' are no longer taken. " +
+        "Pass a running quico WebSocketServer as 'wsServer' (new WebSocketServer({ server }) on your quico server), " +
+        "or call server.handleWebSocket(ws, req) from your own WebSocket server."), config, transport));
       return;
     }
 
-    // Lazy import('ws') — only loaded when actually starting a ws listener.
-    import('ws').then(function(m) {
-      var Ctor = m.WebSocketServer || (m.default && m.default.Server) || m.Server;
-      if (typeof Ctor !== 'function') {
-        ev.emit('error', new Error("ws transport: installed 'ws' has no WebSocketServer export"));
-        return;
-      }
-      var inst = instantiateWsServer(config, Ctor);
-      if (inst) wireWsServer(config, inst);
-    }).catch(function() {
-      ev.emit('error', new Error(
-        "ws transport requires the 'ws' package. Install it (npm i ws), pass a " +
-        "'wsServer' instance or 'WebSocketServer' constructor in the listen config, " +
-        "or call server.handleWebSocket(ws, req) from your own WebSocket server."));
+    if (config.wsServer) {
+      wireWsServer(config, config.wsServer);
+      ev.emit('listening', { transport: transport, address: config.address || '0.0.0.0', port: config.port || null });
+      // Closed with stop() / drain(), as the WebSocketServer it is: its
+      // clients get 1001. Not through close(cb): quico's close takes
+      // (code, reason), and a callback there went out as the close code.
+      var given = config.wsServer;
+      context.listeners.push({ type: 'ws', socket: {
+        address: function() { return typeof given.address === 'function' ? given.address() : null; },
+        close: function(cb) {
+          try { given.close(); } catch (e) {}
+          if (cb) cb();
+        }
+      } });
+      return;
+    }
+
+    // The listener entry exists from now, so a stop() before quico has loaded
+    // still finds (and cancels) it.
+    var entry = { closed: false, http: null, wss: null, conns: null, listener: null };
+    entry.listener = { type: 'ws', socket: {
+      address: function() { return entry.http ? entry.http.address() : null; },
+      close: function(cb) { close_own_ws(entry, cb); }
+    } };
+    context.listeners.push(entry.listener);
+
+    loadQuico().then(function(quico) {
+      if (entry.closed || context.destroyed) return;
+      if (!start_own_ws(config, transport, quico, entry)) drop_ws_entry(entry);
+    }, function() {
+      drop_ws_entry(entry);
+      ev.emit('error', annotate_ws(new Error(
+        transport + " transport requires the 'quico' package (an optional dependency of turn-server). " +
+        "Install it, pass a running quico WebSocketServer as 'wsServer' in the listen config, " +
+        "or call server.handleWebSocket(ws, req) from your own WebSocket server."), config, transport));
     });
   }
 
-  // The WebSocketServers riding an https server of ours ('wss').
-  var ownTlsWs = new WeakSet();
+  // A listener that never started is not one (isHealthy, stop).
+  function drop_ws_entry(entry) {
+    var i = context.listeners.indexOf(entry.listener);
+    if (i >= 0) context.listeners.splice(i, 1);
+  }
 
-  function instantiateWsServer(config, Ctor) {
-    var ctorOpts = { port: listenPort(config, 3478), host: config.address || '0.0.0.0' };
-    if (config.path) ctorOpts.path = config.path;
-    if (config.server) { delete ctorOpts.port; delete ctorOpts.host; ctorOpts.server = config.server; }
-    // 'wss' is WebSocket over TLS (RFC 6455 §3, RFC 7118's "wss"): a
-    // WebSocketServer made on { port, host } is a cleartext HTTP server, so a
-    // 'wss' listener without a server of the caller's listened in the clear —
-    // TURN credentials' MESSAGE-INTEGRITY exchanges and every relayed byte
-    // readable on the path, behind a name that promises TLS. Here the
-    // WebSocketServer rides an https server of ours, with the endpoint's
-    // cert / key (or createServer({ tls })'s), as 'tls' does; none → an
-    // error, never a cleartext fallback.
-    var httpsServer = null;
-    if (!config.server && String(config.transport || '').toLowerCase() === 'wss') {
+  function annotate_ws(err, config, transport) {
+    if (err && typeof err === 'object') {
+      err.transport = transport;
+      err.port = config.port != null ? config.port : null;
+      err.address = config.address || '0.0.0.0';
+    }
+    return err;
+  }
+
+  // Returns false when it did not start (the 'error' is emitted).
+  function start_own_ws(config, transport, quico, entry) {
+    var port = listenPort(config, 3478);
+    var address = config.address || '0.0.0.0';
+    var secure = transport === 'wss';
+
+    var httpOpts = { http1: true, http2: false, http3: false };
+    if (secure) {
       var cert = loadPem(tlsField(config, 'cert'));
       var key  = loadPem(tlsField(config, 'key'));
-      if (!cert || !key) {
-        ev.emit('error', new Error("wss transport requires cert and key (in the listen config or createServer({ tls })), " +
-                                   "or a TLS 'server' / 'wsServer' of the caller's"));
-        return null;
+      var ca   = loadPem(tlsField(config, 'ca'));
+      // The same SNICallback as 'tls' (quico's tcp_listener hands it the
+      // connection's details third, as start_tls does; info.transport 'tcp').
+      var sni = tlsField(config, 'SNICallback') || tlsField(config, 'sniCallback')
+             || config.sniCallback || context.sniCallback || null;
+      if (!(cert && key) && !sni) {
+        ev.emit('error', annotate_ws(new Error("wss transport requires cert and key (in the listen config or createServer({ tls })), " +
+                                               "an SNICallback, or a 'wsServer' of the caller's"), config, transport));
+        return false;
       }
-      var tlsOpts = { cert: cert, key: key };
-      var ca = loadPem(tlsField(config, 'ca'));
-      if (ca) tlsOpts.ca = ca;
-      try {
-        httpsServer = https.createServer(tlsOpts);
-      } catch (e) {
-        ev.emit('error', e);
-        return null;
-      }
-      delete ctorOpts.port; delete ctorOpts.host;
-      ctorOpts.server = httpsServer;
+      if (cert && key) { httpOpts.cert = cert; httpOpts.key = key; }
+      if (ca) httpOpts.ca = ca;
+      if (sni) httpOpts.SNICallback = sni;
+      // (The TLS handshake's deadline is handshakeTimeout, from the timer
+      // below: TLS and the HTTP Upgrade together.)
     }
+
+    var http, wss;
     try {
-      var inst = new Ctor(ctorOpts);
-      if (httpsServer) {
-        // Closed with it (stop / drain close the WebSocketServer only).
-        var close0 = inst.close;
-        inst.close = function(cb) {
-          try { close0.call(inst); } catch (_) {}
-          httpsServer.close(function() { if (cb) cb(); });
-        };
-        // 'listening' and 'error' from the https server itself: not every
-        // WebSocketServer forwards a given server's ('ws' does, quico's does
-        // not). wireWsServer skips the WebSocketServer's 'listening' for it;
-        // an error both report is reported once.
-        ownTlsWs.add(inst);
-        httpsServer.on('error', function(err) {
-          if (err && err.__turnReported) return;
-          if (err) { err.__turnReported = true; err.transport = 'ws'; err.port = config.port || null; }
-          ev.emit('error', err);
-        });
-        httpsServer.listen(listenPort(config, 3478), config.address || '0.0.0.0', function() {
-          var a = httpsServer.address();
-          ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0',
-                                 port: (a && typeof a === 'object' && a.port) || config.port || null });
-        });
-      }
-      return inst;
+      http = quico.createServer(httpOpts);
+      wss = new quico.WebSocketServer(config.path ? { server: http, path: config.path } : { server: http });
     } catch (e) {
-      if (httpsServer) { try { httpsServer.close(); } catch (_) {} }
-      ev.emit('error', e);
-      return null;
+      ev.emit('error', annotate_ws(e, config, transport));
+      return false;
     }
+    entry.http = http;
+    entry.wss = wss;
+
+    // Connections before they are WebSockets (the TLS handshake, the HTTP
+    // Upgrade): counted against maxConnections with the TLS listener's
+    // handshakes, and given handshakeTimeout to become one — a client that
+    // connects and says nothing does not hold a socket for good. Keyed by the
+    // remote address and port, the one thing the raw socket ('connection',
+    // before TLS) and the upgrade's req.socket (the TLS socket over it) share.
+    var conns = new Map();
+    var timedOut = new Set();   // keys of the ones the timer closed: reported once
+    entry.conns = conns;
+    function connKey(s) { return unmapIPv4(s.remoteAddress || '') + '|' + (s.remotePort || 0); }
+    function settle(c) {
+      if (c.done) return;
+      c.done = true;
+      clearTimeout(c.timer);
+      context.pendingHandshakes--;
+      if (conns.get(c.key) === c) conns.delete(c.key);
+    }
+
+    http.on('connection', function(raw) {
+      if (context.destroyed || context.draining ||
+          (context.maxConnections > 0 &&
+           context.stats.activeConnections + context.pendingHandshakes >= context.maxConnections)) {
+        try { raw.destroy(); } catch (e) {}
+        return;
+      }
+      var c = { key: connKey(raw), raw: raw, done: false, timer: null };
+      context.pendingHandshakes++;
+      conns.set(c.key, c);
+      c.timer = setTimeout(function() {
+        if (c.done) return;
+        settle(c);
+        client_error(new Error('WebSocket handshake timeout'), 'ws', { ip: unmapIPv4(raw.remoteAddress), port: raw.remotePort });
+        timedOut.add(c.key);
+        try { raw.destroy(); } catch (e) {}
+      }, context.handshakeTimeout);
+      if (c.timer.unref) c.timer.unref();
+      raw.on('close', function() {
+        settle(c);
+        if (timedOut.has(c.key)) setImmediate(function() { timedOut.delete(c.key); });
+      });
+    });
+
+    // A failed TLS handshake (no certificate for the name, a scanner): the
+    // connection is gone; reported as the TLS listener reports one.
+    http.on('tlsClientError', function(err, sock) {
+      if (sock && timedOut.has(connKey(sock))) return;   // the timeout, reported
+      if (ev.listenerCount('tlsClientError') > 0) ev.emit('tlsClientError', err, sock);
+      client_error(err, 'ws', { ip: unmapIPv4(sock && sock.remoteAddress), port: sock && sock.remotePort });
+    });
+    http.on('clientError', function(err, sock) {
+      client_error(err, 'ws', { ip: unmapIPv4(sock && sock.remoteAddress), port: sock && sock.remotePort });
+    });
+
+    // Before wireWsServer's own handler: the connection stops being pending
+    // before handleWebSocket counts it as active.
+    wss.on('connection', function(ws, req) {
+      var s = req && req.socket;
+      var c = s ? conns.get(connKey(s)) : null;
+      if (c) settle(c);
+    });
+    wireWsServer(config, wss);
+
+    http.on('error', function(err) {
+      ev.emit('error', annotate_ws(err, config, transport));
+    });
+    http.listen(port, address, function() {
+      if (entry.closed) return;
+      var a = http.address();
+      ev.emit('listening', { transport: transport, address: address,
+                             port: (a && typeof a === 'object' && a.port) || port || null });
+    });
+    return true;
+  }
+
+  function close_own_ws(entry, cb) {
+    entry.closed = true;
+    if (!entry.http) { if (cb) cb(); return; }
+    // The WebSockets first (1001, and torn down if the peer does not answer),
+    // then the connections still in their handshake, then the port.
+    try { entry.wss.close(); } catch (e) {}
+    if (entry.conns) {
+      entry.conns.forEach(function(c) { try { c.raw.destroy(); } catch (e) {} });
+    }
+    try { entry.http.closeAllConnections(); } catch (e) {}
+    try { entry.http.close(function() { if (cb) cb(); }); }
+    catch (e) { if (cb) cb(); }
   }
 
   function wireWsServer(config, wsServer) {
     wsServer.on('connection', function(ws, req) {
       handleWebSocket(ws, req);
     });
-
+    // quico's WebSocketServer has no 'error' of its own (its server's errors
+    // are the server's); another server's are reported as the listener's.
     wsServer.on('error', function(err) {
-      if (err && err.__turnReported) return;
-      if (err) err.__turnReported = true;
-      err.transport = 'ws'; err.port = config.port || null;
-      ev.emit('error', err);
+      ev.emit('error', annotate_ws(err, config, String(config.transport || 'ws').toLowerCase()));
     });
-
-    if (typeof wsServer.on === 'function' && !ownTlsWs.has(wsServer)) {
-      wsServer.on('listening', function() {
-        // The port bound (listen({ port: 0 }): the system's choice).
-        var a = null;
-        try { a = typeof wsServer.address === 'function' ? wsServer.address() : null; } catch (_) {}
-        ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0',
-                               port: (a && typeof a === 'object' && a.port) || config.port || null });
-      });
-    }
-    // Some WS servers attached to an existing http.Server never emit 'listening'
-    // themselves — surface a listening event immediately in that case.
-    if (config.wsServer || config.server) {
-      ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0', port: config.port || null });
-    }
-
-    // Tracked so stop()/drain() can close it (ws.WebSocketServer and http.Server
-    // both expose .close(cb)).
-    context.listeners.push({ type: 'ws', socket: wsServer });
   }
 
 
@@ -2049,14 +2139,14 @@ function Server(options) {
 
         var e2 = createDtlsConn(key, rinfo, sock, localAddr, cfg);
         if (!e2) return;
-        if (e2.idle && typeof e2.idle.refresh === 'function') e2.idle.refresh();
+        if (e2.idle) e2.idle.refresh();
         e2.session.feedDatagram(msg);
       });
 
       return;
     }
 
-    if (entry.idle && typeof entry.idle.refresh === 'function') entry.idle.refresh();
+    if (entry.idle) entry.idle.refresh();
     entry.session.feedDatagram(msg);
   }
 
@@ -2178,7 +2268,7 @@ function Server(options) {
     /** Get all client sockets */
     getClients: function() { return context.clients; },
 
-    /** Accept a WebSocket connection (from any WS library).
+    /** Accept a WebSocket connection from a WebSocket server of the caller's (quico's, or one of its shape).
      *  Usage: wsServer.on('connection', (ws, req) => server.handleWebSocket(ws, req));
      */
     handleWebSocket: handleWebSocket,

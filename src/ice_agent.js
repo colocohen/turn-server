@@ -1273,7 +1273,7 @@ function IceAgent(options) {
             rejectUnauthorized: srv.rejectUnauthorized,
             ca:                 srv.ca,
             // Pass-through DTLS (lemon-tls) + WebSocket transport options.
-            // All optional: the Socket uses its own lemon-tls and the global
+            // All optional: the Socket uses its own lemon-tls and quico's
             // WebSocket respectively when these are absent.
             connectDTLS:        srv.connectDTLS,
             lemonTls:           srv.lemonTls,
@@ -2006,8 +2006,8 @@ function IceAgent(options) {
           minVersion:         server.minVersion  || null,
           maxVersion:         server.maxVersion  || null,
           mtu:                server.mtu         || null,
-          // WebSocket transport — injection optional; Socket falls back to the
-          // global WebSocket (Node >= 22).
+          // WebSocket transport — injection optional; Socket uses quico's
+          // WebSocket when absent.
           WebSocket:          server.WebSocket || null,
           wsPath:             server.wsPath    || null,
           wsUrl:              server.wsUrl     || null,
@@ -2821,16 +2821,21 @@ function IceAgent(options) {
       _diagLog('[ice-diag] ' + _diagTs() + ' role conflict: both controlling, we LOSE → switching to controlled');
       switchRole(false);
     } else if (!context.controlling && icControlled !== null) {
-      // Both claim controlled
-      if (compareTieBreakers(context.tieBreaker, icControlled.raw) >= 0) {
+      // Both claim controlled (RFC 8445 §7.3.1.1): the larger tie-breaker
+      // takes the controlling role; the smaller answers 487 and keeps its
+      // role. (This was the other way round: the larger answered 487, so
+      // the smaller became controlling — against an RFC peer, which then
+      // switched too, both ended controlling and a second conflict had to
+      // settle it.)
+      if (compareTieBreakers(context.tieBreaker, icControlled.raw) < 0) {
         if (_ICE_DBG && _diagRL('roleconf:' + rinfo.address + ':' + rinfo.port, 2000)) {
-          _diagLog('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlled, we win) → ' +
+          _diagLog('[ice-diag] ' + _diagTs() + ' 487 ROLE CONFLICT (both controlled, theirs larger) → ' +
                       rinfo.address + ':' + rinfo.port + ' — our role=controlled');
         }
         sendBindingError(msg, rinfo, sock, turnSocket, 487, 'Role Conflict', localKey());
         return;
       }
-      _diagLog('[ice-diag] ' + _diagTs() + ' role conflict: both controlled, we LOSE → switching to controlling');
+      _diagLog('[ice-diag] ' + _diagTs() + ' role conflict: both controlled, ours larger → switching to controlling');
       switchRole(true);
     }
 

@@ -90,16 +90,17 @@ function computeCandidatePriority(type, localPreference, componentId) {
  * ones one apart (2130706431 / 2130706430 against 2113929471) came out
  * equal, and their order was the order they were formed in.
  *
- * A candidate priority is a 32-bit positive integer (RFC 8445 §5.1.2.1);
+ * A candidate priority is an integer 1 .. 2^31-1 (RFC 8445 §5.1.2.1);
  * anything else a peer signals (NaN, a fraction, out of range) is taken
- * as its integer part clamped to [0, 2^32 - 1], so the result is always
+ * as its integer part clamped to [0, 2^31 - 1] (RFC 8445 §5.1.2.1), so the result is always
  * defined. Compare the results with < > === (never subtract them into a
  * sort comparator: Array.prototype.sort cannot take a BigInt).
  */
 function pairPriorityInput(p) {
   const n = Math.trunc(Number(p));
   if (!(n > 0)) return 0n;                       // NaN, negative, 0
-  return BigInt(n > 0xFFFFFFFF ? 0xFFFFFFFF : n);
+  // RFC 8445 §5.1.2.1: a priority is 1 .. 2^31-1 (the pair's then fits 63 bits)
+  return BigInt(n > 0x7FFFFFFF ? 0x7FFFFFFF : n);
 }
 
 function computePairPriority(controlling, localPriority, remotePriority) {
