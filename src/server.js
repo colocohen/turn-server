@@ -1,6 +1,7 @@
 import dgram from 'node:dgram';
 import { checkedSocketBufferSize, udpSocketOptions } from './udp_buffers.js';
 import net from 'node:net';
+import https from 'node:https';
 import { randomBuffer } from './random.js';
 import os from 'node:os';
 // lemon-tls is this library's TLS: for the TLS listener and for DTLS. One
@@ -32,6 +33,14 @@ function resolveCreateDTLSServer(config, ctx, cb) {
 }
 
 // Load a PEM cert/key that may be a path, a string, or a Buffer.
+// A listen config's port: as given, 0 included — the system picks a free
+// one, as node's net / dgram listen({ port: 0 }) do (the 'listening' event
+// reports it). `config.port || 3478` made 0 bind 3478. Absent (undefined /
+// null): the transport's default.
+function listenPort(config, dflt) {
+  return (config.port === undefined || config.port === null) ? dflt : config.port;
+}
+
 function loadPem(v) {
   if (v == null) return v;
   if (Buffer.isBuffer(v)) return v;
@@ -442,6 +451,14 @@ function Server(options) {
     // Auth hooks (no built-in equivalent — always forward)
     session.on('authenticate', function(username, realm, cb) {
       if (ev.listenerCount('authenticate') > 0) ev.emit('authenticate', username, realm, cb);
+      else cb(new Error('no handler'));
+    });
+
+    // The OAuth hook (RFC 7635). It was not forwarded: a server created with
+    // auth.mechanism 'oauth' answered every token 401 without asking the
+    // 'authenticate_oauth' listener the README documents.
+    session.on('authenticate_oauth', function(token, realm, cb) {
+      if (ev.listenerCount('authenticate_oauth') > 0) ev.emit('authenticate_oauth', token, realm, cb);
       else cb(new Error('no handler'));
     });
 
@@ -954,7 +971,7 @@ function Server(options) {
   /* ====================== UDP listener ====================== */
 
   function start_udp(config) {
-    var port = config.port || 3478;
+    var port = listenPort(config, 3478);
     var address = config.address || '0.0.0.0';
     var family = address.indexOf(':') >= 0 ? 'udp6' : 'udp4';
 
@@ -1252,7 +1269,7 @@ function Server(options) {
   /* ====================== TCP listener ====================== */
 
   function start_tcp(config) {
-    var port = config.port || 3478;
+    var port = listenPort(config, 3478);
     var address = config.address || '0.0.0.0';
 
     var tcp = net.createServer(function(conn) {
@@ -1278,7 +1295,7 @@ function Server(options) {
   /* ====================== TLS listener ====================== */
 
   function start_tls(config) {
-    var port = config.port || 5349;
+    var port = listenPort(config, 5349);
     var address = config.address || '0.0.0.0';
 
     // SNI: per-listener callback takes priority, then server-level tls default,
@@ -1529,13 +1546,70 @@ function Server(options) {
     });
   }
 
+  // The WebSocketServers riding an https server of ours ('wss').
+  var ownTlsWs = new WeakSet();
+
   function instantiateWsServer(config, Ctor) {
-    var ctorOpts = { port: config.port || 3478, host: config.address || '0.0.0.0' };
+    var ctorOpts = { port: listenPort(config, 3478), host: config.address || '0.0.0.0' };
     if (config.path) ctorOpts.path = config.path;
     if (config.server) { delete ctorOpts.port; delete ctorOpts.host; ctorOpts.server = config.server; }
+    // 'wss' is WebSocket over TLS (RFC 6455 §3, RFC 7118's "wss"): a
+    // WebSocketServer made on { port, host } is a cleartext HTTP server, so a
+    // 'wss' listener without a server of the caller's listened in the clear —
+    // TURN credentials' MESSAGE-INTEGRITY exchanges and every relayed byte
+    // readable on the path, behind a name that promises TLS. Here the
+    // WebSocketServer rides an https server of ours, with the endpoint's
+    // cert / key (or createServer({ tls })'s), as 'tls' does; none → an
+    // error, never a cleartext fallback.
+    var httpsServer = null;
+    if (!config.server && String(config.transport || '').toLowerCase() === 'wss') {
+      var cert = loadPem(tlsField(config, 'cert'));
+      var key  = loadPem(tlsField(config, 'key'));
+      if (!cert || !key) {
+        ev.emit('error', new Error("wss transport requires cert and key (in the listen config or createServer({ tls })), " +
+                                   "or a TLS 'server' / 'wsServer' of the caller's"));
+        return null;
+      }
+      var tlsOpts = { cert: cert, key: key };
+      var ca = loadPem(tlsField(config, 'ca'));
+      if (ca) tlsOpts.ca = ca;
+      try {
+        httpsServer = https.createServer(tlsOpts);
+      } catch (e) {
+        ev.emit('error', e);
+        return null;
+      }
+      delete ctorOpts.port; delete ctorOpts.host;
+      ctorOpts.server = httpsServer;
+    }
     try {
-      return new Ctor(ctorOpts);
+      var inst = new Ctor(ctorOpts);
+      if (httpsServer) {
+        // Closed with it (stop / drain close the WebSocketServer only).
+        var close0 = inst.close;
+        inst.close = function(cb) {
+          try { close0.call(inst); } catch (_) {}
+          httpsServer.close(function() { if (cb) cb(); });
+        };
+        // 'listening' and 'error' from the https server itself: not every
+        // WebSocketServer forwards a given server's ('ws' does, quico's does
+        // not). wireWsServer skips the WebSocketServer's 'listening' for it;
+        // an error both report is reported once.
+        ownTlsWs.add(inst);
+        httpsServer.on('error', function(err) {
+          if (err && err.__turnReported) return;
+          if (err) { err.__turnReported = true; err.transport = 'ws'; err.port = config.port || null; }
+          ev.emit('error', err);
+        });
+        httpsServer.listen(listenPort(config, 3478), config.address || '0.0.0.0', function() {
+          var a = httpsServer.address();
+          ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0',
+                                 port: (a && typeof a === 'object' && a.port) || config.port || null });
+        });
+      }
+      return inst;
     } catch (e) {
+      if (httpsServer) { try { httpsServer.close(); } catch (_) {} }
       ev.emit('error', e);
       return null;
     }
@@ -1547,13 +1621,19 @@ function Server(options) {
     });
 
     wsServer.on('error', function(err) {
+      if (err && err.__turnReported) return;
+      if (err) err.__turnReported = true;
       err.transport = 'ws'; err.port = config.port || null;
       ev.emit('error', err);
     });
 
-    if (typeof wsServer.on === 'function') {
+    if (typeof wsServer.on === 'function' && !ownTlsWs.has(wsServer)) {
       wsServer.on('listening', function() {
-        ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0', port: config.port || null });
+        // The port bound (listen({ port: 0 }): the system's choice).
+        var a = null;
+        try { a = typeof wsServer.address === 'function' ? wsServer.address() : null; } catch (_) {}
+        ev.emit('listening', { transport: 'ws', address: config.address || '0.0.0.0',
+                               port: (a && typeof a === 'object' && a.port) || config.port || null });
       });
     }
     // Some WS servers attached to an existing http.Server never emit 'listening'
@@ -1577,7 +1657,7 @@ function Server(options) {
   // (each 'data' is one STUN/ChannelData message), and the relay path to peers
   // stays plain UDP as usual.
   function start_dtls(config) {
-    var port = config.port || 5349;
+    var port = listenPort(config, 5349);
     var address = config.address || '0.0.0.0';
 
     resolveCreateDTLSServer(config, context, function(err, createDTLSServer) {
@@ -1683,7 +1763,10 @@ function Server(options) {
       });
 
       dtlsServer.listen(port, address, function() {
-        ev.emit('listening', { transport: 'dtls', address: address, port: port });
+        // The port bound (port 0: the system's choice).
+        var a = null;
+        try { a = typeof dtlsServer.address === 'function' ? dtlsServer.address() : null; } catch (_) {}
+        ev.emit('listening', { transport: 'dtls', address: address, port: (a && a.port) || port });
       });
 
       // dtlsServer exposes .close(cb) — trackable for stop()/drain().

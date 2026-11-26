@@ -255,6 +255,12 @@ function Socket(options) {
       secret: options.secret || null,
       username: options.username || null,
       password: options.password || null,
+      // RFC 8489 §6.2.1: the client's retransmission over UDP and DTLS.
+      // connect(), getPublicIP(), detectNAT() and the ICE agent set it, and it
+      // was not passed on: no request was ever retransmitted, and a lost
+      // datagram was a 39.5 s wait for the reliable transports' Ti.
+      rto: options.rto || null,
+      tcpTimeout: options.tcpTimeout,
       source: options.source || null,
       localAddress: options.localAddress || null,
       // Carried into hook payloads (beforeBindingResponse) so they can report
@@ -589,29 +595,39 @@ function Socket(options) {
     var relay_ip = opt_relay_ip || '0.0.0.0';
     var external_ip = opt_external_ip || relay_ip;
 
-    // Resolve 0.0.0.0 to a reachable address
+    // Resolve 0.0.0.0 to a reachable address — and '::' to one of its own
+    // family. The walk below stopped after the first interface once the
+    // address was '::' (its test was `!== '0.0.0.0'`), and only ever looked
+    // for IPv4: an IPv6 relay on '::' announced '::' as its relayed address
+    // (RFC 8656 §7.3: the address peers send to), and the local address, of
+    // whichever family, was taken for it.
     if (external_ip === '0.0.0.0' || external_ip === '::') {
+      var want6 = external_ip === '::';
       var la = session.context.localAddress;
       // Use localAddress only if it's a real routable IP (not unspecified/loopback)
+      // of the relay's family
       if (la && la.ip && la.ip !== '0.0.0.0' && la.ip !== '::' &&
-          !la.ip.startsWith('127.') && la.ip !== '::1') {
+          !la.ip.startsWith('127.') && la.ip !== '::1' && net.isIPv6(la.ip) === want6) {
         external_ip = la.ip;
       } else {
-        // Auto-detect default non-loopback IP (consistent for all transports)
+        // Auto-detect default non-loopback IP (consistent for all transports);
+        // for IPv6 not a link-local one, which needs a scope and is no use off
+        // the link.
+        var found = null;
         var ifaces = os.networkInterfaces();
         var keys = Object.keys(ifaces);
-        for (var ki = 0; ki < keys.length; ki++) {
+        for (var ki = 0; ki < keys.length && found === null; ki++) {
           var addrs = ifaces[keys[ki]];
           for (var ai = 0; ai < addrs.length; ai++) {
-            if (addrs[ai].family === 'IPv4' && !addrs[ai].internal) {
-              external_ip = addrs[ai].address;
-              break;
-            }
+            var x = addrs[ai];
+            if (x.internal || x.family !== (want6 ? 'IPv6' : 'IPv4')) continue;
+            if (want6 && /^fe80:/i.test(x.address)) continue;
+            found = x.address;
+            break;
           }
-          if (external_ip !== '0.0.0.0') break;
         }
-        // Still 0.0.0.0? Last resort: use loopback (localhost testing)
-        if (external_ip === '0.0.0.0') external_ip = '127.0.0.1';
+        // None? Last resort: use loopback (localhost testing)
+        external_ip = found !== null ? found : (want6 ? '::1' : '127.0.0.1');
       }
     }
     var min_port = opt_port_range ? opt_port_range[0] : 49152;
@@ -648,6 +664,13 @@ function Socket(options) {
       var e440 = new Error('Address family not supported (no IPv6 relay address)');
       e440.stunCode = 440;
       return cb(e440);
+    }
+    // The same the other way: an IPv4 allocation on an IPv6 relay address
+    // failed every bind and answered 508 (RFC 8656 §7.2: 440).
+    if (family === 'udp4' && !(net.isIPv4(relay_ip) && net.isIPv4(external_ip))) {
+      var e440v4 = new Error('Address family not supported (no IPv4 relay address)');
+      e440v4.stunCode = 440;
+      return cb(e440v4);
     }
 
     // RFC 6062 §5.1: a TCP allocation gets a TCP relayed address, listening.
@@ -1368,6 +1391,14 @@ function Socket(options) {
   // Client-side: forward success/error events for convenience
   session.on('success', function(msg) { ev.emit('success', msg); });
   session.on('error_response', function(msg, err) { ev.emit('error_response', msg, err); });
+  // A request that got no answer (RFC 8489 §6.2), and 300 Try Alternate
+  // (§10). Neither was forwarded: getPublicIP()'s and detectNAT()'s
+  // socket.on('timeout') never fired.
+  session.on('timeout', function() { ev.emit('timeout'); });
+  session.on('redirect', function(info) { ev.emit('redirect', info); });
+  // A transaction ended because its responses failed their integrity check
+  // (RFC 8489 §9.2.5: signalled instead of the timeout).
+  session.on('integrity_violation', function() { ev.emit('integrity_violation'); });
 
   // Forward specific method events
   var method_names = ['binding', 'allocate', 'refresh', 'create_permission', 'channel_bind', 'connect', 'connection_bind'];
@@ -1432,6 +1463,7 @@ function Socket(options) {
       session.off('connect:success', onOk);
       session.off('connect:error', onErr);
       session.off('timeout', onTimeout);
+      session.off('integrity_violation', onViolation);
     }
     function mine(msg) { return tid && msg && msg.transactionId && Buffer.compare(Buffer.from(msg.transactionId), Buffer.from(tid)) === 0; }
     function onOk(msg) {
@@ -1452,9 +1484,11 @@ function Socket(options) {
       cb(stunError(code || 500, 'Connect failed: ' + (code || '?') + (err && err.reason ? ' ' + err.reason : '')));
     }
     function onTimeout() { cleanup(); cb(new Error('Connect timed out')); }
+    function onViolation() { cleanup(); cb(new Error('Connect failed: the response failed its integrity check')); }
     session.on('connect:success', onOk);
     session.on('connect:error', onErr);
     session.on('timeout', onTimeout);
+    session.on('integrity_violation', onViolation);
     session.connect(p, function(e, t) { tid = t; });
   }
 
@@ -1489,6 +1523,7 @@ function Socket(options) {
     if (sc.realm) ds.context.realm = sc.realm;
     if (sc.nonce) ds.context.nonce = sc.nonce;
     if (sc.passwordAlgorithm) ds.context.passwordAlgorithm = sc.passwordAlgorithm;
+    if (sc.passwordAlgorithms) ds.context.passwordAlgorithms = sc.passwordAlgorithms;
     var settled = false;
     function fin(err, stream) {
       if (settled) return;
@@ -1507,6 +1542,7 @@ function Socket(options) {
       fin(stunError(code || 500, 'ConnectionBind failed: ' + (code || '?') + (err && err.reason ? ' ' + err.reason : '')));
     });
     ds.on('timeout', function() { fin(new Error('ConnectionBind timed out')); });
+    ds.on('integrity_violation', function() { fin(new Error('ConnectionBind failed: the response failed its integrity check')); });
     d.connect(function() { ds.connectionBind(connectionId); });
   }
 

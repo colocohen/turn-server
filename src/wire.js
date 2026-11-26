@@ -200,6 +200,15 @@ function format_ipv4(buf) {
 }
 
 function parse_ipv6(str) {
+  // RFC 4291 §2.2 (3): the last 32 bits may be written as an IPv4 address,
+  // ::ffff:1.2.3.4 — how node:dgram reports an IPv4 peer on a dual-stack
+  // socket, and how format_ipv6 writes an IPv4-mapped address. It was read as
+  // one hex group ("1.2.3.4" → 1): the address encoded was another one.
+  var last_colon = str.lastIndexOf(':');
+  if (last_colon >= 0 && str.indexOf('.', last_colon) > last_colon) {
+    var v4 = parse_ipv4(str.slice(last_colon + 1));
+    str = str.slice(0, last_colon + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16);
+  }
   var halves = str.split('::');
   var left = halves[0] ? halves[0].split(':') : [];
   var right = halves.length > 1 && halves[1] ? halves[1].split(':') : [];
@@ -220,6 +229,14 @@ function parse_ipv6(str) {
 function format_ipv6(buf) {
   var groups = [];
   for (var i = 0; i < 16; i += 2) groups.push(((buf[i] << 8) | buf[i + 1]));
+
+  // RFC 5952 §5: an IPv4-mapped address in mixed notation, ::ffff:1.2.3.4 —
+  // the text node:dgram gives for the same address. Written ::ffff:102:304 it
+  // never matched a peer's rinfo.address: a permission installed for a
+  // decoded XOR-PEER-ADDRESS (keyed by its text) let nothing in from that peer.
+  if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0xFFFF) {
+    return '::ffff:' + format_ipv4(buf.subarray(12, 16));
+  }
 
   // RFC 5952: find longest run of consecutive zero groups for :: compression
   var best_start = -1, best_len = 0, cur_start = -1, cur_len = 0;
@@ -340,12 +357,25 @@ attrs[ATTR.XOR_RELAYED_ADDRESS] = attrs[ATTR.XOR_MAPPED_ADDRESS];
 attrs[ATTR.ALTERNATE_SERVER]    = attrs[ATTR.MAPPED_ADDRESS];
 
 // RFC 8489 byte limits: USERNAME <513, REALM <763, NONCE <763, SOFTWARE <763
+//
+// A string is cut at a character boundary: RFC 8489 §14.3 / §14.8–§14.10 make
+// these values UTF-8 sequences, and a cut at the byte limit could split a
+// multi-byte character, sending an ill-formed one (a peer decoding it strictly
+// refuses the attribute; a lenient one reads U+FFFD).
+function utf8_cut(bytes, max_bytes) {
+  var n = max_bytes;
+  while (n > 0 && (bytes[n] & 0xC0) === 0x80) n--;   // bytes[n] continues the character before it
+  return bytes.slice(0, n);
+}
+
 function make_str_codec(max_bytes) {
   return {
     encode: function(v) {
       if (v == null) return new Uint8Array(0); // null-safe: encode as empty
       var bytes = typeof v === 'string' ? _te.encode(v) : v;
-      if (max_bytes && bytes.length > max_bytes) bytes = bytes.slice(0, max_bytes);
+      if (max_bytes && bytes.length > max_bytes) {
+        bytes = typeof v === 'string' ? utf8_cut(bytes, max_bytes) : bytes.slice(0, max_bytes);
+      }
       return bytes;
     },
     decode: function(d) { return _td.decode(d); }
@@ -364,7 +394,7 @@ attrs[ATTR.ERROR_CODE] = {
     if (code < 300 || code > 699) code = 500;
     var reason = value.reason || ERROR_REASON[code] || '';
     var rb = _te.encode(reason);
-    if (rb.length > 763) rb = rb.slice(0, 763);
+    if (rb.length > 763) rb = utf8_cut(rb, 763);   // at a character boundary (see make_str_codec)
     var out = new Uint8Array(4 + rb.length);
     w_u16(out, 0, 0);
     w_u8(out, 2, Math.floor(code / 100) & 0x07);
@@ -502,31 +532,39 @@ attrs[ATTR.CACHE_TIMEOUT] = {
   decode: function(d) { return r_u32(d, 0)[0]; }
 };
 
-// RFC 7982 — TRANSACTION-TRANSMIT-COUNTER (uint16 req + uint16 resp)
+// RFC 7982 §3.1 — TRANSACTION-TRANSMIT-COUNTER:
+//   Reserved(16) | Req(8) | Resp(8).
+// Req and Resp are one byte each in the low half. They were written as two
+// 16-bit fields (req over the reserved bits, resp over both counters), so a
+// compliant peer's { req: 2, resp: 1 } (00 00 02 01) read back as
+// { req: 0, resp: 513 }, and ours reached it as req 0.
 attrs[ATTR.TRANSACTION_TRANSMIT_COUNTER] = {
   encode: function(v) {
     var o = new Uint8Array(4);
-    w_u16(o, 0, v.req || v[0] || 0);
-    w_u16(o, 2, v.resp || v[1] || 0);
+    w_u8(o, 2, v.req || v[0] || 0);
+    w_u8(o, 3, v.resp || v[1] || 0);
     return o;
   },
   decode: function(d) {
-    return { req: r_u16(d, 0)[0], resp: r_u16(d, 2)[0] };
+    return { req: r_u8(d, 2)[0], resp: r_u8(d, 3)[0] };
   }
 };
 
-// RFC 6679 — ECN-CHECK (valid bit + val bit + padding, 4 bytes)
+// RFC 6679 §7.2.2 — ECN-CHECK: Reserved(29) | ECF(2) | V(1), 4 bytes.
+//   { valid: boolean, val: 0..3 }  — val is the ECN field echoed (ECF).
+// The flags sit at the END of the 32 bits. They were written at the start
+// (0x80 / 0x40 of the first byte, where the RFC has reserved bits) and the
+// two-bit ECN value was one bit: a compliant peer read V=0 from every
+// response, and ECT(1) / CE could not be told apart from ECT(0).
 attrs[ATTR.ECN_CHECK] = {
   encode: function(v) {
     var o = new Uint8Array(4);
-    var flags = 0;
-    if (v.valid) flags |= 0x80;
-    if (v.val) flags |= 0x40;
-    w_u8(o, 0, flags);
+    var flags = ((v.val & 0x03) << 1) | (v.valid ? 0x01 : 0x00);
+    w_u8(o, 3, flags);
     return o;
   },
   decode: function(d) {
-    return { valid: !!(d[0] & 0x80), val: !!(d[0] & 0x40) };
+    return { valid: !!(d[3] & 0x01), val: (d[3] >>> 1) & 0x03 };
   }
 };
 
@@ -644,7 +682,7 @@ attrs[ATTR.ADDITIONAL_ADDRESS_FAMILY] = attrs[ATTR.REQUESTED_ADDRESS_FAMILY];
 attrs[ATTR.ADDRESS_ERROR_CODE] = {
   encode: function(v) {
     var rb = v.reason ? _te.encode(v.reason) : new Uint8Array(0);
-    if (rb.length > 763) rb = rb.slice(0, 763);
+    if (rb.length > 763) rb = utf8_cut(rb, 763);   // at a character boundary (see make_str_codec)
     var out = new Uint8Array(4 + rb.length);
     w_u8(out, 0, v.family || 0);
     // byte 1 + top 5 bits of byte 2: reserved (zero)
@@ -681,10 +719,22 @@ attrs[ATTR.PASSWORD_ALGORITHM] = {
 };
 
 // PASSWORD-ALGORITHMS (list of PASSWORD-ALGORITHM)
+//
+// RFC 8489 §14.11: each algorithm's parameters are padded to a 32-bit
+// boundary, "in the same manner as an attribute", so the next algorithm
+// starts aligned. The list was written without that padding while decode
+// (below) skips it: an algorithm whose parameters are not a multiple of four
+// bytes long swallowed the start of the next one, and the list a server
+// sent was not the list a client read back.
 attrs[ATTR.PASSWORD_ALGORITHMS] = {
   encode: function(v) {
     var parts = [];
-    for (var i = 0; i < v.length; i++) parts.push(attrs[ATTR.PASSWORD_ALGORITHM].encode(v[i]));
+    for (var i = 0; i < v.length; i++) {
+      var part = attrs[ATTR.PASSWORD_ALGORITHM].encode(v[i]);
+      var rem = part.length % 4;
+      if (rem !== 0) { var padded = new Uint8Array(part.length + (4 - rem)); padded.set(part, 0); part = padded; }
+      parts.push(part);
+    }
     var total = 0; for (var j = 0; j < parts.length; j++) total += parts[j].length;
     var o = new Uint8Array(total);
     var off = 0;

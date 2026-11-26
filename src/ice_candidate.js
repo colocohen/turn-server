@@ -83,18 +83,31 @@ function computeCandidatePriority(type, localPreference, componentId) {
  * where G = controlling priority, D = controlled priority.
  * RFC 8445 §6.1.2.3.
  *
- * NOTE: For realistic candidate priorities (~2^31), this exceeds
- * Number.MAX_SAFE_INTEGER (2^53). The min*2^32 term dominates and
- * sort ordering is preserved; exact tie-breaking between pairs with
- * identical min priority may lose a few low bits. All pure-JS ICE
- * implementations share this limitation.
+ * Exact, as a BigInt: the value reaches 2^63 for real candidate
+ * priorities (~2^31 each), far past Number.MAX_SAFE_INTEGER (2^53), and a
+ * double drops the low bits — the 2*MAX(G,D) and G>D terms that order two
+ * pairs sharing MIN(G,D). Pairs of the same remote candidate and two local
+ * ones one apart (2130706431 / 2130706430 against 2113929471) came out
+ * equal, and their order was the order they were formed in.
+ *
+ * A candidate priority is a 32-bit positive integer (RFC 8445 §5.1.2.1);
+ * anything else a peer signals (NaN, a fraction, out of range) is taken
+ * as its integer part clamped to [0, 2^32 - 1], so the result is always
+ * defined. Compare the results with < > === (never subtract them into a
+ * sort comparator: Array.prototype.sort cannot take a BigInt).
  */
+function pairPriorityInput(p) {
+  const n = Math.trunc(Number(p));
+  if (!(n > 0)) return 0n;                       // NaN, negative, 0
+  return BigInt(n > 0xFFFFFFFF ? 0xFFFFFFFF : n);
+}
+
 function computePairPriority(controlling, localPriority, remotePriority) {
-  const G = controlling ? localPriority : remotePriority;
-  const D = controlling ? remotePriority : localPriority;
-  const min = Math.min(G, D);
-  const max = Math.max(G, D);
-  return (min * 0x100000000) + (max * 2) + (G > D ? 1 : 0);
+  const G = pairPriorityInput(controlling ? localPriority : remotePriority);
+  const D = pairPriorityInput(controlling ? remotePriority : localPriority);
+  const min = G < D ? G : D;
+  const max = G < D ? D : G;
+  return (min << 32n) + (max * 2n) + (G > D ? 1n : 0n);
 }
 
 

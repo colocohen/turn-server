@@ -31,12 +31,38 @@ function coarseNow() {
 }
 
 
-// RFC 8489 §9.2 structured nonce: hex(unix seconds) ":" HMAC(key, ts + scope)
-// truncated to 16 hex digits; scope binds it to the client's ip:port.
+// RFC 8489 §9.2: the "nonce cookie" an RFC 8489 server puts before its
+// nonce — "obMatJos2" and the base64 of the 24-bit STUN Security Features
+// (§18.1: bit 0, "Password algorithms", the most significant; bit 1,
+// "Username anonymity"). { passwordAlgorithms, usernameAnonymity }, or null
+// when the nonce does not start with a cookie (an RFC 5389 server's).
+var NONCE_COOKIE = 'obMatJos2';
+var BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+export function nonceSecurityFeatures(nonce) {
+  if (typeof nonce !== 'string' || nonce.length < 13 || nonce.slice(0, 9) !== NONCE_COOKIE) return null;
+  var bits = 0;
+  for (var i = 9; i < 13; i++) {
+    var v = BASE64.indexOf(nonce[i]);
+    if (v < 0) return null;
+    bits = bits * 64 + v;
+  }
+  return { passwordAlgorithms: (bits & 0x800000) !== 0, usernameAnonymity: (bits & 0x400000) !== 0 };
+}
+
+// This server's cookie: "Password algorithms" set — every 401 and 438 it
+// sends carries PASSWORD-ALGORITHMS, and §9.2.4 says such a server "MUST
+// set the STUN Security Feature 'Password algorithms' bit to 1". Its
+// nonces had no cookie at all: a client could not tell a list stripped on
+// the way (the bid-down §9.2.1 guards against) from an RFC 5389 server.
+var SERVER_NONCE_COOKIE = NONCE_COOKIE + 'gAAA';
+
+// RFC 8489 §9.2 structured nonce: the cookie, hex(unix seconds) ":"
+// HMAC(key, ts + scope) truncated to 16 hex digits; scope binds it to the
+// client's ip:port.
 export function makeNonce(key, scope) {
   var timestamp = Math.floor(Date.now() / 1000).toString(16);
   var mac = nonce_mac(key, timestamp, scope);
-  return timestamp + ':' + mac;
+  return SERVER_NONCE_COOKIE + timestamp + ':' + mac;
 }
 
 function Session(options) {
@@ -78,6 +104,9 @@ function Session(options) {
 
     // RFC 8489 — client chosen password algorithm (0x0001=MD5, 0x0002=SHA256)
     passwordAlgorithm: options.passwordAlgorithm || null,
+    // The PASSWORD-ALGORITHMS of the 401 the algorithm was chosen from: sent
+    // back with PASSWORD-ALGORITHM (RFC 8489 §9.2.5, checked by §9.2.4).
+    passwordAlgorithms: null,
 
     // source address of the remote side (set by transport layer)
     source: options.source || null,   // { ip, port, family }
@@ -226,7 +255,9 @@ function Session(options) {
   }
 
   function validate_nonce(nonce, scope) {
-    if (!nonce || nonce.indexOf(':') < 0) return false;
+    if (!nonce || nonce.slice(0, SERVER_NONCE_COOKIE.length) !== SERVER_NONCE_COOKIE) return false;
+    nonce = nonce.slice(SERVER_NONCE_COOKIE.length);
+    if (nonce.indexOf(':') < 0) return false;
     var parts = nonce.split(':');
     var timestamp = parts[0];
     var mac = parts[1];
@@ -934,24 +965,49 @@ function Session(options) {
   }
 
   // RFC 5389 §11 — Long-term credential: USERNAME + REALM + NONCE + INTEGRITY
+  //
+  // RFC 8489 §9.2.4's checks, in its order: no MESSAGE-INTEGRITY(-SHA256) →
+  // 401; integrity without USERNAME, REALM or NONCE → 400; the nonce cookie's
+  // "Password algorithms" bit → PASSWORD-ALGORITHMS / PASSWORD-ALGORITHM as
+  // offered, else 400; an unknown user → 401; a wrong integrity → 401; a
+  // stale nonce → 438. They ran in another order: a request with integrity
+  // but no USERNAME got 401 (the RFC: 400); the nonce came before the
+  // credentials (a stale nonce with a wrong password got 438, the RFC: 401);
+  // and PASSWORD-ALGORITHM was checked alone — MD5 without the list it must
+  // come with (the bid-down check, §9.2.1) was taken.
   function authenticate_long_term(msg, raw) {
     var username = msg.getAttribute(wire.ATTR.USERNAME);
     var msg_realm = msg.getAttribute(wire.ATTR.REALM);
     var msg_nonce = msg.getAttribute(wire.ATTR.NONCE);
 
-    if (username === null || msg_realm === null || msg_nonce === null) {
-      send_challenge(msg);
-      return;
-    }
-
-    if (!validate_nonce(msg_nonce) && !valid_control_nonce(msg, msg_nonce)) {
-      send_stale_nonce(msg);
-      return;
-    }
-
     if (msg.integrity_offset === null && msg.integrity_sha256_offset === null) {
       send_challenge(msg);
       return;
+    }
+
+    if (username === null || msg_realm === null || msg_nonce === null) {
+      ev.emit('auth:failure', { username: username, code: 400, reason: 'missing-credentials' });
+      send_error(msg, 400, null, null);
+      return;
+    }
+
+    // The nonce cookie says PASSWORD-ALGORITHMS was sent with this nonce
+    // (always MD5 alone, see send_challenge): the request has neither it nor
+    // PASSWORD-ALGORITHM (processed as MD5), or both — the list as it was
+    // sent, the algorithm one of it.
+    var features = nonceSecurityFeatures(msg_nonce);
+    if (features && features.passwordAlgorithms) {
+      var client_algo = msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHM);
+      var client_algos = msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHMS);
+      if (client_algo !== null || client_algos !== null) {
+        var offered = client_algos !== null && client_algos.length === 1 && client_algos[0].algorithm === 0x0001 &&
+                      client_algos[0].params.length === 0;
+        if (!(client_algo !== null && offered && client_algo.algorithm === 0x0001)) {
+          ev.emit('auth:failure', { username: username, code: 400, reason: 'algorithm-mismatch' });
+          send_error(msg, 400, null, null);
+          return;
+        }
+      }
     }
 
     get_key_for_user(username, function(key) {
@@ -963,16 +1019,6 @@ function Session(options) {
         return;
       }
 
-      // A PASSWORD-ALGORITHM other than the one offered (MD5): RFC 8489
-      // §9.2.4 — 400. This used to be checked only for MESSAGE-INTEGRITY; with
-      // MESSAGE-INTEGRITY-SHA256 a client naming SHA-256 slipped through to a
-      // key check that could never pass.
-      var client_algo = msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHM);
-      if (client_algo && client_algo.algorithm !== 0x0001) {
-        ev.emit('auth:failure', { username: username, code: 400, reason: 'algorithm-mismatch' });
-        send_error(msg, 400, null, null);
-        return;
-      }
       // Answer with the integrity type the request used (RFC 8489 §9.2.4).
       if (msg.integrity_sha256_offset !== null) msg._integrity = 'sha256';
 
@@ -989,9 +1035,10 @@ function Session(options) {
         return;
       }
 
-      // RFC 8489 §9.2.1 — bid-down attack prevention
-      // If server advertised PASSWORD-ALGORITHMS, client SHOULD include PASSWORD-ALGORITHM
-      // If client uses SHA1 but SHA256 was offered, SHOULD reject
+      if (!validate_nonce(msg_nonce) && !valid_control_nonce(msg, msg_nonce)) {
+        send_stale_nonce(msg);
+        return;
+      }
 
       // Wrong credentials check
       if (context.allocation && context.allocation.username !== null) {
@@ -1034,7 +1081,7 @@ function Session(options) {
       }
 
       switch (msg.method) {
-        case wire.METHOD.BINDING:           handle_binding(msg); break;
+        case wire.METHOD.BINDING:           handle_binding(msg, key); break;
         case wire.METHOD.ALLOCATE:          handle_allocate(msg, key); break;
         case wire.METHOD.REFRESH:           handle_refresh(msg, key); break;
         case wire.METHOD.CREATE_PERMISSION: handle_create_permission(msg, key); break;
@@ -1049,8 +1096,13 @@ function Session(options) {
 
   /* ====================== Server handlers ====================== */
 
-  function handle_binding(msg) {
-    if (context.source === null) { send_error(msg, 400, null, null); return; }
+  // key: an authenticated Binding's (secureStun), whose answers carry its
+  // integrity (RFC 8489 §9.2.4: "Any response generated by the server MUST
+  // include" it); they went out without, which a client checking the
+  // response (§9.2.5) discards.
+  function handle_binding(msg, key) {
+    key = key || null;
+    if (context.source === null) { send_error(msg, 400, null, key); return; }
 
     // Hook: beforeBindingResponse — a Binding response is larger than the
     // request that triggered it, and the source address of a UDP request is
@@ -1081,12 +1133,27 @@ function Session(options) {
       // RFC 5780 — CHANGE-REQUEST: client asks response from different IP/port
       var change = msg.getAttribute(wire.ATTR.CHANGE_REQUEST);
       if (change) {
-        // Emit 'change_request' — Socket layer must send the response from the alternate address
-        ev.emit('change_request', msg, change, response_attrs);
-        return; // Socket layer sends the response
+        // RFC 5780 §6.1: a server without an alternate address "MUST generate
+        // an error response of type 420". The request was handed to the
+        // Socket layer anyway, which has nothing to send it from and answered
+        // nothing: the client's NAT test waited out its whole retransmission.
+        if (!context.secondaryAddress) {
+          send_error(msg, 420, [
+            { type: wire.ATTR.ERROR_CODE, value: { code: 420 } },
+            { type: wire.ATTR.UNKNOWN_ATTRIBUTES, value: [wire.ATTR.CHANGE_REQUEST] },
+          ], key);
+          return;
+        }
+        // Neither flag set: the response comes from the address and port the
+        // request came to (§6.1, Table 1) — a plain Binding response.
+        if (change.changeIp || change.changePort) {
+          // Emit 'change_request' — Socket layer must send the response from the alternate address
+          ev.emit('change_request', msg, change, response_attrs);
+          return; // Socket layer sends the response
+        }
       }
 
-      send_success(msg, response_attrs, null);
+      send_success(msg, response_attrs, key);
     });
   }
 
@@ -1142,8 +1209,14 @@ function Session(options) {
       }
     }
 
-    // RESERVATION-TOKEN and EVEN-PORT together is invalid
-    if (reservation_token !== null && even_port !== null) {
+    var requested_family = msg.getAttribute(wire.ATTR.REQUESTED_ADDRESS_FAMILY);
+    var additional_family = msg.getAttribute(wire.ATTR.ADDITIONAL_ADDRESS_FAMILY);
+
+    // RESERVATION-TOKEN and EVEN-PORT together is invalid — and so is a token
+    // with REQUESTED- or ADDITIONAL-ADDRESS-FAMILY (RFC 8656 §7.2 (5): the
+    // token names the reserved address, its family included). Only EVEN-PORT
+    // was refused; with a family the token was taken and the family ignored.
+    if (reservation_token !== null && (even_port !== null || requested_family !== null || additional_family !== null)) {
       send_error(msg, 400, null, key);
       return;
     }
@@ -1160,11 +1233,23 @@ function Session(options) {
       return;
     }
 
+    // RFC 8656 §7.2 (6): REQUESTED-ADDRESS-FAMILY and ADDITIONAL-ADDRESS-FAMILY
+    // together → 400. The additional family used to be dropped quietly.
+    if (requested_family !== null && additional_family !== null) { send_error(msg, 400, null, key); return; }
+
     // RFC 6156 — REQUESTED-ADDRESS-FAMILY (0x0017)
-    var requested_family = msg.getAttribute(wire.ATTR.REQUESTED_ADDRESS_FAMILY);
     if (requested_family !== null && requested_family !== wire.FAMILY.IPV4 && requested_family !== wire.FAMILY.IPV6) {
       send_error(msg, 440, null, key); // Address Family not Supported
       return;
+    }
+
+    // RFC 8656 §7.2 (8): EVEN-PORT with the R bit and ADDITIONAL-ADDRESS-FAMILY
+    // → 400 (two reservation tokens would be needed). (9): the additional
+    // family "MUST be set to 0x02" — 0x01 (or anything else) → 400. Both used
+    // to be accepted, the additional family dropped without a word.
+    if (additional_family !== null) {
+      if (even_port !== null && even_port.reserve) { send_error(msg, 400, null, key); return; }
+      if (additional_family !== wire.FAMILY.IPV6) { send_error(msg, 400, null, key); return; }
     }
 
     // Quota event — same deferred contract as the hooks (sync or async).
@@ -1238,16 +1323,9 @@ function Session(options) {
     alloc.dontFragment = msg.getAttribute(wire.ATTR.DONT_FRAGMENT) || false;
     alloc.requestedFamily = requested_family;
 
-    // RFC 8656 — ADDITIONAL-ADDRESS-FAMILY for dual-stack allocation
-    var additional_family = msg.getAttribute(wire.ATTR.ADDITIONAL_ADDRESS_FAMILY);
-    if (additional_family !== null) {
-      if (additional_family !== wire.FAMILY.IPV4 && additional_family !== wire.FAMILY.IPV6) {
-        additional_family = null;
-      } else if (additional_family === requested_family || (requested_family === null && additional_family === wire.FAMILY.IPV4)) {
-        additional_family = null;
-      }
-    }
-    alloc.additionalFamily = additional_family;
+    // RFC 8656 — ADDITIONAL-ADDRESS-FAMILY for dual-stack allocation: IPv6 or
+    // none (handle_allocate refused every other combination with 400).
+    alloc.additionalFamily = msg.getAttribute(wire.ATTR.ADDITIONAL_ADDRESS_FAMILY);
 
     // Deferred response: Socket needs to bind relay port first, then call alloc.confirm(addr)
     // If nobody calls confirm synchronously during the 'allocate' event, send response immediately
@@ -1264,6 +1342,14 @@ function Session(options) {
         { type: wire.ATTR.XOR_MAPPED_ADDRESS, value: context.source },
         { type: wire.ATTR.LIFETIME, value: alloc.lifetime },
       ];
+      // RFC 8656 §7.2 (9): a dual allocation the server can meet only in part
+      // — one relayed address, no IPv6 one (the Socket layer binds a single
+      // relay) — says why in ADDRESS-ERROR-CODE. The success used to look like
+      // an ordinary one, and the client waited for an IPv6 relay it never got.
+      if (alloc.additionalFamily !== null) {
+        success_attrs.push({ type: wire.ATTR.ADDRESS_ERROR_CODE, value:
+          { family: wire.FAMILY.IPV6, code: 440, reason: wire.ERROR_REASON[440] } });
+      }
       // RFC 5766 §14.9 — EVEN-PORT with the R bit reserves port+1; the token
       // identifying the reservation MUST be returned in the success response.
       if (extra && extra.reservationToken) {
@@ -1294,8 +1380,16 @@ function Session(options) {
   function handle_refresh(msg, key) {
     if (context.allocation === null) { send_error(msg, 437, null, key); return; }
 
+    // RFC 8656 §8.2: a REQUESTED-ADDRESS-FAMILY that is not the allocation's
+    // family → 443 (it was ignored).
+    var refresh_family = msg.getAttribute(wire.ATTR.REQUESTED_ADDRESS_FAMILY);
+    if (refresh_family !== null && refresh_family !== relay_family()) { send_error(msg, 443, null, key); return; }
+
+    // §8.2: without a LIFETIME the desired lifetime is the default one. It was
+    // the allocation's current lifetime — up to maxAllocateLifetime for a
+    // client that asked for that once, on every Refresh after.
     var lifetime = msg.getAttribute(wire.ATTR.LIFETIME);
-    if (lifetime === null) lifetime = context.allocation.lifetime;
+    if (lifetime === null) lifetime = context.defaultAllocateLifetime;
 
     // Hook: beforeRefresh — can modify lifetime or reject
     var refresh_info = {
@@ -1375,6 +1469,11 @@ function Session(options) {
         return;
       }
 
+      // The allocation can expire while the previous peer's hook is pending
+      // (an asynchronous one): 437, as at the end of the walk. Reading its
+      // username threw a TypeError out of the hook's cb — in an asynchronous
+      // listener an uncaught exception, the whole server down.
+      if (context.allocation === null) { send_error(msg, 437, null, key); return; }
       var peer = peers[j++];
       check_hook('beforePermission', {
         username: context.allocation.username,
@@ -1584,26 +1683,92 @@ function Session(options) {
   // Pending request tracking for auto-retry on 401/438
   var _pendingRequest = null; // { method, attributes, retries }
   var _pendingTransactionId = null; // 12-byte Uint8Array
+  // How the request in progress was protected: { mech, key, integrity,
+  // username, userhash, realm, password } — the key and MESSAGE-INTEGRITY
+  // variant its response is checked with (RFC 8489 §9.1.4 / §9.2.5), the
+  // credentials a 401 retry must change (§9.2.5). null: it carried none.
+  var _pendingAuth = null;
+  // A response to it was discarded for its integrity: if none is taken, the
+  // transaction ends in 'integrity_violation', not 'timeout' (§9.2.5).
+  var _integrityDiscarded = false;
 
-  function process_client_message(msg) {
-    // RFC 8489 §6.3.3: client MUST verify transactionId matches pending request.
-    // Responses only: an indication (a Data indication, a ConnectionAttempt)
-    // has a transaction id of its own, and was dropped whenever it came in
-    // while a request was outstanding — a Refresh in flight lost relayed data.
-    if (_pendingTransactionId !== null && msg.transactionId &&
-        (msg.cls === wire.CLASS.SUCCESS || msg.cls === wire.CLASS.ERROR)) {
+  function end_transaction() {
+    _pendingRequest = null;
+    _pendingTransactionId = null;
+    _pendingAuth = null;
+    _integrityDiscarded = false;
+    stop_retransmission();
+  }
+
+  // The first algorithm of a PASSWORD-ALGORITHMS list this client supports
+  // (MD5, SHA-256), or null.
+  function first_supported_algorithm(list) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].algorithm === 0x0001 || list[i].algorithm === 0x0002) return list[i].algorithm;
+    }
+    return null;
+  }
+
+  // RFC 8489 §9.2.5 / §9.1.4: is this response to the transaction in
+  // progress to be taken? false: discarded, as if it had never been received.
+  // Responses were taken whatever their integrity: anyone on the path (or,
+  // over UDP, anyone who could guess the transaction) could answer an
+  // authenticated Allocate, Refresh or CreatePermission.
+  function response_authentic(msg, raw, code) {
+    var has_mi = msg.integrity_offset !== null || msg.integrity_sha256_offset !== null;
+    // "For all other responses" than 401 and 438, a nonce cookie with the
+    // "Password algorithms" bit and no PASSWORD-ALGORITHMS: ignored.
+    if (context.authMech === 'long-term' && code !== 401 && code !== 438) {
+      var features = nonceSecurityFeatures(msg.getAttribute(wire.ATTR.NONCE));
+      if (features && features.passwordAlgorithms && msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHMS) === null) return false;
+    }
+    var a = _pendingAuth;
+    if (a === null) return true; // the request carried no integrity: nothing to check it with
+    if (a.mech === 'long-term') {
+      // A 400 without integrity: discarded, and the transaction times out
+      // (§9.2.5 — the server's bid-down 400 carries none).
+      if (code === 400 && !has_mi) return false;
+      // The challenges: 401 and 438 come from the server's own checks
+      // failing (§9.2.4: "SHOULD NOT include" integrity; 438 "MAY"), and
+      // §9.2.5 acts on them (the retry) before it looks at the integrity.
+      if ((code === 401 || code === 438) && !has_mi) return true;
+    }
+    // The variant the request carried, with its key: the response "has to
+    // match" (§9.1.4; §9.2.4 has the server answer with the request's).
+    var off = a.integrity === 'sha256' ? msg.integrity_sha256_offset : msg.integrity_offset;
+    if (off !== null && (a.integrity === 'sha256' ? wire.validate_integrity_sha256 : wire.validate_integrity)(raw, off, a.key)) return true;
+    // Integrity protection violated. Unreliable transport: discarded, the
+    // retransmissions go on, and if no response is taken the transaction
+    // ends in 'integrity_violation'. Reliable: the transaction ends now.
+    if (_rtoBase !== null) { _integrityDiscarded = true; return false; }
+    end_transaction();
+    ev.emit('integrity_violation');
+    return false;
+  }
+
+  function process_client_message(msg, raw) {
+    // RFC 8489 §6.3: a response's transaction ID must match a transaction
+    // still in progress, else it is silently discarded. Responses only: an
+    // indication (a Data indication, a ConnectionAttempt) has a transaction id
+    // of its own, and was dropped whenever it came in while a request was
+    // outstanding — a Refresh in flight lost relayed data. With none in
+    // progress every response was taken: a duplicate of one already answered
+    // (a retransmitted request answered twice) was a second 'success', and one
+    // after the 'timeout' a success of a transaction already failed.
+    if (msg.cls === wire.CLASS.SUCCESS || msg.cls === wire.CLASS.ERROR) {
+      if (_pendingTransactionId === null || !msg.transactionId) return;
       var match = true;
       for (var ti = 0; ti < 12; ti++) {
         if (msg.transactionId[ti] !== _pendingTransactionId[ti]) { match = false; break; }
       }
       if (!match) return; // silently discard unmatched response
+      var ecode = msg.cls === wire.CLASS.ERROR ? msg.getAttribute(wire.ATTR.ERROR_CODE) : null;
+      if (!response_authentic(msg, raw, ecode ? ecode.code : null)) return;
     }
 
     if (msg.cls === wire.CLASS.SUCCESS) {
       if (msg.method === wire.METHOD.CHANNEL_BIND && _pendingRequest) note_client_channel(_pendingRequest.attributes);
-      _pendingRequest = null;
-      _pendingTransactionId = null;
-      stop_retransmission();
+      end_transaction();
       ev.emit('success', msg);
       ev.emit((wire.METHOD_NAME[msg.method] || 'unknown') + ':success', msg);
       return;
@@ -1616,9 +1781,7 @@ function Session(options) {
       if (err && err.code === 300) {
         var alt_server = msg.getAttribute(wire.ATTR.ALTERNATE_SERVER);
         var alt_domain = msg.getAttribute(wire.ATTR.ALTERNATE_DOMAIN);
-        _pendingRequest = null;
-        _pendingTransactionId = null;
-        stop_retransmission();
+        end_transaction();
         ev.emit('redirect', { server: alt_server, domain: alt_domain });
         return;
       }
@@ -1628,40 +1791,68 @@ function Session(options) {
         var new_realm = msg.getAttribute(wire.ATTR.REALM);
         var new_nonce = msg.getAttribute(wire.ATTR.NONCE);
         if (new_realm && new_nonce && context.username && context.password) {
-          context.realm = new_realm;
-          context.nonce = new_nonce;
-          _clientKeyInputs = null; // invalidate key cache
-
-          // RFC 8489 §9.2.1 — bid-down prevention: extract PASSWORD-ALGORITHMS
+          // RFC 8489 §9.2.5 — the algorithm is the FIRST on the server's
+          // PASSWORD-ALGORITHMS that this client supports (MD5, SHA-256), and
+          // the list goes back as it came (bid-down prevention, §9.2.4). One
+          // chosen before is not kept: it used to stay SHA-256 when the new
+          // 401 offered only MD5 (the server then answered 400), and a number
+          // this client does not know was adopted as it was. No list (an RFC
+          // 5389 server): MD5, and no PASSWORD-ALGORITHM(S) at all.
+          //
+          // No retry (MUST NOT): a list with nothing supported (an empty one
+          // too: it was taken for no list); a nonce cookie with the "Password
+          // algorithms" bit and no list (a bid-down); the same username (or
+          // USERHASH), realm and password as the attempt that drew this 401.
+          // With the cookie's "Username anonymity" bit the retry carries
+          // USERHASH (send_client_request reads it from the nonce).
+          var features = nonceSecurityFeatures(new_nonce);
           var pw_algos = msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHMS);
-          if (pw_algos && pw_algos.length > 0) {
-            // Prefer SHA256 (0x0002) over MD5 (0x0001)
-            for (var pa = 0; pa < pw_algos.length; pa++) {
-              if (pw_algos[pa].algorithm === 0x0002) { context.passwordAlgorithm = 0x0002; break; }
-            }
-            if (!context.passwordAlgorithm) context.passwordAlgorithm = pw_algos[0].algorithm;
-          }
+          var chosen = pw_algos !== null ? first_supported_algorithm(pw_algos) : null;
+          var userhash = !!(features && features.usernameAnonymity);
+          var prev = _pendingAuth;
+          var unchanged = prev !== null && prev.username === context.username && prev.userhash === userhash &&
+                          prev.realm === new_realm && prev.password === context.password;
+          var bid_down = !!(features && features.passwordAlgorithms) && pw_algos === null;
+          if ((pw_algos === null || chosen !== null) && !bid_down && !unchanged) {
+            context.realm = new_realm;
+            context.nonce = new_nonce;
+            _clientKeyInputs = null; // invalidate key cache
+            context.passwordAlgorithm = chosen;
+            context.passwordAlgorithms = chosen !== null ? pw_algos : null;
 
-          _pendingRequest.retries++;
-          send_client_request(_pendingRequest.method, _pendingRequest.attributes, null, true);
-          return;
+            _pendingRequest.retries++;
+            send_client_request(_pendingRequest.method, _pendingRequest.attributes, null, true);
+            return;
+          }
         }
       }
 
-      // Auto-retry on 438 Stale Nonce — extract new nonce and resend
+      // Auto-retry on 438 Stale Nonce — extract new nonce and resend.
+      // RFC 8489 §9.2.5: not with a nonce cookie whose "Password algorithms"
+      // bit is set and no PASSWORD-ALGORITHMS (a bid-down); a list it does
+      // carry is the one the server checks the retry against (§9.2.4), so the
+      // algorithm is chosen from it as after a 401 (none supported: no retry).
       if (err && err.code === 438 && _pendingRequest && _pendingRequest.retries < 1) {
         var stale_nonce = msg.getAttribute(wire.ATTR.NONCE);
         if (stale_nonce) {
-          context.nonce = stale_nonce;
-          _pendingRequest.retries++;
-          send_client_request(_pendingRequest.method, _pendingRequest.attributes, null, true);
-          return;
+          var sfeatures = nonceSecurityFeatures(stale_nonce);
+          var s_algos = msg.getAttribute(wire.ATTR.PASSWORD_ALGORITHMS);
+          var s_chosen = s_algos !== null ? first_supported_algorithm(s_algos) : null;
+          if (!(sfeatures && sfeatures.passwordAlgorithms && s_algos === null) && (s_algos === null || s_chosen !== null)) {
+            context.nonce = stale_nonce;
+            if (s_algos !== null) {
+              _clientKeyInputs = null;
+              context.passwordAlgorithm = s_chosen;
+              context.passwordAlgorithms = s_algos;
+            }
+            _pendingRequest.retries++;
+            send_client_request(_pendingRequest.method, _pendingRequest.attributes, null, true);
+            return;
+          }
         }
       }
 
-      _pendingRequest = null;
-      _pendingTransactionId = null;
-      stop_retransmission();
+      end_transaction();
       ev.emit('error_response', msg, err);
       ev.emit((wire.METHOD_NAME[msg.method] || 'unknown') + ':error', msg, err);
       return;
@@ -1719,7 +1910,8 @@ function Session(options) {
   var _rtoTimer = null;
   var _rtoAttempt = 0;
   var _rtoLastBuf = null;
-  var _rtoMaxRetries = 7;
+  var _rtoMaxRetries = 7;   // Rc
+  var _rtoRm = 16;          // Rm
   var _rtoBase = context.rto || null;
   var _tcpTimeout = options.tcpTimeout || 39500; // Ti = 39.5s default
 
@@ -1734,24 +1926,35 @@ function Session(options) {
       // TCP/TLS/WS mode: reliable transport — a single transaction timeout Ti
       // (RFC 8489 §6.2.2), no retransmission.
       _rtoLastBuf = buf;
-      _rtoTimer = setTimeout(function() {
-        _rtoTimer = null;
-        _pendingRequest = null;
-        _pendingTransactionId = null;
-        ev.emit('timeout');
-      }, _tcpTimeout);
+      _rtoTimer = setTimeout(transaction_timeout, _tcpTimeout);
     }
   }
 
+  // The transaction failed (RFC 8489 §6.2.1 / §6.2.2): it is over, and an
+  // answer that comes after is not its answer. Over UDP the request used to
+  // stay pending, and a late success was taken after the 'timeout'.
+  //
+  // Responses came and every one was discarded for its integrity: RFC 8489
+  // §9.2.5 — "instead of signaling a timeout after ending the transaction,
+  // the layer MUST signal that the integrity protection was violated".
+  function transaction_timeout() {
+    _rtoTimer = null;
+    var violated = _integrityDiscarded;
+    end_transaction();
+    ev.emit(violated ? 'integrity_violation' : 'timeout');
+  }
+
+  // RFC 8489 §6.2.1: Rc (7) requests in all, the interval starting at RTO
+  // and doubling, then Rm (16) times the RTO after the last — with an RTO of
+  // 500 ms, sent at 0, 0.5, 1.5, 3.5, 7.5, 15.5 and 31.5 s, failed at
+  // 39.5 s. It sent 8, each interval capped at 16 RTO, and failed at the
+  // moment of the last (31.5 s).
   function schedule_retransmit() {
-    if (_rtoAttempt >= _rtoMaxRetries) {
-      // Timeout — no response
-      stop_retransmission();
-      ev.emit('timeout');
+    if (_rtoAttempt >= _rtoMaxRetries - 1) {
+      _rtoTimer = setTimeout(transaction_timeout, _rtoRm * _rtoBase);
       return;
     }
     var delay = _rtoBase * Math.pow(2, _rtoAttempt);
-    if (delay > 16 * _rtoBase) delay = 16 * _rtoBase; // Rm cap
     _rtoTimer = setTimeout(function() {
       _rtoAttempt++;
       ev.emit('message', _rtoLastBuf); // resend
@@ -1775,11 +1978,26 @@ function Session(options) {
       _pendingRequest = { method: method, attributes: attributes, retries: 0 };
     }
 
-    // Build auth attributes
+    // Build auth attributes.
+    // A Binding is plain STUN on a TURN server (RFC 8656 gives it no
+    // authentication): sent without the long-term credentials, and with them
+    // only when the server challenges it (the 401 retry, secureStun). Sent
+    // authenticated, a server that does not authenticate Binding (coturn,
+    // this one without secureStun) answers without integrity, and the
+    // response is discarded (RFC 8489 §9.2.5).
+    // With the nonce cookie's "Username anonymity" bit, USERHASH instead of
+    // USERNAME (§9.2.5: "MUST be used").
     var final_attrs = attributes;
-    if (context.authMech === 'long-term' && context.username && context.realm && context.nonce) {
+    var authenticated = false;
+    var userhash = false;
+    if (context.authMech === 'long-term' && context.username && context.realm && context.nonce &&
+        (method !== wire.METHOD.BINDING || _isAuthRetry)) {
+      authenticated = true;
+      var features = nonceSecurityFeatures(context.nonce);
+      userhash = !!(features && features.usernameAnonymity);
       final_attrs = attributes.concat([
-        { type: wire.ATTR.USERNAME, value: context.username },
+        userhash ? { type: wire.ATTR.USERHASH, value: wire.compute_userhash(context.username, context.realm) }
+                 : { type: wire.ATTR.USERNAME, value: context.username },
         { type: wire.ATTR.REALM, value: context.realm },
         { type: wire.ATTR.NONCE, value: context.nonce },
       ]);
@@ -1789,8 +2007,13 @@ function Session(options) {
       ]);
     }
 
-    // Client may echo PASSWORD-ALGORITHM to indicate chosen algo
-    if (context.authMech === 'long-term' && context.passwordAlgorithm) {
+    // The chosen algorithm, with the server's list it came from (RFC 8489
+    // §9.2.5). Only with the credentials: the first request carries neither
+    // (§9.2.3.1); it used to carry PASSWORD-ALGORITHM alone.
+    if (authenticated && context.passwordAlgorithm) {
+      if (context.passwordAlgorithms) {
+        final_attrs = final_attrs.concat([{ type: wire.ATTR.PASSWORD_ALGORITHMS, value: context.passwordAlgorithms }]);
+      }
       final_attrs = final_attrs.concat([
         { type: wire.ATTR.PASSWORD_ALGORITHM, value: { algorithm: context.passwordAlgorithm, params: new Uint8Array(0) } },
       ]);
@@ -1804,23 +2027,41 @@ function Session(options) {
     // the server advertised PASSWORD-ALGORITHMS), the MESSAGE-INTEGRITY
     // variant MUST match. Otherwise the server sees mismatched algo/integrity
     // and rejects with 400 Bad Request (bid-down protection).
+    // And once the server sent PASSWORD-ALGORITHMS, every request carries
+    // MESSAGE-INTEGRITY-SHA256 only, whichever algorithm made the key (RFC
+    // 8489 §9.2.5).
     var integrity_algo = 'sha1';
-    if (context.authMech === 'long-term' && context.passwordAlgorithm === 0x0002) {
+    if (context.authMech === 'long-term' && (context.passwordAlgorithm === 0x0002 || (authenticated && context.passwordAlgorithms))) {
       integrity_algo = 'sha256';
     }
+
+    // MESSAGE-INTEGRITY only with the credentials it is computed from: a
+    // long-term request before the server's nonce (RFC 8489 §9.2.3.1: the
+    // first request "MUST omit" it) carried one whenever a realm was known
+    // (an option), with no USERNAME; a short-term one only with USERNAME
+    // (§9.1.2).
+    var key = (authenticated || (context.authMech === 'short-term' && context.username)) ? get_client_key() : null;
 
     var result = wire.encode_message({
       method: method,
       cls: wire.CLASS.REQUEST,
       attributes: final_attrs,
-      key: get_client_key(),
+      key: key,
       integrity: integrity_algo,
       fingerprint: context.useFingerprint !== false,
     });
 
-    ev.emit('message', result.buf);
+    // In progress before it is sent: an answer that comes back inside the
+    // send (a transport that delivers synchronously) finds its transaction.
     _pendingTransactionId = result.transactionId;
+    _pendingAuth = key ? {
+      mech: context.authMech, key: key, integrity: integrity_algo,
+      username: authenticated ? context.username : null, userhash: userhash,
+      realm: authenticated ? context.realm : null, password: context.password,
+    } : null;
+    _integrityDiscarded = false;
     start_retransmission(result.buf);
+    ev.emit('message', result.buf);
     if (cb) cb(null, result.transactionId);
   }
 

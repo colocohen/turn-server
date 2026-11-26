@@ -962,7 +962,8 @@ function IceAgent(options) {
       const p = context.checkList[i];
       p.priority = computePairPriority(context.controlling, p.local.priority, p.remote.priority);
     }
-    context.checkList.sort((a, b) => b.priority - a.priority);
+    // (BigInt priorities: compared, never subtracted — ice_candidate.js)
+    context.checkList.sort((a, b) => (b.priority > a.priority) ? 1 : (b.priority < a.priority) ? -1 : 0);
     // A pair pruned under its old priority that now outranks the selected
     // one is worth checking again — pruning only ever drops dominated pairs.
     const sel = context.selectedPair;
@@ -1717,6 +1718,12 @@ function IceAgent(options) {
     try {
       const type = family === 'IPv6' ? 'udp6' : 'udp4';
       const sock = dgram.createSocket(udpSocketOptions({ type, reuseAddr: true }, context.socketBufferSize));
+      // A bind that fails (EADDRNOTAVAIL: an IPv6 address still tentative,
+      // an address gone since networkInterfaces()) is an 'error' and no
+      // bind callback: cb was never called, gatherHostCandidates' count
+      // never reached 0 and gatheringState stayed 'gathering' — no
+      // end-of-candidates (RFC 8838 §4). It ends this address's attempt.
+      let bindSettled = false;
 
       sock.on('message', function(buf, rinfo) {
         // HOT PATH: Node dgram delivers Buffer (a Uint8Array subclass).
@@ -1733,6 +1740,11 @@ function IceAgent(options) {
           _diagLog('[ice-diag] ' + _diagTs() + ' SOCKET ERROR (unbound) — ' + (err && err.message));
         }
         ev.emit('error', err);
+        if (!bindSettled) {
+          bindSettled = true;
+          try { sock.close(); } catch (_) {}
+          cb(null, null);
+        }
       });
 
       sock.on('close', function() {
@@ -1746,6 +1758,8 @@ function IceAgent(options) {
       });
 
       sock.bind({ address: ip, port: 0, exclusive: false }, function() {
+        if (bindSettled) return;
+        bindSettled = true;
         let bound;
         try { bound = sock.address(); } catch (e) { cb(null, null); return; }
         sock.__diagBound = bound.address + ':' + bound.port;
@@ -1784,6 +1798,15 @@ function IceAgent(options) {
     });
     const txHex = txIdHex(encoded.transactionId);
 
+    // The gathering timeout. Declared before finish() reads it: finish can
+    // run before the timer is armed — resolveHost answers a literal at once,
+    // and an IPv4 STUN server on an IPv6 base (any dual-stack host) fails
+    // there and then. With `const timer` below, that read was in the
+    // temporal dead zone: a ReferenceError thrown out of gather() (or the
+    // socket's bind callback), the remaining srflx / relay gathering never
+    // started, and gatheringState stuck at 'gathering' — no end-of-candidates
+    // (RFC 8838 §4: the agent signals it when gathering ends).
+    let timer = null;
     let finished = false;
     function finish(err, info) {
       if (finished) return;
@@ -1855,10 +1878,12 @@ function IceAgent(options) {
       }
     }, sockFamily);
 
-    const timer = setTimeout(function() {
-      finish(new Error('STUN timeout'));
-    }, GATHER_SRFLX_TIMEOUT_MS);
-    context._gather_timers.add(timer);
+    if (!finished) {
+      timer = setTimeout(function() {
+        finish(new Error('STUN timeout'));
+      }, GATHER_SRFLX_TIMEOUT_MS);
+      context._gather_timers.add(timer);
+    }
   }
 
 
