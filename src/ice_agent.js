@@ -95,6 +95,11 @@ const DEFAULT_RTT_MS             = 3000;   // before the first measurement
 const MIN_RTT_MS                 = 100;
 const MAX_RTT_MS                 = 60000;
 const RTT_RATIO                  = 3;      // smoothing: rtt = (3·rtt + sample) / 4
+// RFC 8863 §4: the PAC timer, "equal to the agent's connectivity check
+// transaction timeout, including all retransmissions" — this agent gives a
+// check up after INACTIVE_TIMEOUT_MS unanswered (libwebrtc's write timeout),
+// not RFC 5389's 39.5 s of Rc retransmissions at the default RTO.
+const PAC_TIMEOUT_MS             = 15000;
 const MIN_RTT_IMPROVEMENT_MS     = 10;     // kMinImprovement: an RTT-only switch must gain this
 
 // ── [ice-diag] instrumentation gate + rate limiter ──
@@ -313,7 +318,12 @@ function IceAgent(options) {
     trickle:              options.trickle !== false,            // default true
     controlling:          resolvedControlling,
     iceServers:           options.iceServers || [],
-    iceTransportPolicy:   options.iceTransportPolicy || 'all',   // 'all' | 'relay'
+    iceTransportPolicy:   options.iceTransportPolicy || 'all',   // 'all' | 'relay' — for the NEXT gathering phase
+    // The policy of the current gathering phase (RFC 9429 §3.5.3: "determine
+    // the current setting at the start of each gathering phase"). Latched by
+    // beginPhase() — at the first gather() and at the first gather() after
+    // restart() — so setConfiguration() changes nothing mid-phase.
+    phasePolicy:          options.iceTransportPolicy || 'all',
     includeLoopback:      !!options.includeLoopback,
     ipv6:                 options.ipv6 !== false,                // default true
     portRange:            options.portRange || [0, 0],           // [min, max]; 0 = any
@@ -437,6 +447,9 @@ function IceAgent(options) {
     _endOfCandidatesEmitted: false,
     _reopenAfterFailed: false,     // a remote candidate arrived after 'failed' (cascade 2.0)
     _reEmitOnGather:      false,   // set by restart(): re-announce kept candidates
+    _phasePending:        true,
+    pacStartedAt:         0,       // RFC 8863 PAC timer: when the session's checks could start
+    pacTimer:             null,    // bookkeeping: re-evaluates a pair-less session at expiry    // the next startGathering() begins a phase (beginPhase)
     _gather_timers:       new Set(),
   };
 
@@ -548,6 +561,9 @@ function IceAgent(options) {
       if (opts.remotePwd !== context.remotePwd && opts.remotePwd) {
         context.remotePwd = opts.remotePwd;
         has_changed = true;
+        // RFC 8863 §4: the PAC timer starts once the checks can start (our
+        // credentials sent, the peer's received).
+        if (!context.pacStartedAt) context.pacStartedAt = Date.now();
       }
     }
 
@@ -600,7 +616,7 @@ function IceAgent(options) {
 
     if ('add_local_candidate' in opts) {
       const cand = opts.add_local_candidate;
-      if (cand && !findLocalCandidate(cand.ip, cand.port, cand.protocol || 'udp')) {
+      if (cand && localUsable(cand) && !findLocalCandidate(cand.ip, cand.port, cand.protocol || 'udp')) {
         context.localCandidates.push(cand);
         has_changed = true;
         // RFC 8838 — Trickle ICE: emit candidates as found.
@@ -771,7 +787,7 @@ function IceAgent(options) {
     if (context.gatheringState === 'complete' && !context._endOfCandidatesEmitted) {
       context._endOfCandidatesEmitted = true;
       if (!context.trickle) {
-        const batch = context.localCandidates.slice().sort(function(a, b) {
+        const batch = context.localCandidates.filter(localUsable).sort(function(a, b) {
           return b.priority - a.priority;
         });
         for (let i = 0; i < batch.length; i++) ev.emit('candidate', maskCandidateForSignaling(batch[i]));
@@ -868,6 +884,7 @@ function IceAgent(options) {
         // (assigned by the recursive set_context call) takes over send().
         if (context._previousPair) {
           context._previousPair = null;
+          releaseRetiredRelays(best);
         }
       }
     }
@@ -1028,7 +1045,7 @@ function IceAgent(options) {
    *     re-enter set_context with the real IP + mdnsName kept for logs.
    */
   function handleMdnsRemoteCandidate(cand) {
-    if (context.iceTransportPolicy === 'relay') return;
+    if (context.phasePolicy === 'relay') return;
     if (context.mode === 'lite') return;
 
     if (!context.mdns.resolve) {
@@ -1108,7 +1125,17 @@ function IceAgent(options) {
    *     name exists to conceal. Matches Chrome's behavior and JSEP §5.2.1.
    */
   function maskCandidateForSignaling(c) {
-    if (!c || !context.mdns.register) return c;
+    if (!c) return c;
+    // iceTransportPolicy 'relay': a relay candidate's related address is the
+    // host base it was allocated from — RFC 9429 §3.5.3: candidates the
+    // policy forbids MUST NOT be exposed "indirectly ... via other fields,
+    // such as the raddr/rport attributes". Scrubbed as for mDNS below.
+    if (context.phasePolicy === 'relay' && c.relatedAddress &&
+        c.relatedAddress !== '0.0.0.0' && c.relatedAddress !== '::') {
+      const v6r = c.relatedAddress.indexOf(':') >= 0;
+      return Object.assign({}, c, { relatedAddress: v6r ? '::' : '0.0.0.0', relatedPort: 9 });
+    }
+    if (!context.mdns.register) return c;
     if (c.mdnsName) {
       return Object.assign({}, c, { ip: c.mdnsName });
     }
@@ -1123,6 +1150,11 @@ function IceAgent(options) {
   }
 
   function tryMakePair(local, remote) {
+    // Only candidates the current phase permits are paired (RFC 9429 §3.5.3,
+    // W3C 4.2.5: "only these candidates will be used for connectivity
+    // checks") — the kept ones of an earlier phase under another policy, and
+    // relay candidates of a server no longer configured, are not.
+    if (!localUsable(local)) return null;
     if (local.component !== remote.component) return null;
     if (local.protocol !== remote.protocol) return null;
     // Address family must match — RFC 8445 §6.1.2.2
@@ -1213,11 +1245,103 @@ function IceAgent(options) {
   }
 
 
+  /* ===================== Candidate policy (per phase) ===================== */
+  //
+  // RFC 9429 §3.5.3 / §4.1.18, W3C 4.4.1.6 "set a configuration": a new
+  // iceTransportPolicy or ICE servers list takes effect at the next gathering
+  // phase. The agent keeps its local candidates across restart() (their
+  // sockets carry the previous pair's media, RFC 8445 §9), so the phase's
+  // policy decides which of them it may announce and pair.
+
+  // May this local candidate be announced and paired in the current phase?
+  function localUsable(c) {
+    if (!c || c.retired) return false;
+    if (context.phasePolicy !== 'relay') return true;
+    // 'relay': relay candidates, and peer-reflexive ones learned through a
+    // relay (they share its TURN client) — never host / srflx.
+    return c.type === 'relay' || !!c.turnClient;
+  }
+
+  // 'host:port' of each TURN server in the configured list.
+  function configuredTurnKeys() {
+    const keys = {};
+    const list = context.iceServers || [];
+    for (let i = 0; i < list.length; i++) {
+      const urls = list[i].urls || list[i].url;
+      const urlList = Array.isArray(urls) ? urls : [urls];
+      for (let j = 0; j < urlList.length; j++) {
+        const p = parseIceServerUri(urlList[j]);
+        if (p && p.isTurn) keys[p.host + ':' + p.port] = true;
+      }
+    }
+    return keys;
+  }
+
+  // Start of a gathering phase: latch the configured policy and retire the
+  // relay candidates of TURN servers no longer configured.
+  function beginPhase() {
+    context._phasePending = false;
+    context.phasePolicy = context.iceTransportPolicy;
+    const turnKeys = configuredTurnKeys();
+    const retiredClients = [];
+    for (let i = 0; i < context.localCandidates.length; i++) {
+      const c = context.localCandidates[i];
+      if (c.turnKey && !turnKeys[c.turnKey]) { c.retired = true; retiredClients.push(c.turnClient); }
+    }
+    // (and the peer-reflexive candidates learned through those relays)
+    for (let i = 0; i < context.localCandidates.length; i++) {
+      const c = context.localCandidates[i];
+      if (c.turnClient && retiredClients.indexOf(c.turnClient) >= 0) c.retired = true;
+    }
+    // Pairs formed before the phase began (remote candidates applied between
+    // restart() and gather()) with candidates the phase forbids.
+    context.checkList = context.checkList.filter(function(p) { return localUsable(p.local); });
+    context.validList = context.validList.filter(function(p) { return localUsable(p.local); });
+    releaseRetiredRelays(context.selectedPair);
+  }
+
+  // Close the TURN allocations of retired relay candidates that no pair in
+  // use relies on (the previous pair keeps its own until a new one is
+  // selected — cascade 2.5 calls this again then).
+  function releaseRetiredRelays(inUse) {
+    const keep = [];
+    [inUse, context._previousPair, context.selectedPair].forEach(function(p) {
+      if (p && p.local && p.local.turnClient) keep.push(p.local.turnClient);
+    });
+    const drop = {};
+    for (let i = 0; i < context.localCandidates.length; i++) {
+      const c = context.localCandidates[i];
+      if (c.retired && c.turnKey && keep.indexOf(c.turnClient) < 0) drop[c.turnKey] = true;
+    }
+    const keys = Object.keys(drop);
+    if (keys.length === 0) return;
+    const closing = keys.map(function(k) { return context.turnClients[k]; });
+    context.localCandidates = context.localCandidates.filter(function(c) {
+      return !(c.turnKey && drop[c.turnKey]) && !(c.turnClient && closing.indexOf(c.turnClient) >= 0);
+    });
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const client = context.turnClients[k];
+      delete context.turnClients[k];
+      const pk = Object.keys(context.turnPermissions);
+      for (let j = 0; j < pk.length; j++) {
+        if (pk[j].indexOf(k + '|') !== 0) continue;
+        const perm = context.turnPermissions[pk[j]];
+        if (perm && perm.timer) clearTimeout(perm.timer);
+        delete context.turnPermissions[pk[j]];
+      }
+      if (client) { try { client.close(); } catch (_) {} }
+    }
+  }
+
+
   /* ========================= Gathering ========================= */
 
   function startGathering() {
     if (context._gathering_host) return;
     context._gathering_host = true;
+
+    if (context._phasePending) beginPhase();
 
     set_context({ gatheringState: 'gathering' });
 
@@ -1231,7 +1355,7 @@ function IceAgent(options) {
     if (context._reEmitOnGather) {
       context._reEmitOnGather = false;
       if (context.trickle) {
-        const existing = context.localCandidates.slice().sort(function(a, b) {
+        const existing = context.localCandidates.filter(localUsable).sort(function(a, b) {
           return b.priority - a.priority;
         });
         for (let i = 0; i < existing.length; i++) ev.emit('candidate', maskCandidateForSignaling(existing[i]));
@@ -1292,7 +1416,7 @@ function IceAgent(options) {
     }
 
     // Relay-only policy skips srflx (but keeps relay)
-    const relayOnly = (context.iceTransportPolicy === 'relay');
+    const relayOnly = (context.phasePolicy === 'relay');
 
     // ICE-Lite: only host candidates — no srflx/relay, no checks (RFC 8445 §6.1.1)
     const liteMode = (context.mode === 'lite');
@@ -1567,6 +1691,15 @@ function IceAgent(options) {
       try { alreadyBound[s.address().address] = true; } catch (_) {}
     }
 
+    // A socket bound in an earlier phase under 'relay' (a TURN base) has no
+    // host candidate; under 'all' it gets one now (a no-op where it has one).
+    for (let b = 0; b < boundKeys.length; b++) {
+      const s = context.sockets[boundKeys[b]];
+      let ba;
+      try { ba = s.address(); } catch (_) { continue; }
+      if (ba) addHostFromBoundSocket(s, { address: ba.address, port: ba.port, family: ba.family });
+    }
+
     const addrs = [];
     for (let i = 0; i < names.length; i++) {
       const list = ifaces[names[i]];
@@ -1614,7 +1747,7 @@ function IceAgent(options) {
   const TCP_PASSIVE_LOCAL_PREFERENCE = (4 << 13) + 8191;
 
   function addTcpPassiveHost(tsock, addr) {
-    if (context.iceTransportPolicy === 'relay') return;
+    if (context.phasePolicy === 'relay') return;
     set_context({ add_local_candidate: {
       foundation:     computeFoundation('host', addr.address, 'tcp', ''),
       component:      COMPONENT_RTP,
@@ -1634,15 +1767,19 @@ function IceAgent(options) {
 
   function addHostFromBoundSocket(sock, boundAddr) {
     const key = boundAddr.family + ':' + boundAddr.address + ':' + boundAddr.port;
-    if (context.sockets[key]) return;
-    context.sockets[key] = sock;
-    if (!context.primarySocket) context.primarySocket = sock;
+    if (!context.sockets[key]) {
+      context.sockets[key] = sock;
+      if (!context.primarySocket) context.primarySocket = sock;
+    } else if (findLocalCandidate(boundAddr.address, boundAddr.port, 'udp')) {
+      return;   // known socket, its host candidate held
+    }
 
     // Relay-only policy: bind the socket (needed as TURN allocate base) but
     // do NOT expose the host candidate externally. RFC 8445 §5.1.1.2 allows
     // filtering candidates; WebRTC's `iceTransportPolicy: 'relay'` mandates
-    // that only relay candidates be gathered and used.
-    if (context.iceTransportPolicy === 'relay') return;
+    // that only relay candidates be gathered and used. (A socket kept from a
+    // 'relay' phase gets its host candidate in the next 'all' phase.)
+    if (context.phasePolicy === 'relay') return;
 
     const cand = {
       foundation:     computeFoundation('host', boundAddr.address, 'udp', ''),
@@ -2398,7 +2535,8 @@ function IceAgent(options) {
     if (context.mode === 'lite' || context.closed) return null;
     if (context.state === 'failed' || context.state === 'closed') return null;
     const list = context.checkList;
-    if (list.length === 0 || !context.remotePwd) return null;
+    if (!context.remotePwd) return null;
+    if (list.length === 0) return pairlessState();
     let anyActive = false;
     for (let i = 0; i < list.length; i++) if (isActive(list[i])) { anyActive = true; break; }
     if (!anyActive) return context.mdns.pendingResolves > 0 ? null : 'failed';
@@ -2408,6 +2546,32 @@ function IceAgent(options) {
     if (sel && sel.writeState === 'writable') { context.hasBeenWritable = true; return 'connected'; }
     if (context.hasBeenWritable) return 'disconnected';
     return 'checking';
+  }
+
+  // A session without a single pair (W3C 4.3.3 RTCIceTransportState
+  // 'failed': gathering finished, end-of-candidates received, every pair
+  // failed — none here — "and either zero local candidates were gathered or
+  // the PAC timer has expired", RFC 8863 §4). Before, no pair meant no
+  // verdict at all: a session whose candidates could never pair (a 'relay'
+  // policy without a TURN server, the peer's address family only) stayed
+  // 'new' / 'checking' forever.
+  function pairlessState() {
+    if (context.gatheringState !== 'complete' || !context.remoteCandidatesEnded) return null;
+    if (context.mdns.pendingResolves > 0) return null;
+    if (context.localCandidates.some(localUsable)) {
+      const left = (context.pacStartedAt || Date.now()) + PAC_TIMEOUT_MS - Date.now();
+      if (left > 0) {
+        if (!context.pacTimer) {
+          context.pacTimer = setTimeout(function() {
+            context.pacTimer = null;
+            if (!context.closed) set_context({ pair_tick: true });
+          }, left);
+          if (context.pacTimer.unref) context.pacTimer.unref();
+        }
+        return null;
+      }
+    }
+    return 'failed';
   }
 
   function writableInterval(p, t) {
@@ -2746,6 +2910,20 @@ function IceAgent(options) {
 
   function handleBindingRequest(buf, msg, rinfo, sock, turnSocket) {
     if (context.closed) return;
+
+    // A check that arrived on a local candidate the current phase forbids
+    // (a host socket under 'relay' — kept as the TURN base or from an 'all'
+    // phase —, a retired relay) is dropped unanswered: answering is using
+    // that candidate for connectivity checks, and the response's
+    // XOR-MAPPED-ADDRESS / source would expose it (RFC 9429 §3.5.3).
+    if (!incomingLocalUsable(sock, turnSocket)) {
+      if (_ICE_DBG && _diagRL('drop-policy:' + rinfo.address + ':' + rinfo.port, 2000)) {
+        _diagLog('[ice-diag] ' + _diagTs() + ' DROP binding-req from ' +
+                    rinfo.address + ':' + rinfo.port + ' — arrived on a candidate the ' +
+                    context.phasePolicy + ' policy forbids');
+      }
+      return;
+    }
 
     // Verify USERNAME and MESSAGE-INTEGRITY with OUR password (RFC 8445 §7.3)
     // [ice-diag] Every drop branch below LOGS (rate-limited): a silent
@@ -3097,15 +3275,44 @@ function IceAgent(options) {
   function findLocalForIncoming(sock, turnSocket) {
     if (sock) {
       for (let i = 0; i < context.localCandidates.length; i++) {
-        if (context.localCandidates[i].socket === sock) return context.localCandidates[i];
+        const c = context.localCandidates[i];
+        if (c.socket === sock && localUsable(c)) return c;
       }
     }
     if (turnSocket) {
       for (let i = 0; i < context.localCandidates.length; i++) {
-        if (context.localCandidates[i].turnClient === turnSocket) return context.localCandidates[i];
+        const c = context.localCandidates[i];
+        if (c.turnClient === turnSocket && localUsable(c)) return c;
       }
     }
-    return context.localCandidates[0] || null;
+    for (let i = 0; i < context.localCandidates.length; i++) {
+      if (localUsable(context.localCandidates[i])) return context.localCandidates[i];
+    }
+    return null;
+  }
+
+  // Did a packet that came in on this socket / TURN client arrive on a
+  // candidate the current phase permits? Arriving on a TURN client: that
+  // relay must be usable. On a socket: under 'relay' never (no host
+  // candidate may be used); otherwise unless every candidate on it is
+  // forbidden (none: a socket without candidates yet — answered as before).
+  function incomingLocalUsable(sock, turnSocket) {
+    if (turnSocket) {
+      for (let i = 0; i < context.localCandidates.length; i++) {
+        const c = context.localCandidates[i];
+        if (c.turnClient === turnSocket) return localUsable(c);
+      }
+      return true;
+    }
+    if (context.phasePolicy === 'relay') return false;
+    let any = false;
+    for (let i = 0; i < context.localCandidates.length; i++) {
+      const c = context.localCandidates[i];
+      if (c.socket !== sock || c.turnClient) continue;
+      if (localUsable(c)) return true;
+      any = true;
+    }
+    return !any;
   }
 
 
@@ -3213,6 +3420,7 @@ function IceAgent(options) {
 
   function teardown() {
     // Stop all timers
+    if (context.pacTimer)          { clearTimeout(context.pacTimer);          context.pacTimer = null; }
     if (context.pingTimer)         { clearTimeout(context.pingTimer);         context.pingTimer = null; }
     if (context.liteLivenessTimer) { clearTimeout(context.liteLivenessTimer); context.liteLivenessTimer = null; }
     context.liteLivenessActive = false;
@@ -3393,6 +3601,43 @@ function IceAgent(options) {
       });
     },
 
+    /** Change the configuration for the NEXT gathering phase (RFC 9429
+     *  §4.1.18, W3C 4.4.1.6 "set a configuration"): nothing happens to the
+     *  current one — its candidates, pairs and selected pair stay. The next
+     *  phase begins at the first gather() after restart() (or the first
+     *  gather() of all); it gathers and pairs under the new values:
+     *
+     *    iceTransportPolicy 'relay' — only relay candidates are announced
+     *      (kept host / srflx ones are not re-announced) and paired, a check
+     *      arriving on a host socket is dropped, relay candidates' raddr is
+     *      scrubbed;
+     *    iceTransportPolicy 'all'   — host candidates of the sockets kept
+     *      from a 'relay' phase are announced, srflx gathered again;
+     *    iceServers — STUN / TURN servers of the new list are used; the relay
+     *      candidates of TURN servers no longer listed are not announced or
+     *      paired, and their allocations are released once the previous
+     *      pair (RFC 8445 §9) no longer uses them.
+     *
+     *  Members left out keep their value. An ICE restart is the caller's
+     *  (JSEP's needs-ice-restart). Throws TypeError on an unknown policy. */
+    setConfiguration: function(cfg) {
+      if (!cfg || context.closed) return;
+      if (cfg.iceTransportPolicy !== undefined) {
+        if (cfg.iceTransportPolicy !== 'all' && cfg.iceTransportPolicy !== 'relay') {
+          throw new TypeError('IceAgent.setConfiguration: invalid iceTransportPolicy "' +
+            cfg.iceTransportPolicy + '" (expected "all" or "relay")');
+        }
+        context.iceTransportPolicy = cfg.iceTransportPolicy;
+      }
+      if (cfg.iceServers !== undefined) {
+        context.iceServers = Array.isArray(cfg.iceServers) ? cfg.iceServers.slice() : [];
+      }
+    },
+
+    /** The configured policy (next phase) and the current phase's. */
+    get iceTransportPolicy() { return context.iceTransportPolicy; },
+    get phasePolicy()        { return context.phasePolicy; },
+
     /** Add a remote candidate. Pass null to signal end-of-candidates. */
     addRemoteCandidate: function(candOrString) {
       if (candOrString === null || candOrString === undefined) {
@@ -3416,7 +3661,7 @@ function IceAgent(options) {
     },
 
     /** Convenience: just the local candidates. */
-    get localCandidates()  { return context.localCandidates.map(maskCandidateForSignaling); },
+    get localCandidates()  { return context.localCandidates.filter(localUsable).map(maskCandidateForSignaling); },
     get remoteCandidates() { return context.remoteCandidates.slice(); },
     get selectedPair()     { return context.selectedPair; },
     get state()            { return context.state; },
@@ -3531,6 +3776,9 @@ function IceAgent(options) {
       if (context.liteLivenessTimer) { clearTimeout(context.liteLivenessTimer); context.liteLivenessTimer = null; }
       context.liteLivenessActive = false;
       context.lastRequestReceivedAt = 0;   // restart: new session, new clock (re-armed by 2.8b)
+      // The PAC timer is the session's: the new one starts with the new remote credentials.
+      if (context.pacTimer) { clearTimeout(context.pacTimer); context.pacTimer = null; }
+      context.pacStartedAt = 0;
 
       /* ── Reset ICE check state ──
        * NOTE: sockets, turnClients, turnPermissions are intentionally
@@ -3553,6 +3801,9 @@ function IceAgent(options) {
       // media). The next gather() re-announces them to the SDP layer —
       // add_local_candidate's dedup would otherwise swallow them.
       context._reEmitOnGather = true;
+      // ... under the policy configured now (beginPhase at the next gather()).
+      context._phasePending = true;
+      context.phasePolicy   = context.iceTransportPolicy;
 
       // Reset gather counters so checkGatheringComplete() works after re-gather
       context._gathering_host  = false;
